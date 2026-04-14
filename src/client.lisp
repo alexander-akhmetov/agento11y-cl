@@ -134,6 +134,7 @@
   (make-instance 'generation-recorder
     :client client
     :started-at (iso8601-now)
+    :generation-id (generate-id)
     :trace-id (generate-trace-id)
     :span-id (generate-span-id)
     :mode mode

@@ -190,7 +190,8 @@ when reasoning or cache tokens are counted separately)."
    ;; Timing
    (duration-seconds  :initarg :duration-seconds  :accessor gen-rec-duration-seconds  :initform nil)
    (ttft-seconds      :initarg :ttft-seconds      :accessor gen-rec-ttft-seconds      :initform nil)
-   ;; Trace IDs (generated at start, used in span building)
+   ;; IDs (generated at start)
+   (generation-id     :initarg :generation-id     :accessor gen-rec-generation-id     :initform nil)
    (trace-id          :initarg :trace-id          :accessor gen-rec-trace-id          :initform nil)
    (span-id           :initarg :span-id           :accessor gen-rec-span-id           :initform nil)))
 
@@ -255,7 +256,7 @@ when reasoning or cache tokens are counted separately)."
               (when (gen-rec-conversation-title rec)
                 (setf (gethash "sigil.conversation.title" meta)
                       (gen-rec-conversation-title rec)))))
-         (gen (jobj "id" (generate-id)
+         (gen (jobj "id" (gen-rec-generation-id rec)
                     "mode" mode-str
                     "operation_name" op-name
                     "model" (jobj "provider" (or (gen-rec-model-provider rec) "")

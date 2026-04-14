@@ -255,6 +255,7 @@
           (check "generation enqueued" (= (length gen-items) 1))
           (let ((gen (first gen-items)))
             (check "gen has id" (search "gen_" (jget gen "id")))
+            (check "gen id matches recorder" (equal (jget gen "id") (gen-rec-generation-id rec)))
             (check "gen mode" (equal (jget gen "mode") "GENERATION_MODE_SYNC"))
             (check "gen model provider" (equal (jget* gen "model" "provider") "openai"))
             (check "gen conversation_id" (equal (jget gen "conversation_id") "conv-1"))

@@ -62,6 +62,7 @@
    #:build-output-message
    ;; Trace context
    #:*trace-context*
+   #:gen-rec-generation-id
    #:gen-rec-trace-id
    #:gen-rec-span-id
    ;; OTel helpers
