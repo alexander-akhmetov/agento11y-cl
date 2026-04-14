@@ -373,6 +373,48 @@
           (check "no top-level conversation_title"
                  (null (jget gen "conversation_title"))))))
 
+    ;; Parent generation IDs
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      ;; Set at start
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :parent-generation-ids '("gen-aaa" "gen-bbb"))))
+        (recorder-end rec)
+        (let ((gen (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-generation-queue client)))))
+          (check "parent_generation_ids present"
+                 (= (length (jget gen "parent_generation_ids")) 2))
+          (check "parent_generation_ids first"
+                 (equal (aref (jget gen "parent_generation_ids") 0) "gen-aaa"))
+          (check "parent_generation_ids second"
+                 (equal (aref (jget gen "parent_generation_ids") 1) "gen-bbb")))))
+
+    ;; Parent generation IDs via set-result
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m")))
+        (set-result rec :parent-generation-ids '("gen-ccc"))
+        (recorder-end rec)
+        (let ((gen (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-generation-queue client)))))
+          (check "parent_generation_ids via set-result"
+                 (= (length (jget gen "parent_generation_ids")) 1))
+          (check "parent_generation_ids set-result value"
+                 (equal (aref (jget gen "parent_generation_ids") 0) "gen-ccc")))))
+
+    ;; Omitted parent_generation_ids -> absent from payload
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m")))
+        (recorder-end rec)
+        (let ((gen (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-generation-queue client)))))
+          (check "no parent_generation_ids when omitted"
+                 (null (jget gen "parent_generation_ids"))))))
+
     ;; Total tokens preserved
     (multiple-value-bind (client get-requests) (make-test-client)
       (declare (ignore get-requests))

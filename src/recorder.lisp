@@ -186,6 +186,7 @@ when reasoning or cache tokens are counted separately)."
    (max-tokens        :initarg :max-tokens        :accessor gen-rec-max-tokens        :initform nil)
    (tool-choice       :initarg :tool-choice       :accessor gen-rec-tool-choice       :initform nil)
    (thinking-enabled  :initarg :thinking-enabled  :accessor gen-rec-thinking-enabled  :initform :unset)
+   (parent-generation-ids :initarg :parent-generation-ids :accessor gen-rec-parent-generation-ids :initform nil)
    ;; Timing
    (duration-seconds  :initarg :duration-seconds  :accessor gen-rec-duration-seconds  :initform nil)
    (ttft-seconds      :initarg :ttft-seconds      :accessor gen-rec-ttft-seconds      :initform nil)
@@ -201,6 +202,7 @@ when reasoning or cache tokens are counted separately)."
                                                        tags metadata
                                                        temperature top-p max-tokens
                                                        tool-choice thinking-enabled
+                                                       parent-generation-ids
                                                        duration-seconds ttft-seconds)
   (when input-messages  (setf (gen-rec-input-messages rec) input-messages))
   (when output-messages (setf (gen-rec-output-messages rec) output-messages))
@@ -219,6 +221,8 @@ when reasoning or cache tokens are counted separately)."
   (unless (eq thinking-enabled nil)
     (when (member thinking-enabled '(t nil :unset))
       (setf (gen-rec-thinking-enabled rec) thinking-enabled)))
+  (when parent-generation-ids
+    (setf (gen-rec-parent-generation-ids rec) parent-generation-ids))
   (when duration-seconds (setf (gen-rec-duration-seconds rec) duration-seconds))
   (when ttft-seconds     (setf (gen-rec-ttft-seconds rec) ttft-seconds))
   rec)
@@ -288,6 +292,9 @@ when reasoning or cache tokens are counted separately)."
       (setf (gethash "tool_choice" gen) (gen-rec-tool-choice rec)))
     (unless (eq (gen-rec-thinking-enabled rec) :unset)
       (setf (gethash "thinking_enabled" gen) (if (gen-rec-thinking-enabled rec) t nil)))
+    (when (gen-rec-parent-generation-ids rec)
+      (setf (gethash "parent_generation_ids" gen)
+            (coerce (gen-rec-parent-generation-ids rec) 'vector)))
     ;; Tags (config tags + recorder tags merged)
     (let ((all-tags (append (config-tags config) (gen-rec-tags rec))))
       (when all-tags

@@ -128,6 +128,7 @@
                                       system-prompt input-messages tools
                                       temperature top-p max-tokens tool-choice
                                       (thinking-enabled :unset)
+                                      parent-generation-ids
                                       tags metadata)
   "Create and start a generation recorder."
   (make-instance 'generation-recorder
@@ -151,6 +152,7 @@
     :max-tokens max-tokens
     :tool-choice tool-choice
     :thinking-enabled thinking-enabled
+    :parent-generation-ids parent-generation-ids
     :tags tags
     :metadata metadata))
 
