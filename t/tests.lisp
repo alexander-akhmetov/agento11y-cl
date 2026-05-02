@@ -343,6 +343,63 @@
             (check "metadata-only: text redacted"
                    (equal (jget (aref (jget input-msg "parts") 0) "text") ""))))))
 
+    ;; No-tool-content: full generation content but redact tool spans
+    (multiple-value-bind (client get-requests) (make-test-client :capture :no-tool-content)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :system-prompt "Be helpful"
+                                          :input-messages (list (make-message
+                                                                 :role :user
+                                                                 :parts (list (make-text-part "Hello")))))))
+        (set-result rec :output-messages (list (make-message
+                                                :role :assistant
+                                                :parts (list (make-text-part "Hi")))))
+        (set-call-error rec "rate limit")
+        (recorder-end rec)
+        (let ((gen (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-generation-queue client)))))
+          (check "no-tool-content: system prompt included"
+                 (equal (jget gen "system_prompt") "Be helpful"))
+          (check "no-tool-content: input text kept"
+                 (equal (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text")
+                        "Hello"))
+          (check "no-tool-content: output text kept"
+                 (equal (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")
+                        "Hi"))
+          (check "no-tool-content: call_error not redacted"
+                 (equal (jget gen "call_error") "rate limit")))))
+
+    ;; No-tool-content: tool execution span args/results redacted
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :no-tool-content :generation-enabled nil)
+      (declare (ignore get-requests))
+      (let ((*trace-context* (list :trace-id "parent-trace" :span-id "parent-span")))
+        (let ((rec (start-tool-execution client
+                     :tool-name "search"
+                     :tool-call-id "tc-1"
+                     :tool-type "function")))
+          (set-result rec :arguments "{\"q\":\"secret\"}"
+                          :result "found something private"
+                          :duration-seconds 0.5d0)
+          (recorder-end rec)
+          (let* ((span (first (sigil-cl::queue-drain-all
+                               (sigil-cl::client-trace-queue client))))
+                 (attrs (jget span "attributes"))
+                 (args-attr (find "gen_ai.tool.call.arguments" (coerce attrs 'list)
+                                  :key (lambda (a) (jget a "key")) :test #'equal))
+                 (result-attr (find "gen_ai.tool.call.result" (coerce attrs 'list)
+                                    :key (lambda (a) (jget a "key")) :test #'equal))
+                 (args-len (find "gen_ai.tool.call.arguments.length" (coerce attrs 'list)
+                                 :key (lambda (a) (jget a "key")) :test #'equal)))
+            (check "no-tool-content: tool args redacted"
+                   (equal (jget* args-attr "value" "stringValue") "<redacted>"))
+            (check "no-tool-content: tool result redacted"
+                   (equal (jget* result-attr "value" "stringValue") "<redacted>"))
+            (check "no-tool-content: arg length still recorded"
+                   (= (parse-integer (jget* args-len "value" "intValue"))
+                      (length "{\"q\":\"secret\"}")))))))
+
     ;; Caller metadata merge
     (multiple-value-bind (client get-requests) (make-test-client)
       (declare (ignore get-requests))

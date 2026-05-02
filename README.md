@@ -13,7 +13,7 @@ Sigil captures LLM generations, tool executions, and embeddings from your applic
 - **Conversation ratings** — submit user feedback ratings to the Sigil API
 - **Message normalization** — convert raw Anthropic and OpenAI API responses into SDK types
 - **Background export** — batched, async HTTP export with exponential backoff retry
-- **Content capture modes** — `:full`, `:metadata-only`, or `:metadata-with-system-prompt`
+- **Content capture modes** — `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only`
 
 ## Installation
 
@@ -105,7 +105,7 @@ Convert raw LLM API hash-tables into SDK types:
 | `:auth-user` | `nil` | Basic auth username (falls back to tenant-id) |
 | `:auth-password` | `nil` | Auth password/token |
 | `:tenant-id` | `nil` | Grafana Cloud tenant ID |
-| `:content-capture-mode` | `:metadata-only` | `:full`, `:metadata-only`, or `:metadata-with-system-prompt` |
+| `:content-capture-mode` | `:metadata-only` | `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only` |
 | `:batch-size` | `20` | Generations per export batch |
 | `:flush-interval-sec` | `5` | Background flush interval |
 | `:queue-max` | `500` | Generation queue capacity |
@@ -113,6 +113,17 @@ Convert raw LLM API hash-tables into SDK types:
 | `:service-name` | `"unknown"` | Service name in OTLP resource |
 | `:log-fn` | `nil` | `(lambda (level component message) ...)` |
 | `:metrics-fn` | `nil` | `(lambda (type recorder) ...)` |
+
+### Content capture modes
+
+| Mode | Generation messages | System prompt | call_error | Tool span args/results |
+|------|---------------------|---------------|-----------|------------------------|
+| `:full` | full | full | full | full |
+| `:no-tool-content` | full | full | full | redacted |
+| `:metadata-with-system-prompt` | full | full | redacted | redacted |
+| `:metadata-only` | structure only, text empty | omitted | redacted | redacted |
+
+`:no-tool-content` matches the Go SDK's `ContentCaptureModeNoToolContent` semantics: keep generation content for evaluation, but redact tool execution span attributes (where untrusted tool I/O accumulates).
 
 ## Running tests
 

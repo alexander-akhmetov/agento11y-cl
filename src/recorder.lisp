@@ -66,6 +66,21 @@ Each with-generation call binds this per-thread via LET.")
     (:tool      "MESSAGE_ROLE_TOOL")
     (t          "MESSAGE_ROLE_UNSPECIFIED")))
 
+;;; --- Capture mode predicates ---
+
+(defun capture-keeps-content-p (mode)
+  "True when MODE keeps full generation content: message text, system prompt,
+call_error, and span status messages.
+:full and :no-tool-content keep content; :metadata-with-system-prompt and
+:metadata-only redact it."
+  (or (eq mode :full) (eq mode :no-tool-content)))
+
+(defun capture-keeps-tool-span-content-p (mode)
+  "True when MODE keeps tool execution span arguments and results.
+Only :full keeps tool span content; :no-tool-content, :metadata-with-system-prompt,
+and :metadata-only redact it."
+  (eq mode :full))
+
 ;;; --- Message serialization ---
 
 (defun serialize-part (part capture-mode)
@@ -231,8 +246,8 @@ when reasoning or cache tokens are counted separately)."
 (defun build-generation-payload (rec config)
   "Build a generation JSON hash-table from the recorder state."
   (let* ((capture (config-content-capture-mode config))
-         (capture-full (eq capture :full))
-         (capture-sys (or capture-full (eq capture :metadata-with-system-prompt)))
+         (capture-content (capture-keeps-content-p capture))
+         (capture-sys (or capture-content (eq capture :metadata-with-system-prompt)))
          (mode-str (if (eq (gen-rec-mode rec) :stream)
                        "GENERATION_MODE_STREAM" "GENERATION_MODE_SYNC"))
          (op-name (if (eq (gen-rec-mode rec) :stream) "streamText" "generateText"))
@@ -277,7 +292,7 @@ when reasoning or cache tokens are counted separately)."
       (setf (gethash "agent_version" gen) (gen-rec-agent-version rec)))
     (when (recorder-call-error rec)
       (setf (gethash "call_error" gen)
-            (if capture-full (recorder-call-error rec) "<redacted>")))
+            (if capture-content (recorder-call-error rec) "<redacted>")))
     (when (gen-rec-response-id rec)
       (setf (gethash "response_id" gen) (gen-rec-response-id rec)))
     (when (gen-rec-response-model rec)
@@ -394,7 +409,7 @@ when reasoning or cache tokens are counted separately)."
           (push (otel-string-attr "error.category" category) attrs))))
     ;; Build span
     (let* ((capture (config-content-capture-mode config))
-           (capture-full (eq capture :full))
+           (capture-content (capture-keeps-content-p capture))
            (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
            (end-nano (if (and start-nano (gen-rec-duration-seconds rec))
                          (unix-nano-plus-seconds start-nano (gen-rec-duration-seconds rec))
@@ -408,7 +423,7 @@ when reasoning or cache tokens are counted separately)."
                   :attributes (coerce (nreverse attrs) 'vector)
                   :status-code (if (recorder-call-error rec) 2 1)
                   :status-message (if (recorder-call-error rec)
-                                      (if capture-full (recorder-call-error rec) "<redacted>")
+                                      (if capture-content (recorder-call-error rec) "<redacted>")
                                       "")))))
 
 (defmethod recorder-end ((rec generation-recorder))
@@ -458,7 +473,7 @@ when reasoning or cache tokens are counted separately)."
   (let ((config (client-config (recorder-client rec))))
     (when (config-traces-enabled config)
       (let* ((capture (config-content-capture-mode config))
-             (capture-full (eq capture :full))
+             (capture-tool (capture-keeps-tool-span-content-p capture))
              (parent *trace-context*)
              (trace-id (or (getf parent :trace-id) (generate-trace-id)))
              (parent-span-id (getf parent :span-id))
@@ -485,13 +500,13 @@ when reasoning or cache tokens are counted separately)."
         (let ((args (tool-rec-arguments rec)))
           (when (and args (stringp args) (plusp (length args)))
             (push (otel-string-attr "gen_ai.tool.call.arguments"
-                                     (if capture-full (truncate-for-span args) "<redacted>"))
+                                     (if capture-tool (truncate-for-span args) "<redacted>"))
                   attrs)
             (push (otel-int-attr "gen_ai.tool.call.arguments.length" (length args)) attrs)))
         (let ((res (tool-rec-result rec)))
           (when (and res (stringp res) (plusp (length res)))
             (push (otel-string-attr "gen_ai.tool.call.result"
-                                     (if capture-full (truncate-for-span res) "<redacted>"))
+                                     (if capture-tool (truncate-for-span res) "<redacted>"))
                   attrs)
             (push (otel-int-attr "gen_ai.tool.call.result.length" (length res)) attrs)))
         (let ((err (or (tool-rec-error-message rec) (recorder-call-error rec))))
@@ -517,7 +532,7 @@ when reasoning or cache tokens are counted separately)."
                        :status-message (let ((err (or (tool-rec-error-message rec)
                                                       (recorder-call-error rec))))
                                          (if err
-                                             (if capture-full err "<redacted>")
+                                             (if capture-tool err "<redacted>")
                                              "")))))))))
 
 ;;; ================================================================
@@ -550,7 +565,7 @@ when reasoning or cache tokens are counted separately)."
   (let ((config (client-config (recorder-client rec))))
     (when (config-traces-enabled config)
       (let* ((capture (config-content-capture-mode config))
-             (capture-full (eq capture :full))
+             (capture-content (capture-keeps-content-p capture))
              (parent *trace-context*)
              (trace-id (or (getf parent :trace-id) (generate-trace-id)))
              (parent-span-id (getf parent :span-id))
@@ -590,6 +605,6 @@ when reasoning or cache tokens are counted separately)."
                        :attributes (coerce (nreverse attrs) 'vector)
                        :status-code (if (recorder-call-error rec) 2 1)
                        :status-message (if (recorder-call-error rec)
-                                           (if capture-full (recorder-call-error rec)
+                                           (if capture-content (recorder-call-error rec)
                                                "<redacted>")
                                            ""))))))))
