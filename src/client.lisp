@@ -13,14 +13,19 @@
    (wake-cv          :initform (bt2:make-condition-variable :name "sigil-wake")
                      :accessor client-wake-cv)))
 
-(defun make-client (config)
-  "Create a Sigil client from CONFIG."
-  (make-instance 'sigil-client
-    :config config
-    :generation-queue (make-bounded-queue :max-size (config-queue-max config)
-                                          :name "generation")
-    :trace-queue (make-bounded-queue :max-size (effective-trace-queue-max config)
-                                      :name "trace")))
+(defun make-client (config &key (env-fn #'uiop:getenv))
+  "Create a Sigil client from CONFIG.
+Layers SIGIL_* env vars on top of the supplied config (caller > env > defaults)
+so deployments can configure the SDK without code changes. ENV-FN is the
+function used to read environment variables; defaults to uiop:getenv. Tests
+can pass (constantly nil) to ignore the host environment."
+  (let ((resolved (resolve-config-from-env config :env-fn env-fn)))
+    (make-instance 'sigil-client
+      :config resolved
+      :generation-queue (make-bounded-queue :max-size (config-queue-max resolved)
+                                            :name "generation")
+      :trace-queue (make-bounded-queue :max-size (effective-trace-queue-max resolved)
+                                        :name "trace"))))
 
 (defun noop-client ()
   "Create a client that discards everything (for testing/disabled mode)."
@@ -122,6 +127,18 @@
 
 ;;; --- Recorder factories ---
 
+(defun %resolve-agent-name (config caller-value)
+  "Pick the per-recorder agent name. Precedence: caller > config-agent-name > config-service-name."
+  (or caller-value
+      (config-agent-name config)
+      (config-service-name config)))
+
+(defun %resolve-agent-version (config caller-value)
+  "Pick the per-recorder agent version. Precedence: caller > config-agent-version > config-service-version."
+  (or caller-value
+      (config-agent-version config)
+      (config-service-version config)))
+
 (defun start-generation (client &key (mode :sync) conversation-id conversation-title
                                       user-id agent-name agent-version
                                       model-provider model-name
@@ -131,57 +148,60 @@
                                       parent-generation-ids
                                       tags metadata)
   "Create and start a generation recorder."
-  (make-instance 'generation-recorder
-    :client client
-    :started-at (iso8601-now)
-    :generation-id (generate-id)
-    :trace-id (generate-trace-id)
-    :span-id (generate-span-id)
-    :mode mode
-    :conversation-id conversation-id
-    :conversation-title conversation-title
-    :user-id user-id
-    :agent-name agent-name
-    :agent-version agent-version
-    :model-provider model-provider
-    :model-name model-name
-    :system-prompt system-prompt
-    :input-messages input-messages
-    :tools tools
-    :temperature temperature
-    :top-p top-p
-    :max-tokens max-tokens
-    :tool-choice tool-choice
-    :thinking-enabled thinking-enabled
-    :parent-generation-ids parent-generation-ids
-    :tags tags
-    :metadata metadata))
+  (let ((config (client-config client)))
+    (make-instance 'generation-recorder
+      :client client
+      :started-at (iso8601-now)
+      :generation-id (generate-id)
+      :trace-id (generate-trace-id)
+      :span-id (generate-span-id)
+      :mode mode
+      :conversation-id conversation-id
+      :conversation-title conversation-title
+      :user-id user-id
+      :agent-name (%resolve-agent-name config agent-name)
+      :agent-version (%resolve-agent-version config agent-version)
+      :model-provider model-provider
+      :model-name model-name
+      :system-prompt system-prompt
+      :input-messages input-messages
+      :tools tools
+      :temperature temperature
+      :top-p top-p
+      :max-tokens max-tokens
+      :tool-choice tool-choice
+      :thinking-enabled thinking-enabled
+      :parent-generation-ids parent-generation-ids
+      :tags tags
+      :metadata metadata)))
 
 (defun start-tool-execution (client &key tool-name tool-call-id tool-type tool-description
                                           conversation-id agent-name agent-version
                                           model-provider model-name)
   "Create and start a tool execution recorder."
-  (make-instance 'tool-execution-recorder
-    :client client
-    :started-at (iso8601-now)
-    :tool-name tool-name
-    :tool-call-id tool-call-id
-    :tool-type tool-type
-    :tool-description tool-description
-    :conversation-id conversation-id
-    :agent-name agent-name
-    :agent-version agent-version
-    :model-provider model-provider
-    :model-name model-name))
+  (let ((config (client-config client)))
+    (make-instance 'tool-execution-recorder
+      :client client
+      :started-at (iso8601-now)
+      :tool-name tool-name
+      :tool-call-id tool-call-id
+      :tool-type tool-type
+      :tool-description tool-description
+      :conversation-id conversation-id
+      :agent-name (%resolve-agent-name config agent-name)
+      :agent-version (%resolve-agent-version config agent-version)
+      :model-provider model-provider
+      :model-name model-name)))
 
 (defun start-embedding (client &key model-provider model-name
                                      agent-name agent-version source)
   "Create and start an embedding recorder."
-  (make-instance 'embedding-recorder
-    :client client
-    :started-at (iso8601-now)
-    :model-provider model-provider
-    :model-name model-name
-    :agent-name agent-name
-    :agent-version agent-version
-    :source source))
+  (let ((config (client-config client)))
+    (make-instance 'embedding-recorder
+      :client client
+      :started-at (iso8601-now)
+      :model-provider model-provider
+      :model-name model-name
+      :agent-name (%resolve-agent-name config agent-name)
+      :agent-version (%resolve-agent-version config agent-version)
+      :source source)))

@@ -2,7 +2,8 @@
   (:use :cl)
   (:local-nicknames (:jzon :com.inuoe.jzon)
                     (:bt2 :bordeaux-threads-2)
-                    (:alex :alexandria))
+                    (:alex :alexandria)
+                    (:c2mop :closer-mop))
   (:export
    ;; Client lifecycle
    #:make-client
@@ -28,6 +29,11 @@
    ;; Config
    #:sigil-config
    #:make-config
+   #:resolve-config-from-env
+   #:config-agent-name
+   #:config-agent-version
+   #:config-extra-headers
+   #:config-debug
    ;; Types + constructors
    #:message
    #:text-part
