@@ -13,6 +13,7 @@ Sigil captures LLM generations, tool executions, and embeddings from your applic
 - **Conversation ratings** — submit user feedback ratings to the Sigil API
 - **Offline experiments** — create eval runs, record tagged generations, export scores, and loop a dataset through a target and scorers
 - **Collection datasets** — read Sigil collections and conversations to build experiment datasets from saved conversations
+- **Synchronous hook evaluation** — preflight/postflight policy checks against the Sigil hooks API with allow/deny semantics, fail-open transport handling, and `transformed_input` rewrite passthrough
 - **Message normalization** — convert raw Anthropic and OpenAI API responses into SDK types
 - **Background export** — batched, async HTTP export with exponential backoff retry
 - **Content capture modes** — `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only`
@@ -148,6 +149,69 @@ Anthropic `image` blocks and OpenAI `image_url` blocks become media parts with
 `data:<mime>;base64,<data>` URL; a URL source passes through unchanged. A block
 with neither a URL nor both a media type and inline data is dropped.
 
+### Synchronous hook evaluation
+
+`evaluate-hook` performs a synchronous `POST /api/v1/hooks:evaluate` against the Sigil hooks API to enforce policy rules before (preflight) or after (postflight) an upstream LLM call. Hooks are disabled by default; opt in via `:hooks-config`:
+
+```lisp
+(defvar *client*
+  (sigil-cl:make-client
+   (sigil-cl:make-config
+    :generation-endpoint "https://sigil.example.com/api/v1/generations:export"
+    ;; Optional: override the hooks API host root explicitly. When unset, the
+    ;; hooks endpoint is derived from :generation-endpoint's host root.
+    :api-endpoint "https://sigil.example.com"
+    :hooks-config (sigil-cl:make-hooks-config :enabled t
+                                              :phases '(:preflight)
+                                              :timeout-sec 5.0
+                                              :fail-open t)
+    :auth-mode :basic
+    :auth-password "glc_..."
+    :tenant-id "12345")))
+
+(handler-case
+    (let* ((ctx (sigil-cl:make-hook-context
+                 :model-provider "anthropic"
+                 :model-name "claude-sonnet-4-20250514"
+                 :agent-name "router"
+                 :tags '(("env" . "prod"))))
+           (input (sigil-cl:make-hook-input
+                   :system-prompt system-prompt
+                   :messages input-messages))
+           (response (sigil-cl:evaluate-hook *client*
+                                             :phase :preflight
+                                             :context ctx
+                                             :input input)))
+      ;; If the server returns transformed_input, substitute the rewritten
+      ;; messages/tools/system-prompt into the upstream LLM call. The SDK
+      ;; never mutates caller state -- the caller decides whether to use it.
+      (let ((rewritten (sigil-cl:response-transformed-input response)))
+        (when rewritten
+          (setf system-prompt (sigil-cl:hook-input-system-prompt rewritten))
+          (when (sigil-cl:hook-input-messages rewritten)
+            (setf input-messages (sigil-cl:hook-input-messages rewritten)))))
+      ;; ... call the upstream LLM ...
+      )
+  (sigil-cl:sigil-hook-denied-error (c)
+    ;; Block the LLM call -- the server denied this request.
+    (log-denied (sigil-cl:sigil-hook-denied-error-rule-id c)
+                (sigil-cl:sigil-hook-denied-error-reason c)))
+  (sigil-cl:sigil-hook-transport-error (c)
+    ;; Only reachable when :fail-open nil -- otherwise transport errors
+    ;; resolve to a synthetic allow response.
+    (log-transport-failure c)))
+```
+
+Behaviour:
+
+- **Allow** → returns a `hook-evaluate-response` with `(response-action r) = :allow`.
+- **Deny** → signals `sigil-hook-denied-error` with `rule-id`, `reason`, and per-rule `evaluations`.
+- **Transport failure** → honours `(hooks-config-fail-open hooks)`: when `t` (default) returns a synthetic allow response so failed hook checks never block the LLM call; when `nil` signals `sigil-hook-transport-error`.
+- **transformed_input** → the response carries an optional `hook-input` accessible via `response-transformed-input`. Callers decide whether to substitute the rewritten `messages` / `tools` / `system_prompt` into the upstream call. The SDK does not mutate caller state.
+- **Endpoint** → derived from `:api-endpoint` when set, otherwise from the host root of `:generation-endpoint`. Both `https://host` and `https://host/api/v1/...` forms are accepted; only the scheme + host are used.
+- **Timeout** → `(hooks-config-timeout-sec hooks)` (default `15.0`) is sent to the server via the `X-Sigil-Hook-Timeout-Ms` header. The `:timeout-sec` keyword on `evaluate-hook` overrides it for a single call.
+- **Response size** → bodies larger than 4 MiB are treated as transport failures.
+
 ### Shutdown
 
 ```lisp
@@ -166,6 +230,8 @@ with neither a URL nor both a media type and inline data is dropped.
 | `:scores-export-path` | `"/api/v1/scores:export"` | Score export route on the generation endpoint host |
 | `:ingest-actor` | `"ingest:sdk/lisp"` | Value of the `X-Agento11y-Ingest-Actor` header. It is appended to both the eval auth and score-export auth headers, so it rides every eval request, reads included; `""` sends no header |
 | `:experiment-url-template` | `nil` | Optional UI URL template with `{base}` and `{run_id}` placeholders |
+| `:api-endpoint` | `nil` | Host root used to derive `/api/v1/...` URLs (currently the hooks endpoint). Falls back to the host of `:generation-endpoint` |
+| `:hooks-config` | `nil` | `(make-hooks-config :enabled t :phases '(:preflight) :timeout-sec 15.0 :fail-open t)` — synchronous hook evaluation config |
 | `:traces-endpoint` | `nil` | Full URL for OTLP trace export |
 | `:traces-enabled` | `nil` | Enable trace/span export |
 | `:metrics-endpoint` | `nil` | Full URL for OTLP metrics export (e.g. `https://{host}/v1/metrics`) |

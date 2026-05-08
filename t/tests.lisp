@@ -2500,6 +2500,353 @@ the cdr of CALLS-PLACE as (method url content), newest first."
       (check "build-output: tool-call second" (typep (second (message-parts msg)) 'tool-call-part))
       (check "build-output: text last" (typep (third (message-parts msg)) 'text-part)))))
 
+(defun %make-hook-client (&key http-fn
+                               (api-endpoint nil)
+                               (generation-endpoint
+                                "https://sigil.example.com/api/v1/generations:export")
+                               (hooks-config (make-hooks-config :enabled t))
+                               (extra-headers nil)
+                               (auth-mode :bearer)
+                               (auth-password "tok"))
+  "Build a client wired with hooks-config and an injected http-fn."
+  (make-client
+   (make-config :generation-endpoint generation-endpoint
+                :api-endpoint api-endpoint
+                :hooks-config hooks-config
+                :extra-headers extra-headers
+                :auth-mode auth-mode
+                :auth-password auth-password
+                :http-fn http-fn)
+   :env-fn (constantly nil)))
+
+(defun run-hooks-tests ()
+  (with-test-suite ("Hooks")
+    ;; --- Type construction ---
+    (let ((ctx (make-hook-context :model-provider "openai"
+                                   :model-name "gpt-4"
+                                   :agent-name "router"
+                                   :tags '(("env" . "prod")))))
+      (check "hook-context model-provider"
+             (equal (hook-context-model-provider ctx) "openai"))
+      (check "hook-context model-name"
+             (equal (hook-context-model-name ctx) "gpt-4"))
+      (check "hook-context tags"
+             (equal (cdr (assoc "env" (hook-context-tags ctx) :test #'equal))
+                    "prod")))
+
+    (let ((in (make-hook-input :system-prompt "be safe"
+                                :messages (list (make-message :role :user
+                                                              :parts (list (make-text-part "hi")))))))
+      (check "hook-input system-prompt"
+             (equal (hook-input-system-prompt in) "be safe"))
+      (check "hook-input messages length"
+             (= (length (hook-input-messages in)) 1)))
+
+    ;; --- hooks-config defaults ---
+    (let ((cfg (make-hooks-config)))
+      (check "hooks-config enabled default nil"
+             (null (hooks-config-enabled cfg)))
+      (check "hooks-config phases default :preflight"
+             (equal (hooks-config-phases cfg) (list :preflight)))
+      (check "hooks-config timeout-sec default 15"
+             (= (hooks-config-timeout-sec cfg) 15.0))
+      (check "hooks-config fail-open default t"
+             (eq (hooks-config-fail-open cfg) t)))
+
+    ;; --- Condition shape ---
+    (handler-case
+        (error 'sigil-hook-denied-error
+               :message "denied"
+               :rule-id "r1"
+               :reason "PII"
+               :evaluations nil)
+      (sigil-hook-denied-error (c)
+        (check "denied error rule-id"
+               (equal (sigil-hook-denied-error-rule-id c) "r1"))
+        (check "denied error reason"
+               (equal (sigil-hook-denied-error-reason c) "PII"))))
+
+    (handler-case
+        (error 'sigil-hook-transport-error :message "boom")
+      (sigil-hook-transport-error (c)
+        (check "transport error message"
+               (search "boom" (sigil-error-message c)))))
+
+    ;; --- Disabled hooks short-circuit to allow ---
+    (let* ((called 0)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled nil)
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (incf called)
+                               (values "{}" 200))))
+           (resp (evaluate-hook client :phase :preflight)))
+      (check "disabled: returns allow without HTTP"
+             (and (eq (response-action resp) :allow)
+                  (zerop called))))
+
+    ;; --- Phase mismatch short-circuits to allow ---
+    (let* ((called 0)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t
+                                                     :phases (list :preflight))
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (incf called)
+                               (values "{}" 200))))
+           (resp (evaluate-hook client :phase :postflight)))
+      (check "phase mismatch: returns allow without HTTP"
+             (and (eq (response-action resp) :allow)
+                  (zerop called))))
+
+    ;; --- Allow response is returned ---
+    (let* ((captured nil)
+           (client (%make-hook-client
+                    :http-fn (lambda (url &key headers content)
+                               (setf captured (list url headers content))
+                               (values "{\"action\":\"allow\"}" 200))))
+           (resp (evaluate-hook client :phase :preflight)))
+      (check "allow: response action is :allow"
+             (eq (response-action resp) :allow))
+      (check "allow: HTTP was invoked"
+             (not (null captured))))
+
+    ;; --- API endpoint host-root fallback from generation-endpoint ---
+    (let* ((captured-url nil)
+           (client (%make-hook-client
+                    :generation-endpoint
+                    "https://sigil.example.com/api/v1/generations:export"
+                    :api-endpoint nil
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore headers content))
+                               (setf captured-url url)
+                               (values "{\"action\":\"allow\"}" 200))))
+           (resp (evaluate-hook client :phase :preflight)))
+      (declare (ignore resp))
+      (check "URL falls back to host root + /api/v1/hooks:evaluate"
+             (equal captured-url
+                    "https://sigil.example.com/api/v1/hooks:evaluate")))
+
+    ;; --- API endpoint takes precedence over generation-endpoint ---
+    (let* ((captured-url nil)
+           (client (%make-hook-client
+                    :generation-endpoint
+                    "https://other.example.com/api/v1/generations:export"
+                    :api-endpoint "https://hooks.example.com"
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore headers content))
+                               (setf captured-url url)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (check ":api-endpoint preferred over generation-endpoint"
+             (equal captured-url
+                    "https://hooks.example.com/api/v1/hooks:evaluate")))
+
+    ;; --- X-Sigil-Hook-Timeout-Ms header is sent ---
+    (let* ((captured-headers nil)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t
+                                                     :timeout-sec 2.5)
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url content))
+                               (setf captured-headers headers)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (let ((hdr (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+                             :test #'string-equal))))
+        (check "X-Sigil-Hook-Timeout-Ms present"
+               (and hdr (stringp hdr)))
+        (check "timeout header value derived from timeout-sec (2.5s -> 2500)"
+               (equal hdr "2500"))))
+
+    ;; --- :timeout-sec keyword overrides hooks-config ---
+    (let* ((captured-headers nil)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t
+                                                     :timeout-sec 2.0)
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url content))
+                               (setf captured-headers headers)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight :timeout-sec 7.5)
+      (let ((hdr (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+                             :test #'string-equal))))
+        (check ":timeout-sec keyword overrides config"
+               (equal hdr "7500"))))
+
+    ;; --- Auth + extra headers are merged ---
+    (let* ((captured-headers nil)
+           (client (%make-hook-client
+                    :auth-mode :bearer
+                    :auth-password "secret"
+                    :extra-headers '(("X-Custom" . "v"))
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url content))
+                               (setf captured-headers headers)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (check "auth header forwarded"
+             (equal (cdr (assoc "Authorization" captured-headers :test #'equal))
+                    "Bearer secret"))
+      (check "extra header forwarded"
+             (equal (cdr (assoc "X-Custom" captured-headers :test #'equal)) "v"))
+      (check "Content-Type set"
+             (equal (cdr (assoc "Content-Type" captured-headers :test #'equal))
+                    "application/json")))
+
+    ;; --- Deny response signals sigil-hook-denied-error ---
+    (let ((client (%make-hook-client
+                   :http-fn (lambda (&rest _) (declare (ignore _))
+                              (values "{\"action\":\"deny\",\"rule_id\":\"r1\",\"reason\":\"PII\"}"
+                                      200)))))
+      (handler-case
+          (progn (evaluate-hook client :phase :preflight)
+                 (check "deny: signalled an error" nil))
+        (sigil-hook-denied-error (c)
+          (check "deny: rule-id surfaced"
+                 (equal (sigil-hook-denied-error-rule-id c) "r1"))
+          (check "deny: reason surfaced"
+                 (equal (sigil-hook-denied-error-reason c) "PII")))))
+
+    ;; --- transformed_input parsed into hook-input ---
+    (let* ((client (%make-hook-client
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (values "{\"action\":\"allow\",\"transformed_input\":{\"system_prompt\":\"safer\"}}"
+                                       200))))
+           (resp (evaluate-hook client :phase :preflight))
+           (ti (response-transformed-input resp)))
+      (check "transformed-input present" (not (null ti)))
+      (check "transformed-input system-prompt parsed"
+             (equal (hook-input-system-prompt ti) "safer")))
+
+    ;; --- Transport error + fail-open=t -> synthetic allow ---
+    (let* ((client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t :fail-open t)
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (error "boom"))))
+           (resp (evaluate-hook client :phase :preflight)))
+      (check "fail-open=t transport error -> allow"
+             (eq (response-action resp) :allow)))
+
+    ;; --- Transport error + fail-open=nil -> sigil-hook-transport-error ---
+    (let ((client (%make-hook-client
+                   :hooks-config (make-hooks-config :enabled t :fail-open nil)
+                   :http-fn (lambda (&rest _) (declare (ignore _))
+                              (error "boom")))))
+      (handler-case
+          (progn (evaluate-hook client :phase :preflight)
+                 (check "fail-open=nil: signalled an error" nil))
+        (sigil-hook-transport-error (c)
+          (check "fail-open=nil: transport error signalled"
+                 (search "boom" (sigil-error-message c))))))
+
+    ;; --- 5xx status + fail-open=t -> allow ---
+    (let* ((client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t :fail-open t)
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (values "boom" 500))))
+           (resp (evaluate-hook client :phase :preflight)))
+      (check "fail-open=t 5xx -> allow"
+             (eq (response-action resp) :allow)))
+
+    ;; --- 5xx status + fail-open=nil -> sigil-hook-transport-error ---
+    (let ((client (%make-hook-client
+                   :hooks-config (make-hooks-config :enabled t :fail-open nil)
+                   :http-fn (lambda (&rest _) (declare (ignore _))
+                              (values "boom" 500)))))
+      (handler-case
+          (progn (evaluate-hook client :phase :preflight)
+                 (check "fail-open=nil 5xx: signalled an error" nil))
+        (sigil-hook-transport-error (c)
+          (declare (ignore c))
+          (check "fail-open=nil 5xx: transport error signalled" t))))
+
+    ;; --- Response body too large -> fail-open=t allow ---
+    (let* ((big (make-string (1+ (ash 4 20)) :initial-element #\a))
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t :fail-open t)
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (values big 200))))
+           (resp (evaluate-hook client :phase :preflight)))
+      (check "oversize body fail-open -> allow"
+             (eq (response-action resp) :allow)))
+
+    ;; --- Body shape: phase + context + input round-trip ---
+    (let* ((captured-body nil)
+           (client (%make-hook-client
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url headers))
+                               (setf captured-body content)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client
+                     :phase :preflight
+                     :context (make-hook-context :model-provider "openai"
+                                                  :model-name "gpt-4"
+                                                  :agent-name "a"
+                                                  :tags '(("env" . "prod")))
+                     :input (make-hook-input
+                             :system-prompt "sys"
+                             :messages (list (make-message
+                                              :role :user
+                                              :parts (list (make-text-part "hi"))))))
+      (let* ((parsed (jzon:parse captured-body))
+             (phase (jget parsed "phase"))
+             (ctx-obj (jget parsed "context"))
+             (in-obj (jget parsed "input")))
+        (check "body phase=preflight" (equal phase "preflight"))
+        (check "body context.model.provider"
+               (equal (jget* ctx-obj "model" "provider") "openai"))
+        (check "body context.agent_name"
+               (equal (jget ctx-obj "agent_name") "a"))
+        (check "body input.system_prompt"
+               (equal (jget in-obj "system_prompt") "sys"))
+        (check "body input.messages[0].role"
+               (equal (jget* in-obj "messages" 0 "role") "user"))
+        (check "body input.messages[0].parts[0].text"
+               (equal (jget* in-obj "messages" 0 "parts" 0 "text") "hi"))))
+
+    ;; --- :system role collapses to "user" on the wire (matches Python) ---
+    (let* ((captured-body nil)
+           (client (%make-hook-client
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url headers))
+                               (setf captured-body content)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client
+                     :phase :preflight
+                     :input (make-hook-input
+                             :messages (list (make-message
+                                              :role :system
+                                              :parts (list (make-text-part "x"))))))
+      (let* ((parsed (jzon:parse captured-body))
+             (in-obj (jget parsed "input")))
+        (check ":system role rewritten to \"user\" on the wire"
+               (equal (jget* in-obj "messages" 0 "role") "user"))))
+
+    ;; --- Schemeless :api-endpoint gets https:// prefix ---
+    (let* ((captured-url nil)
+           (client (%make-hook-client
+                    :api-endpoint "hooks.example.com"
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore headers content))
+                               (setf captured-url url)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (check "schemeless api-endpoint gets https:// prefix"
+             (equal captured-url
+                    "https://hooks.example.com/api/v1/hooks:evaluate")))
+
+    ;; --- Schemeless :api-endpoint with trailing path uses host only ---
+    (let* ((captured-url nil)
+           (client (%make-hook-client
+                    :api-endpoint "hooks.example.com/some/path"
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore headers content))
+                               (setf captured-url url)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (check "schemeless api-endpoint strips trailing path"
+             (equal captured-url
+                    "https://hooks.example.com/api/v1/hooks:evaluate")))))
+
 ;;; ================================================================
 ;;; Experiment tests
 ;;; ================================================================
@@ -5039,7 +5386,8 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                            #'run-trial-tests
                            #'run-suite-tests
                            #'run-conversations-tests
-                           #'run-metrics-tests))
+                           #'run-metrics-tests
+                           #'run-hooks-tests))
       (multiple-value-bind (ok pass fail) (funcall test-fn)
         (declare (ignore ok))
         (incf total-pass pass)

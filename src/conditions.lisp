@@ -41,3 +41,18 @@
   ()
   (:report (lambda (c stream)
              (format stream "Sigil actor mismatch error: ~a" (sigil-error-message c)))))
+
+(define-condition sigil-hook-denied-error (sigil-error)
+  ((rule-id     :initarg :rule-id     :reader sigil-hook-denied-error-rule-id     :initform "")
+   (reason      :initarg :reason      :reader sigil-hook-denied-error-reason      :initform "")
+   (evaluations :initarg :evaluations :reader sigil-hook-denied-error-evaluations :initform nil))
+  (:report (lambda (c stream)
+             (format stream "Sigil hook denied (rule ~a): ~a"
+                     (sigil-hook-denied-error-rule-id c)
+                     (sigil-hook-denied-error-reason c)))))
+
+(define-condition sigil-hook-transport-error (sigil-error)
+  ()
+  (:report (lambda (c stream)
+             (format stream "Sigil hook transport error: ~a"
+                     (sigil-error-message c)))))
