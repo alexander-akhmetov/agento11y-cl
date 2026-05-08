@@ -8,9 +8,6 @@
 
 ;;; --- String helpers ---
 
-(defun %whitespace-char-p (c)
-  (or (char= c #\Space) (char= c #\Tab) (char= c #\Newline) (char= c #\Return)))
-
 (defun %trim (s)
   (string-trim '(#\Space #\Tab #\Newline #\Return) s))
 

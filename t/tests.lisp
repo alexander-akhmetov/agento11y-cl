@@ -179,7 +179,24 @@
                                              headers))))
       (check "extra-headers: user Authorization wins"
              (and (= (length auth-vals) 1)
-                  (equal (first auth-vals) "Bearer override"))))))
+                  (equal (first auth-vals) "Bearer override"))))
+
+    ;; Case-insensitive duplicates inside extras themselves are collapsed
+    (let* ((cfg (make-config :auth-mode :none
+                             :extra-headers '(("Authorization" . "first")
+                                              ("authorization" . "second")
+                                              ("X-Custom" . "keep"))))
+           (headers (sigil-cl::build-auth-headers cfg))
+           (auth-vals (mapcar #'cdr
+                              (remove-if-not (lambda (kv)
+                                               (string-equal (car kv) "authorization"))
+                                             headers))))
+      (check "extra-headers: duplicate names collapsed to one entry"
+             (= (length auth-vals) 1))
+      (check "extra-headers: last duplicate wins"
+             (equal (first auth-vals) "second"))
+      (check "extra-headers: non-duplicate kept"
+             (equal (cdr (assoc "X-Custom" headers :test #'equal)) "keep")))))
 
 (defun run-env-tests ()
   (with-test-suite ("Env")
@@ -850,35 +867,42 @@
       (check "trace-context nil after" (null *trace-context*)))
 
     ;; with-span: gen_ai.agent.name uses agent-name when set, falling back to service-name
-    (flet ((agent-attr (span)
+    (flet ((span-attr (span key)
              (let ((found nil))
                (loop for a across (jget span "attributes")
-                     when (equal (jget a "key") "gen_ai.agent.name")
+                     when (equal (jget a "key") key)
                        do (setf found (jget* a "value" "stringValue")))
                found)))
-      ;; agent-name set -> wins over service-name
+      ;; agent-name/version set -> win over service-name/version
       (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
                                               :traces-enabled t
                                               :service-name "my-app"
-                                              :agent-name "router")
+                                              :service-version "1.0"
+                                              :agent-name "router"
+                                              :agent-version "2.0")
                                  :env-fn (constantly nil))))
         (with-span (client "test-op")
           nil)
         (let* ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client)))
                (span (first spans)))
           (check "with-span: agent-name wins over service-name"
-                 (equal (agent-attr span) "router"))))
-      ;; agent-name unset -> service-name fallback (back-compat)
+                 (equal (span-attr span "gen_ai.agent.name") "router"))
+          (check "with-span: agent-version wins over service-version"
+                 (equal (span-attr span "gen_ai.agent.version") "2.0"))))
+      ;; agent-name/version unset -> service-name/version fallback (back-compat)
       (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
                                               :traces-enabled t
-                                              :service-name "legacy-app")
+                                              :service-name "legacy-app"
+                                              :service-version "0.9")
                                  :env-fn (constantly nil))))
         (with-span (client "test-op")
           nil)
         (let* ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client)))
                (span (first spans)))
           (check "with-span: falls back to service-name"
-                 (equal (agent-attr span) "legacy-app")))))))
+                 (equal (span-attr span "gen_ai.agent.name") "legacy-app"))
+          (check "with-span: falls back to service-version"
+                 (equal (span-attr span "gen_ai.agent.version") "0.9")))))))
 
 (defun run-normalize-tests ()
   (with-test-suite ("Normalize")
