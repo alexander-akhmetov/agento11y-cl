@@ -6,6 +6,7 @@
   ((config           :initarg :config           :accessor client-config)
    (generation-queue :initarg :generation-queue :accessor client-generation-queue)
    (trace-queue      :initarg :trace-queue      :accessor client-trace-queue)
+   (workflow-queue   :initarg :workflow-queue   :accessor client-workflow-queue)
    (worker-thread    :initform nil              :accessor client-worker-thread)
    (running-p        :initform nil              :accessor client-running-p)
    (lock             :initform (bt2:make-lock :name "sigil-client")
@@ -25,7 +26,9 @@ can pass (constantly nil) to ignore the host environment."
       :generation-queue (make-bounded-queue :max-size (config-queue-max resolved)
                                             :name "generation")
       :trace-queue (make-bounded-queue :max-size (effective-trace-queue-max resolved)
-                                        :name "trace"))))
+                                        :name "trace")
+      :workflow-queue (make-bounded-queue :max-size (config-queue-max resolved)
+                                           :name "workflow-step"))))
 
 (defun noop-client ()
   "Create a client that discards everything (for testing/disabled mode)."
@@ -34,19 +37,23 @@ can pass (constantly nil) to ignore the host environment."
 ;;; --- Background flush loop ---
 
 (defun run-flush-loop (client)
-  "Background loop: drain and export batches from both queues."
+  "Background loop: drain and export batches from generation, trace, and workflow queues."
   (let ((config (client-config client)))
     (loop while (bt2:with-lock-held ((client-lock client))
                   (client-running-p client))
           do (handler-case
                  (let ((gen-batch (queue-drain-batch (client-generation-queue client)
                                                      (config-batch-size config)))
-                       (trace-batch (queue-drain-all (client-trace-queue client))))
+                       (trace-batch (queue-drain-all (client-trace-queue client)))
+                       (wfs-batch (queue-drain-batch (client-workflow-queue client)
+                                                     (config-batch-size config))))
                    (when (and gen-batch (config-generation-enabled config))
                      (export-generations config gen-batch (build-auth-headers config)))
                    (when (and trace-batch (config-traces-enabled config))
                      (export-traces config trace-batch (build-traces-auth-headers config)))
-                   (unless (or gen-batch trace-batch)
+                   (when (and wfs-batch (config-workflow-steps-enabled config))
+                     (export-workflow-steps config wfs-batch (build-auth-headers config)))
+                   (unless (or gen-batch trace-batch wfs-batch)
                      (bt2:with-lock-held ((client-lock client))
                        (bt2:condition-wait (client-wake-cv client) (client-lock client)
                                            :timeout (config-flush-interval-sec config)))))
@@ -63,7 +70,9 @@ can pass (constantly nil) to ignore the host environment."
     (when (client-running-p client)
       (return-from client-start client))
     (let ((config (client-config client)))
-      (when (or (config-generation-enabled config) (config-traces-enabled config))
+      (when (or (config-generation-enabled config)
+                (config-traces-enabled config)
+                (config-workflow-steps-enabled config))
         (setf (client-running-p client) t)
         (setf (client-worker-thread client)
               (bt2:make-thread (lambda () (run-flush-loop client))
@@ -122,7 +131,17 @@ can pass (constantly nil) to ignore the host environment."
             (error (e)
               (sigil-log config :warn "flush"
                         (format nil "trace export failed: ~a"
-                                (princ-to-string e)))))))))
+                                (princ-to-string e))))))))
+    (when (config-workflow-steps-enabled config)
+      (loop for batch = (queue-drain-batch (client-workflow-queue client)
+                                            (config-batch-size config))
+            while batch
+            do (handler-case
+                   (export-workflow-steps config batch (build-auth-headers config))
+                 (error (e)
+                   (sigil-log config :warn "flush"
+                             (format nil "workflow-step batch export failed: ~a"
+                                     (princ-to-string e))))))))
   nil)
 
 ;;; --- Recorder factories ---
@@ -147,14 +166,21 @@ can pass (constantly nil) to ignore the host environment."
                                       (thinking-enabled :unset)
                                       parent-generation-ids
                                       tags metadata)
-  "Create and start a generation recorder."
-  (let ((config (client-config client)))
+  "Create and start a generation recorder.
+When called inside a `with-workflow-step` (or any other context that binds
+`*trace-context*`), the generation inherits the workflow's trace-id and uses
+its span-id as parent so spans nest under the workflow span."
+  (let* ((config (client-config client))
+         (ctx *trace-context*)
+         (inherited-trace-id (getf ctx :trace-id))
+         (inherited-parent-span-id (getf ctx :span-id)))
     (make-instance 'generation-recorder
       :client client
       :started-at (iso8601-now)
       :generation-id (generate-id)
-      :trace-id (generate-trace-id)
+      :trace-id (or inherited-trace-id (generate-trace-id))
       :span-id (generate-span-id)
+      :parent-span-id inherited-parent-span-id
       :mode mode
       :conversation-id conversation-id
       :conversation-title conversation-title
@@ -205,3 +231,30 @@ can pass (constantly nil) to ignore the host environment."
       :agent-name (%resolve-agent-name config agent-name)
       :agent-version (%resolve-agent-version config agent-version)
       :source source)))
+
+(defun start-workflow-step (client &key conversation-id step-name framework
+                                         agent-name agent-version
+                                         input-state output-state
+                                         tags metadata
+                                         linked-generation-ids parent-step-ids)
+  "Create and start a workflow step recorder.
+Auto-generates step-id, trace-id, span-id, and started-at so callers can read
+them immediately to build parent-step-id chains."
+  (let ((config (client-config client)))
+    (make-instance 'workflow-step-recorder
+      :client client
+      :started-at (iso8601-now)
+      :step-id (generate-workflow-step-id)
+      :trace-id (generate-trace-id)
+      :span-id (generate-span-id)
+      :conversation-id conversation-id
+      :step-name step-name
+      :framework framework
+      :agent-name (%resolve-agent-name config agent-name)
+      :agent-version (%resolve-agent-version config agent-version)
+      :input-state input-state
+      :output-state output-state
+      :tags tags
+      :metadata metadata
+      :linked-generation-ids linked-generation-ids
+      :parent-step-ids parent-step-ids)))

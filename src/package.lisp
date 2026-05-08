@@ -15,6 +15,7 @@
    #:start-generation
    #:start-tool-execution
    #:start-embedding
+   #:start-workflow-step
    ;; Recorder operations
    #:set-result
    #:set-call-error
@@ -23,6 +24,7 @@
    #:with-generation
    #:with-tool-execution
    #:with-embedding
+   #:with-workflow-step
    #:with-span
    ;; Ratings
    #:submit-conversation-rating
@@ -71,6 +73,11 @@
    #:gen-rec-generation-id
    #:gen-rec-trace-id
    #:gen-rec-span-id
+   #:wfs-rec-step-id
+   #:wfs-rec-trace-id
+   #:wfs-rec-span-id
+   #:wfs-rec-conversation-id
+   #:wfs-rec-step-name
    ;; OTel helpers
    #:otel-string-attr
    #:otel-int-attr

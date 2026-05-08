@@ -3,9 +3,12 @@
 ;;; --- Helper: make a test client with captured requests ---
 
 (defun make-test-client (&key (generation-enabled t) (traces-enabled t)
+                               (workflow-steps-enabled nil)
                                (capture :metadata-only)
                                (generation-endpoint "http://test-sigil:4318/api/v1/generations:export")
-                               (traces-endpoint "http://test-sigil:4318/v1/traces"))
+                               (traces-endpoint "http://test-sigil:4318/v1/traces")
+                               (workflow-steps-endpoint
+                                "http://test-sigil:4318/api/v1/workflow-steps:export"))
   "Create a client with mock HTTP that captures requests."
   (let ((requests nil))
     (values
@@ -15,6 +18,8 @@
        :generation-enabled generation-enabled
        :traces-endpoint traces-endpoint
        :traces-enabled traces-enabled
+       :workflow-steps-endpoint workflow-steps-endpoint
+       :workflow-steps-enabled workflow-steps-enabled
        :content-capture-mode capture
        :service-name "test-service"
        :service-version "1.0.0"
@@ -784,6 +789,246 @@
           (check "embedding span name"
                  (search "embeddings" (jget span "name"))))))))
 
+(defun run-workflow-step-tests ()
+  (with-test-suite ("WorkflowStep")
+    ;; Util: generate-workflow-step-id
+    (let ((id (sigil-cl::generate-workflow-step-id)))
+      (check "wfs id starts with wfs_"
+             (and (stringp id) (eql 0 (search "wfs_" id))))
+      (check "wfs id unique"
+             (not (equal id (sigil-cl::generate-workflow-step-id)))))
+
+    ;; Auto-generated IDs and started-at
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client
+                   :conversation-id "conv-1"
+                   :step-name "classify")))
+        (check "wfs has step-id" (search "wfs_" (sigil-cl::wfs-rec-step-id rec)))
+        (check "wfs has 32-hex trace-id"
+               (= (length (sigil-cl::wfs-rec-trace-id rec)) 32))
+        (check "wfs has 16-hex span-id"
+               (= (length (sigil-cl::wfs-rec-span-id rec)) 16))
+        (check "wfs has started-at"
+               (and (stringp (sigil-cl::recorder-started-at rec))
+                    (plusp (length (sigil-cl::recorder-started-at rec)))))))
+
+    ;; set-result mutates slots
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client
+                   :conversation-id "conv-1"
+                   :step-name "classify")))
+        (let ((in (jobj "x" 1))
+              (out (jobj "y" 2))
+              (md (jobj "k" "v")))
+          (sigil-cl::set-result rec
+                                :input-state in
+                                :output-state out
+                                :metadata md
+                                :tags '(("env" . "prod"))
+                                :linked-generation-ids '("gen_a" "gen_b")
+                                :parent-step-ids '("wfs_prev")
+                                :duration-seconds 0.25d0)
+          (check "set-result: input-state" (eq (sigil-cl::wfs-rec-input-state rec) in))
+          (check "set-result: output-state" (eq (sigil-cl::wfs-rec-output-state rec) out))
+          (check "set-result: metadata" (eq (sigil-cl::wfs-rec-metadata rec) md))
+          (check "set-result: tags"
+                 (equal (sigil-cl::wfs-rec-tags rec) '(("env" . "prod"))))
+          (check "set-result: linked-generation-ids"
+                 (equal (sigil-cl::wfs-rec-linked-generation-ids rec)
+                        '("gen_a" "gen_b")))
+          (check "set-result: parent-step-ids"
+                 (equal (sigil-cl::wfs-rec-parent-step-ids rec) '("wfs_prev")))
+          (check "set-result: duration-seconds"
+                 (= (sigil-cl::wfs-rec-duration-seconds rec) 0.25d0)))))
+
+    ;; recorder-end enqueues to both queues
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client
+                   :conversation-id "conv-1"
+                   :step-name "classify"
+                   :framework "custom"
+                   :agent-name "agent-1"
+                   :agent-version "v1"
+                   :parent-step-ids '("wfs_prev")
+                   :linked-generation-ids '("gen_a"))))
+        (sigil-cl::recorder-end rec)
+        ;; Workflow queue payload
+        (let ((wfs (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-workflow-queue client)))))
+          (check "wfs payload enqueued" (not (null wfs)))
+          (check "wfs payload id non-empty"
+                 (and (stringp (jget wfs "id")) (plusp (length (jget wfs "id")))))
+          (check "wfs payload conversation_id"
+                 (equal (jget wfs "conversation_id") "conv-1"))
+          (check "wfs payload step_name"
+                 (equal (jget wfs "step_name") "classify"))
+          (check "wfs payload framework"
+                 (equal (jget wfs "framework") "custom"))
+          (check "wfs payload agent_name"
+                 (equal (jget wfs "agent_name") "agent-1"))
+          (check "wfs payload agent_version"
+                 (equal (jget wfs "agent_version") "v1"))
+          (check "wfs payload started_at present"
+                 (and (stringp (jget wfs "started_at"))
+                      (= (length (jget wfs "started_at")) 20)))
+          (check "wfs payload completed_at present"
+                 (and (stringp (jget wfs "completed_at"))
+                      (= (length (jget wfs "completed_at")) 20)))
+          (check "wfs payload trace_id present"
+                 (= (length (jget wfs "trace_id")) 32))
+          (check "wfs payload span_id present"
+                 (= (length (jget wfs "span_id")) 16))
+          (check "wfs payload parent_step_ids vector"
+                 (and (vectorp (jget wfs "parent_step_ids"))
+                      (equal (aref (jget wfs "parent_step_ids") 0) "wfs_prev")))
+          (check "wfs payload linked_generation_ids vector"
+                 (and (vectorp (jget wfs "linked_generation_ids"))
+                      (equal (aref (jget wfs "linked_generation_ids") 0) "gen_a"))))
+        ;; Trace queue span
+        (let ((span (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-trace-queue client)))))
+          (check "wfs span enqueued" (not (null span)))
+          (check "wfs span name"
+                 (equal (jget span "name") "workflow_step classify"))
+          (check "wfs span kind=INTERNAL" (= (jget span "kind") 1))
+          (check "wfs span no parent (top-level)"
+                 (null (jget span "parentSpanId")))
+          (let* ((attrs (coerce (jget span "attributes") 'list))
+                 (op (find "gen_ai.operation.name" attrs
+                           :key (lambda (a) (jget a "key")) :test #'equal))
+                 (sname (find "sigil.workflow.step.name" attrs
+                              :key (lambda (a) (jget a "key")) :test #'equal))
+                 (sid (find "sigil.workflow.step.id" attrs
+                            :key (lambda (a) (jget a "key")) :test #'equal))
+                 (fw (find "sigil.workflow.framework" attrs
+                           :key (lambda (a) (jget a "key")) :test #'equal)))
+            (check "wfs span op-name=workflow_step"
+                   (equal (jget* op "value" "stringValue") "workflow_step"))
+            (check "wfs span step.name attr"
+                   (equal (jget* sname "value" "stringValue") "classify"))
+            (check "wfs span step.id attr"
+                   (and sid
+                        (search "wfs_" (jget* sid "value" "stringValue"))))
+            (check "wfs span framework attr"
+                   (equal (jget* fw "value" "stringValue") "custom"))))))
+
+    ;; Endpoint disabled: payload not enqueued, span still emitted
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled nil :traces-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client
+                   :conversation-id "c"
+                   :step-name "noop")))
+        (sigil-cl::recorder-end rec)
+        (check "disabled: no workflow payload"
+               (sigil-cl::queue-empty-p (sigil-cl::client-workflow-queue client)))
+        (check "disabled: traces still emitted"
+               (not (sigil-cl::queue-empty-p (sigil-cl::client-trace-queue client))))))
+
+    ;; Both disabled: nothing enqueued
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled nil :traces-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client
+                   :conversation-id "c"
+                   :step-name "noop")))
+        (sigil-cl::recorder-end rec)
+        (check "both disabled: no workflow payload"
+               (sigil-cl::queue-empty-p (sigil-cl::client-workflow-queue client)))
+        (check "both disabled: no trace span"
+               (sigil-cl::queue-empty-p (sigil-cl::client-trace-queue client)))))
+
+    ;; Error path: error-message via set-call-error
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client
+                   :conversation-id "c"
+                   :step-name "boom")))
+        (sigil-cl::set-call-error rec "kaboom")
+        (sigil-cl::recorder-end rec)
+        (let ((wfs (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-workflow-queue client))))
+              (span (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-trace-queue client)))))
+          (check "error path: wfs error field"
+                 (equal (jget wfs "error") "kaboom"))
+          (check "error path: span status code = 2 (ERROR)"
+                 (= (jget* span "status" "code") 2)))))
+
+    ;; Nested generation parents under workflow span
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t :traces-enabled t
+                          :generation-enabled t)
+      (declare (ignore get-requests))
+      (let ((wfs-span-id nil)
+            (wfs-trace-id nil))
+        (with-workflow-step (wfs client :conversation-id "conv-1"
+                                         :step-name "wrapper")
+          (setf wfs-span-id (sigil-cl::wfs-rec-span-id wfs))
+          (setf wfs-trace-id (sigil-cl::wfs-rec-trace-id wfs))
+          (with-generation (gen client :mode :sync :model-provider "p" :model-name "m")
+            (sigil-cl::set-result gen :usage (make-token-usage :input 1 :output 1))))
+        ;; Drain trace queue: we expect at least 2 spans (gen + wfs)
+        (let* ((spans (sigil-cl::queue-drain-all
+                        (sigil-cl::client-trace-queue client)))
+               (gen-span (find-if (lambda (s)
+                                    (search "generateText" (jget s "name")))
+                                  spans))
+               (wfs-span (find-if (lambda (s)
+                                    (search "workflow_step" (jget s "name")))
+                                  spans)))
+          (check "nesting: gen span found" (not (null gen-span)))
+          (check "nesting: wfs span found" (not (null wfs-span)))
+          (check "nesting: gen span trace-id matches workflow"
+                 (equal (jget gen-span "traceId") wfs-trace-id))
+          (check "nesting: gen span parentSpanId is workflow span-id"
+                 (equal (jget gen-span "parentSpanId") wfs-span-id))
+          (check "nesting: workflow span has no parent"
+                 (null (jget wfs-span "parentSpanId"))))))
+
+    ;; Standalone generation: independent trace-id, no parent
+    (multiple-value-bind (client get-requests)
+        (make-test-client :traces-enabled t :generation-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-generation client :mode :sync
+                                              :model-provider "p"
+                                              :model-name "m")))
+        (sigil-cl::recorder-end rec)
+        (let ((span (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-trace-queue client)))))
+          (check "standalone: gen span has no parent"
+                 (null (jget span "parentSpanId")))
+          (check "standalone: gen trace-id is fresh 32-hex"
+                 (= (length (jget span "traceId")) 32)))))
+
+    ;; HTTP path: end-to-end via client-flush
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t)
+      (with-workflow-step (wfs client :conversation-id "conv-1"
+                                       :step-name "classify")
+        wfs)
+      (client-flush client)
+      (let* ((reqs (funcall get-requests))
+             (wfs-req (find "workflow-steps:export" reqs
+                            :key #'first :test #'search)))
+        (check "HTTP: workflow-steps:export URL was called"
+               (not (null wfs-req)))
+        (check "HTTP: URL exact match"
+               (equal (first wfs-req)
+                      "http://test-sigil:4318/api/v1/workflow-steps:export"))
+        (let ((parsed (jzon:parse (second wfs-req))))
+          (check "HTTP: body has workflow_steps array"
+                 (vectorp (jget parsed "workflow_steps")))
+          (check "HTTP: workflow_steps non-empty"
+                 (plusp (length (jget parsed "workflow_steps")))))))))
+
 (defun run-client-tests ()
   (with-test-suite ("Client")
     ;; Noop client
@@ -996,6 +1241,7 @@
                            #'run-queue-tests
                            #'run-otel-tests
                            #'run-recorder-tests
+                           #'run-workflow-step-tests
                            #'run-client-tests
                            #'run-macro-tests
                            #'run-normalize-tests))

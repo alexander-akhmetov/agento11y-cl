@@ -27,6 +27,17 @@ Calls recorder-end in unwind-protect."
           (progn ,@body)
        (recorder-end ,var))))
 
+(defmacro with-workflow-step ((var client &rest initargs) &body body)
+  "Execute BODY with a workflow step recorder bound to VAR.
+Binds *trace-context* per-thread so child generation/tool/embedding spans
+are correctly parented to this workflow step."
+  `(let ((,var (start-workflow-step ,client ,@initargs)))
+     (let ((*trace-context* (list :trace-id (wfs-rec-trace-id ,var)
+                                  :span-id (wfs-rec-span-id ,var))))
+       (unwind-protect
+            (progn ,@body)
+         (recorder-end ,var)))))
+
 (defmacro with-span ((client name &key (kind 1) attributes-var) &body body)
   "Execute BODY wrapped in a Sigil OTel span.
 Zero overhead when traces are disabled on CLIENT's config.

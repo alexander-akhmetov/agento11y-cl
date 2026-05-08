@@ -208,7 +208,8 @@ when reasoning or cache tokens are counted separately)."
    ;; IDs (generated at start)
    (generation-id     :initarg :generation-id     :accessor gen-rec-generation-id     :initform nil)
    (trace-id          :initarg :trace-id          :accessor gen-rec-trace-id          :initform nil)
-   (span-id           :initarg :span-id           :accessor gen-rec-span-id           :initform nil)))
+   (span-id           :initarg :span-id           :accessor gen-rec-span-id           :initform nil)
+   (parent-span-id    :initarg :parent-span-id    :accessor gen-rec-parent-span-id    :initform nil)))
 
 (defmethod recorder-type-key ((rec generation-recorder)) :generation)
 
@@ -416,6 +417,7 @@ when reasoning or cache tokens are counted separately)."
                          (or (iso8601-to-unix-nano (recorder-completed-at rec)) "0"))))
       (build-span :trace-id trace-id
                   :span-id span-id
+                  :parent-span-id (gen-rec-parent-span-id rec)
                   :name (format nil "~a ~a" op-name (or model "unknown"))
                   :kind 3
                   :start-time-unix-nano start-nano
@@ -608,3 +610,142 @@ when reasoning or cache tokens are counted separately)."
                                            (if capture-content (recorder-call-error rec)
                                                "<redacted>")
                                            ""))))))))
+
+;;; ================================================================
+;;; Workflow step recorder
+;;; ================================================================
+
+(defclass workflow-step-recorder (recorder)
+  ((step-id              :initarg :step-id              :accessor wfs-rec-step-id              :initform nil)
+   (conversation-id      :initarg :conversation-id      :accessor wfs-rec-conversation-id      :initform nil)
+   (step-name            :initarg :step-name            :accessor wfs-rec-step-name            :initform nil)
+   (framework            :initarg :framework            :accessor wfs-rec-framework            :initform nil)
+   (agent-name           :initarg :agent-name           :accessor wfs-rec-agent-name           :initform nil)
+   (agent-version        :initarg :agent-version        :accessor wfs-rec-agent-version        :initform nil)
+   (trace-id             :initarg :trace-id             :accessor wfs-rec-trace-id             :initform nil)
+   (span-id              :initarg :span-id              :accessor wfs-rec-span-id              :initform nil)
+   (input-state          :initarg :input-state          :accessor wfs-rec-input-state          :initform nil)
+   (output-state         :initarg :output-state         :accessor wfs-rec-output-state         :initform nil)
+   (error-message        :initarg :error-message        :accessor wfs-rec-error-message        :initform nil)
+   (tags                 :initarg :tags                 :accessor wfs-rec-tags                 :initform nil)
+   (metadata             :initarg :metadata             :accessor wfs-rec-metadata             :initform nil)
+   (linked-generation-ids :initarg :linked-generation-ids :accessor wfs-rec-linked-generation-ids :initform nil)
+   (parent-step-ids      :initarg :parent-step-ids      :accessor wfs-rec-parent-step-ids      :initform nil)
+   (duration-seconds     :initarg :duration-seconds     :accessor wfs-rec-duration-seconds     :initform nil)))
+
+(defmethod recorder-type-key ((rec workflow-step-recorder)) :workflow-step)
+
+(defmethod set-result ((rec workflow-step-recorder) &key input-state output-state
+                                                          error-message
+                                                          linked-generation-ids
+                                                          parent-step-ids
+                                                          tags metadata
+                                                          duration-seconds)
+  (when input-state          (setf (wfs-rec-input-state rec) input-state))
+  (when output-state         (setf (wfs-rec-output-state rec) output-state))
+  (when error-message        (setf (wfs-rec-error-message rec) error-message))
+  (when linked-generation-ids
+    (setf (wfs-rec-linked-generation-ids rec) linked-generation-ids))
+  (when parent-step-ids      (setf (wfs-rec-parent-step-ids rec) parent-step-ids))
+  (when tags                 (setf (wfs-rec-tags rec) tags))
+  (when metadata             (setf (wfs-rec-metadata rec) metadata))
+  (when duration-seconds     (setf (wfs-rec-duration-seconds rec) duration-seconds))
+  rec)
+
+(defun build-workflow-step-payload (rec config)
+  "Build a workflow-step JSON hash-table from the recorder state."
+  (let ((step (jobj "id" (wfs-rec-step-id rec)
+                    "conversation_id" (or (wfs-rec-conversation-id rec) "")
+                    "step_name" (or (wfs-rec-step-name rec) "")
+                    "started_at" (recorder-started-at rec)
+                    "completed_at" (or (recorder-completed-at rec) (iso8601-now))
+                    "trace_id" (or (wfs-rec-trace-id rec) "")
+                    "span_id" (or (wfs-rec-span-id rec) ""))))
+    (when (wfs-rec-framework rec)
+      (setf (gethash "framework" step) (wfs-rec-framework rec)))
+    (when (wfs-rec-agent-name rec)
+      (setf (gethash "agent_name" step) (wfs-rec-agent-name rec)))
+    (when (wfs-rec-agent-version rec)
+      (setf (gethash "agent_version" step) (wfs-rec-agent-version rec)))
+    (when (wfs-rec-input-state rec)
+      (setf (gethash "input_state" step) (wfs-rec-input-state rec)))
+    (when (wfs-rec-output-state rec)
+      (setf (gethash "output_state" step) (wfs-rec-output-state rec)))
+    (when (wfs-rec-metadata rec)
+      (setf (gethash "metadata" step) (wfs-rec-metadata rec)))
+    (let ((err (or (wfs-rec-error-message rec) (recorder-call-error rec))))
+      (when err
+        (setf (gethash "error" step) err)))
+    (when (wfs-rec-linked-generation-ids rec)
+      (setf (gethash "linked_generation_ids" step)
+            (coerce (wfs-rec-linked-generation-ids rec) 'vector)))
+    (when (wfs-rec-parent-step-ids rec)
+      (setf (gethash "parent_step_ids" step)
+            (coerce (wfs-rec-parent-step-ids rec) 'vector)))
+    ;; Tags: merge config + recorder, output as map<string,string>
+    (let ((all-tags (append (config-tags config) (wfs-rec-tags rec))))
+      (when all-tags
+        (let ((tags-obj (jobj)))
+          (dolist (pair all-tags)
+            (when (and (consp pair) (stringp (car pair)) (stringp (cdr pair)))
+              (setf (gethash (car pair) tags-obj) (cdr pair))))
+          (when (plusp (hash-table-count tags-obj))
+            (setf (gethash "tags" step) tags-obj)))))
+    step))
+
+(defun build-workflow-step-span (rec config)
+  "Build an OTel span for a workflow step. Returns span hash-table."
+  (let* ((trace-id (wfs-rec-trace-id rec))
+         (span-id (wfs-rec-span-id rec))
+         (step-name (or (wfs-rec-step-name rec) "unknown"))
+         (err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
+         (capture (config-content-capture-mode config))
+         (capture-content (capture-keeps-content-p capture))
+         (attrs (common-span-attrs config
+                  :provider ""
+                  :model ""
+                  :agent-name (wfs-rec-agent-name rec)
+                  :agent-version (wfs-rec-agent-version rec)
+                  :conversation-id (wfs-rec-conversation-id rec))))
+    (push (otel-string-attr "gen_ai.operation.name" "workflow_step") attrs)
+    (push (otel-string-attr "sigil.workflow.step.id" (or (wfs-rec-step-id rec) "")) attrs)
+    (push (otel-string-attr "sigil.workflow.step.name" step-name) attrs)
+    (let ((fw (wfs-rec-framework rec)))
+      (when (and fw (stringp fw) (plusp (length fw)))
+        (push (otel-string-attr "sigil.workflow.framework" fw) attrs)))
+    (let ((parents (wfs-rec-parent-step-ids rec)))
+      (when parents
+        (push (otel-string-array-attr "sigil.workflow.parent_step_ids" parents) attrs)))
+    (let ((linked (wfs-rec-linked-generation-ids rec)))
+      (when linked
+        (push (otel-string-array-attr "sigil.workflow.linked_generation_ids" linked) attrs)))
+    (when err
+      (push (otel-string-attr "error.type" "workflow_step_error") attrs))
+    (let* ((start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
+           (end-nano (if (and start-nano (wfs-rec-duration-seconds rec))
+                         (unix-nano-plus-seconds start-nano (wfs-rec-duration-seconds rec))
+                         (or (iso8601-to-unix-nano (recorder-completed-at rec)) "0"))))
+      (build-span :trace-id trace-id
+                  :span-id span-id
+                  :name (format nil "workflow_step ~a" step-name)
+                  :kind 1
+                  :start-time-unix-nano start-nano
+                  :end-time-unix-nano end-nano
+                  :attributes (coerce (nreverse attrs) 'vector)
+                  :status-code (if err 2 1)
+                  :status-message (if err
+                                      (if capture-content err "<redacted>")
+                                      "")))))
+
+(defmethod recorder-end ((rec workflow-step-recorder))
+  (let ((config (client-config (recorder-client rec))))
+    (let ((payload nil)
+          (span nil))
+      (when (config-workflow-steps-enabled config)
+        (setf payload (build-workflow-step-payload rec config)))
+      (when (config-traces-enabled config)
+        (setf span (build-workflow-step-span rec config)))
+      (when payload
+        (queue-enqueue (client-workflow-queue (recorder-client rec)) payload))
+      (when span
+        (queue-enqueue (client-trace-queue (recorder-client rec)) span)))))
