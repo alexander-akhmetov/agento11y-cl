@@ -962,6 +962,46 @@
           (check "error path: span status code = 2 (ERROR)"
                  (= (jget* span "status" "code") 2)))))
 
+    ;; Capture mode :metadata-only redacts error and omits state fields
+    (dolist (mode '(:metadata-only :metadata-with-system-prompt))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :workflow-steps-enabled t :capture mode)
+        (declare (ignore get-requests))
+        (let ((rec (sigil-cl::start-workflow-step client
+                     :conversation-id "c"
+                     :step-name "s"
+                     :input-state (jobj "secret" "in")
+                     :output-state (jobj "secret" "out"))))
+          (sigil-cl::set-call-error rec "boom")
+          (sigil-cl::recorder-end rec)
+          (let ((wfs (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-workflow-queue client)))))
+            (check (format nil "~a: error redacted" mode)
+                   (equal (jget wfs "error") "<redacted>"))
+            (check (format nil "~a: input_state omitted" mode)
+                   (null (nth-value 1 (gethash "input_state" wfs))))
+            (check (format nil "~a: output_state omitted" mode)
+                   (null (nth-value 1 (gethash "output_state" wfs))))))))
+
+    ;; Capture mode :full keeps state and error verbatim
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t :capture :full)
+      (declare (ignore get-requests))
+      (let ((in (jobj "x" 1))
+            (out (jobj "y" 2)))
+        (let ((rec (sigil-cl::start-workflow-step client
+                     :conversation-id "c"
+                     :step-name "s"
+                     :input-state in
+                     :output-state out)))
+          (sigil-cl::set-call-error rec "boom")
+          (sigil-cl::recorder-end rec)
+          (let ((wfs (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-workflow-queue client)))))
+            (check ":full: error verbatim" (equal (jget wfs "error") "boom"))
+            (check ":full: input_state present" (eq (jget wfs "input_state") in))
+            (check ":full: output_state present" (eq (jget wfs "output_state") out))))))
+
     ;; Nested generation parents under workflow span
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled t :traces-enabled t
