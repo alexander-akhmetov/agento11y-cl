@@ -26,12 +26,19 @@
    ;; Content capture
    (content-capture-mode :initarg :content-capture-mode :reader config-content-capture-mode
                          :initform :metadata-only)
-   ;; Service identity
+   ;; Service identity (OTel resource attributes)
    (service-name    :initarg :service-name    :reader config-service-name    :initform "unknown")
    (service-version :initarg :service-version :reader config-service-version :initform nil)
+   ;; Agent identity (gen_ai.agent.* span attributes; falls back to service-* when unset)
+   (agent-name    :initarg :agent-name    :reader config-agent-name    :initform nil)
+   (agent-version :initarg :agent-version :reader config-agent-version :initform nil)
    ;; User identity
    (user-id :initarg :user-id :reader config-user-id :initform nil)
    (tags    :initarg :tags    :reader config-tags    :initform nil)
+   ;; Extra HTTP headers merged into auth headers (case-insensitive de-dup; user wins)
+   (extra-headers :initarg :extra-headers :reader config-extra-headers :initform nil)
+   ;; Debug flag (surfaced via SIGIL_DEBUG env var)
+   (debug :initarg :debug :reader config-debug :initform nil)
    ;; Callbacks
    (log-fn     :initarg :log-fn     :reader config-log-fn     :initform nil)
    (metrics-fn :initarg :metrics-fn :reader config-metrics-fn :initform nil)

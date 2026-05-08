@@ -23,7 +23,8 @@
        :http-fn (lambda (url &key headers content)
                   (declare (ignore headers))
                   (push (list url content) requests)
-                  (values "{}" 200))))
+                  (values "{}" 200)))
+      :env-fn (constantly nil))
      (lambda () (reverse requests)))))
 
 ;;; ================================================================
@@ -153,7 +154,249 @@
                              :auth-mode :bearer :auth-password "tok"
                              :traces-forward-auth nil)))
       (check "traces auth: forward-auth=nil -> nil"
-             (null (sigil-cl::build-traces-auth-headers cfg))))))
+             (null (sigil-cl::build-traces-auth-headers cfg))))
+
+    ;; Extra headers merge: appended to auth-derived headers
+    (let* ((cfg (make-config :auth-mode :bearer :auth-password "tok"
+                             :extra-headers '(("X-Custom" . "hello")
+                                              ("X-Trace" . "abc"))))
+           (headers (sigil-cl::build-auth-headers cfg)))
+      (check "extra-headers: keeps Authorization"
+             (equal (cdr (assoc "Authorization" headers :test #'equal))
+                    "Bearer tok"))
+      (check "extra-headers: includes custom"
+             (equal (cdr (assoc "X-Custom" headers :test #'equal)) "hello"))
+      (check "extra-headers: includes second"
+             (equal (cdr (assoc "X-Trace" headers :test #'equal)) "abc")))
+
+    ;; Extra headers wins on case-insensitive Authorization collision
+    (let* ((cfg (make-config :auth-mode :bearer :auth-password "tok"
+                             :extra-headers '(("authorization" . "Bearer override"))))
+           (headers (sigil-cl::build-auth-headers cfg))
+           (auth-vals (mapcar #'cdr
+                              (remove-if-not (lambda (kv)
+                                               (string-equal (car kv) "authorization"))
+                                             headers))))
+      (check "extra-headers: user Authorization wins"
+             (and (= (length auth-vals) 1)
+                  (equal (first auth-vals) "Bearer override"))))
+
+    ;; Case-insensitive duplicates inside extras themselves are collapsed
+    (let* ((cfg (make-config :auth-mode :none
+                             :extra-headers '(("Authorization" . "first")
+                                              ("authorization" . "second")
+                                              ("X-Custom" . "keep"))))
+           (headers (sigil-cl::build-auth-headers cfg))
+           (auth-vals (mapcar #'cdr
+                              (remove-if-not (lambda (kv)
+                                               (string-equal (car kv) "authorization"))
+                                             headers))))
+      (check "extra-headers: duplicate names collapsed to one entry"
+             (= (length auth-vals) 1))
+      (check "extra-headers: last duplicate wins"
+             (equal (first auth-vals) "second"))
+      (check "extra-headers: non-duplicate kept"
+             (equal (cdr (assoc "X-Custom" headers :test #'equal)) "keep")))))
+
+(defun run-env-tests ()
+  (with-test-suite ("Env")
+    (labels ((env-from-alist (alist)
+               (lambda (name)
+                 (cdr (assoc name alist :test #'string=))))
+             (resolve (env-alist &rest config-args)
+               (sigil-cl::resolve-config-from-env
+                (apply #'make-config config-args)
+                :env-fn (env-from-alist env-alist))))
+      ;; --- env-trimmed ---
+      (let ((env (env-from-alist '(("A" . "  hi  ") ("B" . "")))))
+        (check "env-trimmed strips whitespace"
+               (equal (sigil-cl::env-trimmed env "A") "hi"))
+        (check "env-trimmed nil for empty"
+               (null (sigil-cl::env-trimmed env "B")))
+        (check "env-trimmed nil for missing"
+               (null (sigil-cl::env-trimmed env "C"))))
+
+      ;; --- parse-bool ---
+      (check "parse-bool 1"   (sigil-cl::parse-bool "1"))
+      (check "parse-bool true"   (sigil-cl::parse-bool "TRUE"))
+      (check "parse-bool yes"  (sigil-cl::parse-bool "yes"))
+      (check "parse-bool on"   (sigil-cl::parse-bool "on"))
+      (check "parse-bool no"   (null (sigil-cl::parse-bool "no")))
+      (check "parse-bool empty"(null (sigil-cl::parse-bool "")))
+      (check "parse-bool nil"  (null (sigil-cl::parse-bool nil)))
+
+      ;; --- parse-csv-kv ---
+      (let ((kvs (sigil-cl::parse-csv-kv "k=v,k2=v2")))
+        (check "parse-csv-kv simple count" (= (length kvs) 2))
+        (check "parse-csv-kv first" (equal (assoc "k" kvs :test #'equal) '("k" . "v")))
+        (check "parse-csv-kv second" (equal (assoc "k2" kvs :test #'equal) '("k2" . "v2"))))
+      (let ((kvs (sigil-cl::parse-csv-kv "  a = 1 , b=2 ,, c=3")))
+        (check "parse-csv-kv whitespace trimmed (a)"
+               (equal (cdr (assoc "a" kvs :test #'equal)) "1"))
+        (check "parse-csv-kv empty entries skipped"
+               (= (length kvs) 3))
+        (check "parse-csv-kv trailing entry" (equal (cdr (assoc "c" kvs :test #'equal)) "3")))
+      (let ((kvs (sigil-cl::parse-csv-kv "noequals,k=v")))
+        (check "parse-csv-kv missing = skipped"
+               (and (= (length kvs) 1)
+                    (equal (assoc "k" kvs :test #'equal) '("k" . "v")))))
+      (check "parse-csv-kv nil input" (null (sigil-cl::parse-csv-kv nil)))
+      (check "parse-csv-kv empty string" (null (sigil-cl::parse-csv-kv "")))
+
+      ;; --- SIGIL_ENDPOINT ---
+      (let ((cfg (resolve '(("SIGIL_ENDPOINT" . "https://example/api/v1/generations:export")))))
+        (check "SIGIL_ENDPOINT lands in generation-endpoint"
+               (equal (sigil-cl::config-generation-endpoint cfg)
+                      "https://example/api/v1/generations:export")))
+
+      ;; --- SIGIL_AUTH_* (env layered when caller does not set) ---
+      (let ((cfg (resolve '(("SIGIL_AUTH_MODE" . "basic")
+                            ("SIGIL_AUTH_TENANT_ID" . "t1")
+                            ("SIGIL_AUTH_TOKEN" . "tok")))))
+        (check "SIGIL_AUTH_MODE -> :basic"
+               (eq (sigil-cl::config-auth-mode cfg) :basic))
+        (check "SIGIL_AUTH_TENANT_ID -> tenant-id"
+               (equal (sigil-cl::config-tenant-id cfg) "t1"))
+        (check "SIGIL_AUTH_TOKEN -> auth-password"
+               (equal (sigil-cl::config-auth-password cfg) "tok"))
+        ;; And basic Authorization header is built downstream
+        (let ((headers (sigil-cl::build-auth-headers cfg)))
+          (check "Authorization built from env"
+                 (search "Basic " (cdr (assoc "Authorization" headers :test #'equal))))))
+
+      ;; --- Caller value beats env ---
+      (let ((cfg (resolve '(("SIGIL_AUTH_MODE" . "basic"))
+                          :auth-mode :bearer :auth-password "explicit")))
+        (check "caller auth-mode beats env"
+               (eq (sigil-cl::config-auth-mode cfg) :bearer))
+        (check "caller auth-password beats env"
+               (equal (sigil-cl::config-auth-password cfg) "explicit")))
+
+      ;; --- Unknown SIGIL_AUTH_MODE warns and falls through ---
+      (let* ((warn-count 0)
+             (cfg (sigil-cl::resolve-config-from-env
+                   (make-config :log-fn (lambda (level component message &rest kvs)
+                                          (declare (ignore component message kvs))
+                                          (when (eq level :warn) (incf warn-count))))
+                   :env-fn (env-from-alist '(("SIGIL_AUTH_MODE" . "garbage")
+                                             ("SIGIL_AUTH_TOKEN" . "tok"))))))
+        (check "unknown SIGIL_AUTH_MODE keeps default"
+               (eq (sigil-cl::config-auth-mode cfg) :none))
+        (check "unknown SIGIL_AUTH_MODE warned"
+               (>= warn-count 1))
+        (check "other env vars still applied alongside bad auth-mode"
+               (equal (sigil-cl::config-auth-password cfg) "tok")))
+
+      ;; --- SIGIL_TAGS merges with caller tags, caller wins on collision ---
+      (let ((cfg (resolve '(("SIGIL_TAGS" . "env=prod,layer=router"))
+                          :tags '(("layer" . "agent")))))
+        (let ((tags (sigil-cl::config-tags cfg)))
+          (check "SIGIL_TAGS contributes env tag"
+                 (equal (cdr (assoc "env" tags :test #'equal)) "prod"))
+          (check "caller tags win on collision"
+                 (equal (cdr (assoc "layer" tags :test #'equal)) "agent"))))
+      (let ((cfg (resolve '(("SIGIL_TAGS" . "env=prod")))))
+        (check "SIGIL_TAGS with no caller tags -> env tags only"
+               (equal (cdr (assoc "env" (sigil-cl::config-tags cfg) :test #'equal)) "prod")))
+
+      ;; --- SIGIL_HEADERS -> extra-headers, merged into auth ---
+      (let ((cfg (resolve '(("SIGIL_HEADERS" . "X-Foo=bar,X-Baz=qux")))))
+        (let ((extras (config-extra-headers cfg)))
+          (check "SIGIL_HEADERS parsed into extra-headers"
+                 (and (equal (cdr (assoc "X-Foo" extras :test #'equal)) "bar")
+                      (equal (cdr (assoc "X-Baz" extras :test #'equal)) "qux")))))
+
+      ;; SIGIL_HEADERS + caller extra-headers collide case-insensitively.
+      (let* ((cfg (resolve '(("SIGIL_HEADERS" . "authorization=env"))
+                           :extra-headers '(("Authorization" . "caller"))))
+             (extras (config-extra-headers cfg))
+             (auth-entries (remove-if-not (lambda (kv)
+                                            (string-equal (car kv) "authorization"))
+                                          extras)))
+        (check "case-insensitive merge collapses to one entry"
+               (= (length auth-entries) 1))
+        (check "caller header wins case-insensitively over env"
+               (equal (cdr (first auth-entries)) "caller")))
+
+      ;; --- SIGIL_AGENT_NAME / VERSION ---
+      (let ((cfg (resolve '(("SIGIL_AGENT_NAME" . "router")
+                            ("SIGIL_AGENT_VERSION" . "1.2.3")))))
+        (check "SIGIL_AGENT_NAME -> agent-name"
+               (equal (config-agent-name cfg) "router"))
+        (check "SIGIL_AGENT_VERSION -> agent-version"
+               (equal (config-agent-version cfg) "1.2.3")))
+
+      ;; --- Caller agent fields beat env ---
+      (let ((cfg (resolve '(("SIGIL_AGENT_NAME" . "from-env"))
+                          :agent-name "explicit")))
+        (check "caller agent-name beats env"
+               (equal (config-agent-name cfg) "explicit")))
+
+      ;; --- SIGIL_USER_ID ---
+      (let ((cfg (resolve '(("SIGIL_USER_ID" . "u-42")))))
+        (check "SIGIL_USER_ID -> user-id"
+               (equal (sigil-cl::config-user-id cfg) "u-42")))
+
+      ;; --- SIGIL_CONTENT_CAPTURE_MODE ---
+      (let ((cfg (resolve '(("SIGIL_CONTENT_CAPTURE_MODE" . "full")))))
+        (check "SIGIL_CONTENT_CAPTURE_MODE=full"
+               (eq (sigil-cl::config-content-capture-mode cfg) :full)))
+      (let ((cfg (resolve '(("SIGIL_CONTENT_CAPTURE_MODE" . "no_tool_content")))))
+        (check "SIGIL_CONTENT_CAPTURE_MODE=no_tool_content"
+               (eq (sigil-cl::config-content-capture-mode cfg) :no-tool-content)))
+      (let* ((warns 0)
+             (cfg (sigil-cl::resolve-config-from-env
+                   (make-config :log-fn (lambda (l c m &rest kvs)
+                                          (declare (ignore c m kvs))
+                                          (when (eq l :warn) (incf warns))))
+                   :env-fn (env-from-alist
+                            '(("SIGIL_CONTENT_CAPTURE_MODE" . "garbage"))))))
+        (check "bad SIGIL_CONTENT_CAPTURE_MODE keeps default"
+               (eq (sigil-cl::config-content-capture-mode cfg) :metadata-only))
+        (check "bad SIGIL_CONTENT_CAPTURE_MODE warns"
+               (>= warns 1)))
+
+      ;; --- SIGIL_DEBUG ---
+      (let ((cfg (resolve '(("SIGIL_DEBUG" . "1")))))
+        (check "SIGIL_DEBUG=1 -> t" (config-debug cfg)))
+      (let ((cfg (resolve '(("SIGIL_DEBUG" . "false")))))
+        (check "SIGIL_DEBUG=false -> nil" (null (config-debug cfg))))
+
+      ;; --- SIGIL_PROTOCOL warning when non-http ---
+      (let* ((warns 0)
+             (cfg (sigil-cl::resolve-config-from-env
+                   (make-config :log-fn (lambda (l c m &rest kvs)
+                                          (declare (ignore c m kvs))
+                                          (when (eq l :warn) (incf warns))))
+                   :env-fn (env-from-alist '(("SIGIL_PROTOCOL" . "grpc"))))))
+        (declare (ignore cfg))
+        (check "non-http SIGIL_PROTOCOL warns" (>= warns 1)))
+
+      ;; --- make-client honours :env-fn so deployments and tests can stub the env ---
+      (let* ((env (env-from-alist '(("SIGIL_AGENT_NAME" . "auto"))))
+             (client (make-client (make-config) :env-fn env)))
+        (check "make-client :env-fn layers env into resolved config"
+               (equal (config-agent-name (sigil-cl::client-config client)) "auto")))
+
+      ;; --- Resolver preserves slots it doesn't touch ---
+      ;; Regression guard: the MOP-based copy means new slots Just Work; this
+      ;; test catches accidental regressions to a manually enumerated resolver
+      ;; that would silently drop unrelated caller-supplied values.
+      (let* ((http-fn (lambda (&rest _) (declare (ignore _)) (values "" 200)))
+             (cfg (make-config :batch-size 7
+                               :max-retries 11
+                               :http-fn http-fn
+                               :traces-forward-auth nil))
+             (resolved (sigil-cl::resolve-config-from-env
+                        cfg :env-fn (env-from-alist '(("SIGIL_AGENT_NAME" . "x"))))))
+        (check "resolver preserves batch-size"
+               (= (sigil-cl::config-batch-size resolved) 7))
+        (check "resolver preserves max-retries"
+               (= (sigil-cl::config-max-retries resolved) 11))
+        (check "resolver preserves http-fn"
+               (eq (sigil-cl::config-http-fn resolved) http-fn))
+        (check "resolver preserves traces-forward-auth=nil"
+               (null (sigil-cl::config-traces-forward-auth resolved)))))))
 
 (defun run-queue-tests ()
   (with-test-suite ("Queue")
@@ -621,7 +864,45 @@
         (check "trace-context set inside" (not (null *trace-context*)))
         (check "trace-context has trace-id" (getf *trace-context* :trace-id))
         (check "trace-context has span-id" (getf *trace-context* :span-id)))
-      (check "trace-context nil after" (null *trace-context*)))))
+      (check "trace-context nil after" (null *trace-context*)))
+
+    ;; with-span: gen_ai.agent.name uses agent-name when set, falling back to service-name
+    (flet ((span-attr (span key)
+             (let ((found nil))
+               (loop for a across (jget span "attributes")
+                     when (equal (jget a "key") key)
+                       do (setf found (jget* a "value" "stringValue")))
+               found)))
+      ;; agent-name/version set -> win over service-name/version
+      (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
+                                              :traces-enabled t
+                                              :service-name "my-app"
+                                              :service-version "1.0"
+                                              :agent-name "router"
+                                              :agent-version "2.0")
+                                 :env-fn (constantly nil))))
+        (with-span (client "test-op")
+          nil)
+        (let* ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client)))
+               (span (first spans)))
+          (check "with-span: agent-name wins over service-name"
+                 (equal (span-attr span "gen_ai.agent.name") "router"))
+          (check "with-span: agent-version wins over service-version"
+                 (equal (span-attr span "gen_ai.agent.version") "2.0"))))
+      ;; agent-name/version unset -> service-name/version fallback (back-compat)
+      (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
+                                              :traces-enabled t
+                                              :service-name "legacy-app"
+                                              :service-version "0.9")
+                                 :env-fn (constantly nil))))
+        (with-span (client "test-op")
+          nil)
+        (let* ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client)))
+               (span (first spans)))
+          (check "with-span: falls back to service-name"
+                 (equal (span-attr span "gen_ai.agent.name") "legacy-app"))
+          (check "with-span: falls back to service-version"
+                 (equal (span-attr span "gen_ai.agent.version") "0.9")))))))
 
 (defun run-normalize-tests ()
   (with-test-suite ("Normalize")
@@ -711,6 +992,7 @@
     (dolist (test-fn (list #'run-util-tests
                            #'run-json-tests
                            #'run-auth-tests
+                           #'run-env-tests
                            #'run-queue-tests
                            #'run-otel-tests
                            #'run-recorder-tests
