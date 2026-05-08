@@ -8,6 +8,9 @@
    (traces-endpoint     :initarg :traces-endpoint     :reader config-traces-endpoint     :initform nil)
    (traces-enabled      :initarg :traces-enabled      :reader config-traces-enabled      :initform nil)
    (traces-forward-auth :initarg :traces-forward-auth :reader config-traces-forward-auth :initform t)
+   ;; Workflow step export
+   (workflow-steps-endpoint :initarg :workflow-steps-endpoint :reader config-workflow-steps-endpoint :initform nil)
+   (workflow-steps-enabled  :initarg :workflow-steps-enabled  :reader config-workflow-steps-enabled  :initform nil)
    ;; Auth
    (auth-mode     :initarg :auth-mode     :reader config-auth-mode     :initform :none)
    (auth-user     :initarg :auth-user     :reader config-auth-user     :initform nil)

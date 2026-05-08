@@ -88,3 +88,12 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
                                                       (config-service-name config)
                                                       (config-service-version config)))))
     (post-with-retry config url payload auth-headers "traces" (length spans))))
+
+(defun export-workflow-steps (config workflow-steps auth-headers)
+  "POST a batch of workflow steps to the Sigil workflow steps endpoint."
+  (when (null workflow-steps) (return-from export-workflow-steps t))
+  (let* ((url (config-workflow-steps-endpoint config))
+         (payload (jzon:stringify (jobj "workflow_steps"
+                                        (coerce workflow-steps 'vector)))))
+    (post-with-retry config url payload auth-headers
+                     "workflow-steps" (length workflow-steps))))

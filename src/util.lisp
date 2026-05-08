@@ -73,6 +73,13 @@ Parses fractional seconds if present. Returns NIL for invalid input."
                (incf *id-counter*))))
     (format nil "gen_~8,'0x~4,'0x" ts (mod seq #xFFFF))))
 
+(defun generate-workflow-step-id ()
+  "Generate a unique workflow step ID like wfs_<hex>."
+  (let ((ts (get-universal-time))
+        (seq (bt2:with-lock-held (*id-lock*)
+               (incf *id-counter*))))
+    (format nil "wfs_~8,'0x~4,'0x" ts (mod seq #xFFFF))))
+
 (defun generate-trace-id ()
   "Generate a 32-hex-char trace ID (128-bit random)."
   (bt2:with-lock-held (*id-lock*)
