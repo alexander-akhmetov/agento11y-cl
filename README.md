@@ -178,7 +178,7 @@ agent fields and finally to the service fields, so applications that only set
 |------|---------------------|---------------|-----------|------------------------|
 | `:full` | full | full | full | full |
 | `:no-tool-content` | full | full | full | redacted |
-| `:metadata-with-system-prompt` | full | full | redacted | redacted |
+| `:metadata-with-system-prompt` | structure only, text empty | full | redacted | redacted |
 | `:metadata-only` | structure only, text empty | omitted | redacted | redacted |
 
 `:no-tool-content` matches the Go SDK's `ContentCaptureModeNoToolContent` semantics: keep generation content for evaluation, but redact tool execution span attributes (where untrusted tool I/O accumulates).

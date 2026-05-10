@@ -33,7 +33,7 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 
 - **Two independent queues**: `client-generation-queue` (generation payloads) and `client-trace-queue` (OTel spans). Both are bounded and drop-oldest on overflow.
 - **`*trace-context*`** (dynamic variable): `with-generation` binds this with the generation's trace-id/span-id. Child `with-tool-execution` and `with-embedding` calls read it to set their `parentSpanId`, creating the span tree.
-- **Content capture modes** (`:full`, `:metadata-only`, `:metadata-with-system-prompt`): control what message content is serialized. In `:metadata-only`, message structure is preserved but text fields are empty strings and tool inputs are redacted.
+- **Content capture modes** (`:full`, `:no-tool-content`, `:metadata-with-system-prompt`, `:metadata-only`): control what message content is serialized. In `:metadata-only` and `:metadata-with-system-prompt`, message structure is preserved but text fields are empty strings and tool inputs/results are redacted; the difference between them is whether `system_prompt` is exported.
 - **`recorder-end :around`**: shared lifecycle logic (idempotency guard, timestamp, wake worker, metrics callback) lives in the `:around` method on the base `recorder` class. Type-specific serialization is in the primary methods.
 - **`http-fn` config slot**: tests inject a lambda to capture HTTP requests instead of hitting the network.
 

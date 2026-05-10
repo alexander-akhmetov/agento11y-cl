@@ -85,7 +85,8 @@ and :metadata-only redact it."
 
 (defun serialize-part (part capture-mode)
   "Serialize a message part to JSON hash-table. Respects capture mode."
-  (let ((redact (eq capture-mode :metadata-only)))
+  (let ((redact (or (eq capture-mode :metadata-only)
+                    (eq capture-mode :metadata-with-system-prompt))))
     (typecase part
       (text-part
        (jobj "text" (if redact "" (text-part-text part))))

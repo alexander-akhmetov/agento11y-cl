@@ -591,6 +591,64 @@
             (check "metadata-only: text redacted"
                    (equal (jget (aref (jget input-msg "parts") 0) "text") ""))))))
 
+    ;; Metadata-with-system-prompt: redact message content but keep system prompt
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :metadata-with-system-prompt)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :system-prompt "Be helpful"
+                                          :input-messages
+                                          (list (make-message
+                                                 :role :user
+                                                 :parts (list (make-text-part "Hello secret")))
+                                                (make-message
+                                                 :role :assistant
+                                                 :parts (list (make-tool-call-part
+                                                               :id "tc1"
+                                                               :name "search"
+                                                               :input-json "{\"q\":\"secret\"}")))
+                                                (make-message
+                                                 :role :tool
+                                                 :parts (list (make-tool-result-part
+                                                               :tool-call-id "tc1"
+                                                               :name "search"
+                                                               :content "private result")))))))
+        (set-result rec :output-messages (list (make-message
+                                                :role :assistant
+                                                :parts (list (make-text-part "Also secret")))))
+        (recorder-end rec)
+        (let ((gen (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-generation-queue client)))))
+          (check "metadata-with-system-prompt: system_prompt populated"
+                 (equal (jget gen "system_prompt") "Be helpful"))
+          (check "metadata-with-system-prompt: input present" (jget gen "input"))
+          (check "metadata-with-system-prompt: output present" (jget gen "output"))
+          (let ((user-msg (aref (jget gen "input") 0)))
+            (check "metadata-with-system-prompt: user role preserved"
+                   (equal (jget user-msg "role") "MESSAGE_ROLE_USER"))
+            (check "metadata-with-system-prompt: text redacted"
+                   (equal (jget (aref (jget user-msg "parts") 0) "text") "")))
+          (let* ((asst-msg (aref (jget gen "input") 1))
+                 (tc-part (aref (jget asst-msg "parts") 0)))
+            (check "metadata-with-system-prompt: tool_call shape preserved"
+                   (and (equal (jget* tc-part "tool_call" "id") "tc1")
+                        (equal (jget* tc-part "tool_call" "name") "search")))
+            (check "metadata-with-system-prompt: tool_call input_json redacted"
+                   (equal (jget* tc-part "tool_call" "input_json") "")))
+          (let* ((tool-msg (aref (jget gen "input") 2))
+                 (tr-part (aref (jget tool-msg "parts") 0)))
+            (check "metadata-with-system-prompt: tool_result shape preserved"
+                   (and (equal (jget* tr-part "tool_result" "tool_call_id") "tc1")
+                        (equal (jget* tr-part "tool_result" "name") "search")))
+            (check "metadata-with-system-prompt: tool_result content redacted"
+                   (equal (jget* tr-part "tool_result" "content") "")))
+          (let ((out-msg (aref (jget gen "output") 0)))
+            (check "metadata-with-system-prompt: output role preserved"
+                   (equal (jget out-msg "role") "MESSAGE_ROLE_ASSISTANT"))
+            (check "metadata-with-system-prompt: output text redacted"
+                   (equal (jget (aref (jget out-msg "parts") 0) "text") ""))))))
+
     ;; No-tool-content: full generation content but redact tool spans
     (multiple-value-bind (client get-requests) (make-test-client :capture :no-tool-content)
       (declare (ignore get-requests))
