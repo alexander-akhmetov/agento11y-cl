@@ -58,6 +58,67 @@ KIND: 1=INTERNAL, 3=CLIENT. STATUS-CODE: 1=OK, 2=ERROR."
                   (jobj "scope" (jobj "name" +sdk-name+)
                         "spans" (coerce spans 'vector))))))))
 
+;;; --- Metric histogram buckets ---
+;;; Duration and token bucket boundaries match the current OTel GenAI semantic
+;;; conventions (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/)
+;;; and the reference sigil-sdk wire output. The older [0.001..10.0] duration set
+;;; shown on some sources is superseded; do not revert to it.
+
+(defparameter +duration-buckets+
+  #(0.01d0 0.02d0 0.04d0 0.08d0 0.16d0 0.32d0 0.64d0 1.28d0 2.56d0
+    5.12d0 10.24d0 20.48d0 40.96d0 81.92d0)
+  "Explicit bounds for duration histograms (seconds), per OTel GenAI semconv.")
+
+(defparameter +token-buckets+
+  #(1 4 16 64 256 1024 4096 16384 65536 262144 1048576 4194304 16777216 67108864)
+  "Explicit bounds for token-usage histograms, per OTel GenAI semconv.")
+
+;; tool_calls_per_operation is not in the OTel spec; no spec bucket advice exists.
+;; The reference relies on OTel's default [0..10000] set, which is wrongly scaled
+;; for tool counts. This small set is a deliberate divergence chosen for correctness.
+(defparameter +tool-call-buckets+ #(0 1 2 4 8 16 32 64)
+  "Explicit bounds for the non-semconv tool_calls_per_operation histogram.")
+
+(defparameter +temporality-cumulative+ 2
+  "OTLP AggregationTemporality: 1=DELTA, 2=CUMULATIVE.")
+
+;;; --- Metric OTLP shape ---
+
+(defun build-histogram-datapoint (attrs bounds counts sum total start-nano now-nano)
+  "Build one OTLP histogram dataPoint JSON object.
+ATTRS is a vector of OTLP attribute objects. BOUNDS is the explicit-bounds
+sequence. COUNTS is the per-bucket count list (length = bounds + 1). SUM is the
+running total value, TOTAL the number of recorded values. COUNT/bucketCounts are
+encoded as uint64 strings (OTLP JSON convention); sum stays a JSON number."
+  (jobj "attributes" (coerce attrs 'vector)
+        "startTimeUnixNano" start-nano
+        "timeUnixNano" now-nano
+        "count" (format nil "~d" total)
+        "sum" (coerce sum 'double-float)
+        "bucketCounts" (coerce (mapcar (lambda (c) (format nil "~d" c)) counts) 'vector)
+        "explicitBounds" (coerce (map 'list (lambda (b) (coerce b 'double-float)) bounds)
+                                 'vector)))
+
+(defun build-otlp-metric (name unit datapoints)
+  "Build one OTLP metric object wrapping histogram DATAPOINTS."
+  (jobj "name" name
+        "unit" unit
+        "histogram" (jobj "aggregationTemporality" +temporality-cumulative+
+                          "dataPoints" (coerce datapoints 'vector))))
+
+(defun build-otlp-metrics-payload (metrics service-name service-version)
+  "Wrap METRICS in the OTLP resourceMetrics envelope (scope name +sdk-name+)."
+  (let ((resource-attrs (list (otel-string-attr "service.name" (or service-name "unknown")))))
+    (when service-version
+      (push (otel-string-attr "service.version" service-version) resource-attrs))
+    (jobj "resourceMetrics"
+          (vector
+           (jobj "resource" (jobj "attributes" (coerce (nreverse resource-attrs) 'vector))
+                 "scopeMetrics"
+                 (vector
+                  (jobj "scope" (jobj "name" +sdk-name+)
+                        "metrics" (coerce metrics 'vector))))))))
+
 ;;; --- Error classification ---
 
 (defun extract-http-status (error-string)

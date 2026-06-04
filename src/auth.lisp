@@ -69,3 +69,11 @@ When false, sends no auth for traces."
   (if (config-traces-forward-auth config)
       (build-auth-headers config)
       nil))
+
+(defun build-metrics-auth-headers (config)
+  "Build auth headers for metrics export.
+When metrics-forward-auth is true (default), forwards the same auth headers.
+When false, sends no auth for metrics."
+  (if (config-metrics-forward-auth config)
+      (build-auth-headers config)
+      nil))

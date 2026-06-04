@@ -17,6 +17,7 @@
                (:file "otel")
                (:file "queue")
                (:file "exporter")
+               (:file "metrics")
                (:file "recorder")
                (:file "rating")
                (:file "client")

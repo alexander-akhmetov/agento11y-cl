@@ -36,6 +36,8 @@
    #:config-agent-version
    #:config-extra-headers
    #:config-debug
+   #:config-metrics-endpoint
+   #:config-metrics-enabled
    ;; Types + constructors
    #:message
    #:text-part

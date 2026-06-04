@@ -7,6 +7,7 @@
    (generation-queue :initarg :generation-queue :accessor client-generation-queue)
    (trace-queue      :initarg :trace-queue      :accessor client-trace-queue)
    (workflow-queue   :initarg :workflow-queue   :accessor client-workflow-queue)
+   (metric-registry  :initarg :metric-registry  :accessor client-metric-registry)
    (worker-thread    :initform nil              :accessor client-worker-thread)
    (running-p        :initform nil              :accessor client-running-p)
    (lock             :initform (bt2:make-lock :name "sigil-client")
@@ -28,7 +29,8 @@ can pass (constantly nil) to ignore the host environment."
       :trace-queue (make-bounded-queue :max-size (effective-trace-queue-max resolved)
                                         :name "trace")
       :workflow-queue (make-bounded-queue :max-size (config-queue-max resolved)
-                                           :name "workflow-step"))))
+                                           :name "workflow-step")
+      :metric-registry (make-metric-registry))))
 
 (defun noop-client ()
   "Create a client that discards everything (for testing/disabled mode)."
@@ -37,8 +39,12 @@ can pass (constantly nil) to ignore the host environment."
 ;;; --- Background flush loop ---
 
 (defun run-flush-loop (client)
-  "Background loop: drain and export batches from generation, trace, and workflow queues."
-  (let ((config (client-config client)))
+  "Background loop: drain and export batches from generation, trace, and workflow
+queues. Metrics are cumulative, so they are pushed on a time gate (every
+flush-interval-sec) rather than on every wake, to avoid re-pushing identical
+series on each recorder end."
+  (let ((config (client-config client))
+        (last-metrics-export (get-internal-real-time)))
     (loop while (bt2:with-lock-held ((client-lock client))
                   (client-running-p client))
           do (handler-case
@@ -53,6 +59,13 @@ can pass (constantly nil) to ignore the host environment."
                      (export-traces config trace-batch (build-traces-auth-headers config)))
                    (when (and wfs-batch (config-workflow-steps-enabled config))
                      (export-workflow-steps config wfs-batch (build-auth-headers config)))
+                   (when (and (config-metrics-enabled config)
+                              (>= (/ (- (get-internal-real-time) last-metrics-export)
+                                     internal-time-units-per-second)
+                                  (config-flush-interval-sec config)))
+                     (export-metrics config (client-metric-registry client)
+                                     (build-metrics-auth-headers config))
+                     (setf last-metrics-export (get-internal-real-time)))
                    (unless (or gen-batch trace-batch wfs-batch)
                      (bt2:with-lock-held ((client-lock client))
                        (bt2:condition-wait (client-wake-cv client) (client-lock client)
@@ -72,7 +85,8 @@ can pass (constantly nil) to ignore the host environment."
     (let ((config (client-config client)))
       (when (or (config-generation-enabled config)
                 (config-traces-enabled config)
-                (config-workflow-steps-enabled config))
+                (config-workflow-steps-enabled config)
+                (config-metrics-enabled config))
         (setf (client-running-p client) t)
         (setf (client-worker-thread client)
               (bt2:make-thread (lambda () (run-flush-loop client))
@@ -141,7 +155,15 @@ can pass (constantly nil) to ignore the host environment."
                  (error (e)
                    (sigil-log config :warn "flush"
                              (format nil "workflow-step batch export failed: ~a"
-                                     (princ-to-string e))))))))
+                                     (princ-to-string e)))))))
+    (when (config-metrics-enabled config)
+      (handler-case
+          (export-metrics config (client-metric-registry client)
+                          (build-metrics-auth-headers config))
+        (error (e)
+          (sigil-log config :warn "flush"
+                    (format nil "metrics export failed: ~a"
+                            (princ-to-string e)))))))
   nil)
 
 ;;; --- Recorder factories ---

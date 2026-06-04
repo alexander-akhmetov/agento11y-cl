@@ -11,6 +11,10 @@
    ;; Workflow step export
    (workflow-steps-endpoint :initarg :workflow-steps-endpoint :reader config-workflow-steps-endpoint :initform nil)
    (workflow-steps-enabled  :initarg :workflow-steps-enabled  :reader config-workflow-steps-enabled  :initform nil)
+   ;; Metrics export (OTLP histograms)
+   (metrics-endpoint     :initarg :metrics-endpoint     :reader config-metrics-endpoint     :initform nil)
+   (metrics-enabled      :initarg :metrics-enabled      :reader config-metrics-enabled      :initform nil)
+   (metrics-forward-auth :initarg :metrics-forward-auth :reader config-metrics-forward-auth :initform t)
    ;; Auth
    (auth-mode     :initarg :auth-mode     :reader config-auth-mode     :initform :none)
    (auth-user     :initarg :auth-user     :reader config-auth-user     :initform nil)
