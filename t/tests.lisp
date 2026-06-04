@@ -4,11 +4,13 @@
 
 (defun make-test-client (&key (generation-enabled t) (traces-enabled t)
                                (workflow-steps-enabled nil)
+                               (metrics-enabled nil)
                                (capture :metadata-only)
                                (generation-endpoint "http://test-sigil:4318/api/v1/generations:export")
                                (traces-endpoint "http://test-sigil:4318/v1/traces")
                                (workflow-steps-endpoint
-                                "http://test-sigil:4318/api/v1/workflow-steps:export"))
+                                "http://test-sigil:4318/api/v1/workflow-steps:export")
+                               (metrics-endpoint "http://test-sigil:4318/v1/metrics"))
   "Create a client with mock HTTP that captures requests."
   (let ((requests nil))
     (values
@@ -20,6 +22,8 @@
        :traces-enabled traces-enabled
        :workflow-steps-endpoint workflow-steps-endpoint
        :workflow-steps-enabled workflow-steps-enabled
+       :metrics-endpoint metrics-endpoint
+       :metrics-enabled metrics-enabled
        :content-capture-mode capture
        :service-name "test-service"
        :service-version "1.0.0"
@@ -1325,6 +1329,228 @@
       (check "build-output: text last" (typep (third (message-parts msg)) 'text-part)))))
 
 ;;; ================================================================
+;;; Metrics tests
+;;; ================================================================
+
+(defun %registry-series (registry)
+  "Return all hist-state structs in REGISTRY as a list."
+  (let ((out nil))
+    (maphash (lambda (k st) (declare (ignore k)) (push st out))
+             (sigil-cl::metric-registry-table registry))
+    out))
+
+(defun %series-named (registry name)
+  "Return hist-states in REGISTRY whose metric name is NAME."
+  (remove-if-not (lambda (st) (equal (sigil-cl::hist-state-name st) name))
+                 (%registry-series registry)))
+
+(defun %series-attr (st key)
+  "Return the value of attribute KEY in hist-state ST, or NIL."
+  (cdr (assoc key (sigil-cl::hist-state-attrs st) :test #'equal)))
+
+(defun run-metrics-tests ()
+  (with-test-suite ("Metrics")
+    ;; --- OTLP datapoint field types ---
+    (let* ((bounds sigil-cl::+duration-buckets+)
+           (counts (append (make-list (length bounds) :initial-element 0) (list 0)))
+           (dp (sigil-cl::build-histogram-datapoint
+                (vector (otel-string-attr "gen_ai.operation.name" "generateText"))
+                bounds counts 2.5d0 1 "100" "200")))
+      (check "datapoint count is uint64 string" (equal (jget dp "count") "1"))
+      (check "datapoint sum is a number" (numberp (jget dp "sum")))
+      (check "datapoint bucketCounts are strings"
+             (every #'stringp (jget dp "bucketCounts")))
+      (check "datapoint explicitBounds length matches buckets"
+             (= (length (jget dp "explicitBounds")) (length bounds)))
+      (check "datapoint bucketCounts length = bounds + 1"
+             (= (length (jget dp "bucketCounts")) (1+ (length bounds))))
+      (check "datapoint startTimeUnixNano set" (equal (jget dp "startTimeUnixNano") "100"))
+      (check "datapoint timeUnixNano set" (equal (jget dp "timeUnixNano") "200")))
+
+    ;; --- OTLP resourceMetrics envelope shape ---
+    (let* ((dp (sigil-cl::build-histogram-datapoint
+                (vector) sigil-cl::+duration-buckets+
+                (append (make-list (length sigil-cl::+duration-buckets+) :initial-element 0)
+                        (list 0))
+                1.0d0 1 "0" "1"))
+           (metric (sigil-cl::build-otlp-metric "gen_ai.client.operation.duration" "s" (list dp)))
+           (payload (sigil-cl::build-otlp-metrics-payload (list metric) "my-svc" "1.0")))
+      (check "payload has resourceMetrics" (jget payload "resourceMetrics"))
+      (let* ((rm (aref (jget payload "resourceMetrics") 0))
+             (sm (aref (jget rm "scopeMetrics") 0)))
+        (check "scope name is sigil-cl"
+               (equal (jget* sm "scope" "name") "sigil-cl"))
+        (let ((m (aref (jget sm "metrics") 0)))
+          (check "metric name" (equal (jget m "name") "gen_ai.client.operation.duration"))
+          (check "metric unit" (equal (jget m "unit") "s"))
+          (check "metric histogram cumulative temporality"
+                 (= (jget* m "histogram" "aggregationTemporality") 2))
+          (check "metric histogram has dataPoints"
+                 (plusp (length (jget* m "histogram" "dataPoints")))))))
+
+    ;; --- Aggregation + bucket assignment ---
+    (let ((reg (sigil-cl::make-metric-registry)))
+      (sigil-cl::record-histogram reg "gen_ai.client.operation.duration" "s"
+                                  sigil-cl::+duration-buckets+ nil 2.5d0)
+      (let ((st (first (%series-named reg "gen_ai.client.operation.duration"))))
+        (check "series created" (not (null st)))
+        (check "count incremented" (= (sigil-cl::hist-state-count st) 1))
+        (check "sum accumulated" (= (sigil-cl::hist-state-sum st) 2.5d0))
+        (check "bucketCounts length = bounds + 1"
+               (= (length (sigil-cl::hist-state-counts st))
+                  (1+ (length sigil-cl::+duration-buckets+))))
+        ;; 2.5s -> first bound >= 2.5 is 2.56 at index 8
+        (check "2.5s lands in bucket index 8"
+               (= (nth 8 (sigil-cl::hist-state-counts st)) 1))
+        (check "no other bucket incremented"
+               (= 1 (reduce #'+ (sigil-cl::hist-state-counts st))))))
+
+    ;; --- Aggregation across events with same attrs collapses to one series ---
+    (let ((reg (sigil-cl::make-metric-registry)))
+      (sigil-cl::record-histogram reg "m" "s" sigil-cl::+duration-buckets+
+                                  (list (cons "a" "1")) 0.5d0)
+      (sigil-cl::record-histogram reg "m" "s" sigil-cl::+duration-buckets+
+                                  (list (cons "a" "1")) 0.5d0)
+      (check "same attrs -> one series" (= (length (%series-named reg "m")) 1))
+      (check "count summed across events"
+             (= (sigil-cl::hist-state-count (first (%series-named reg "m"))) 2)))
+
+    ;; --- Generation produces all four histograms ---
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :stream
+                                          :model-provider "openai"
+                                          :model-name "gpt-4"
+                                          :agent-name "test-agent"
+                                          :agent-version "1.0")))
+        (set-result rec
+                    :usage (make-token-usage :input 100 :output 50 :reasoning 10
+                                             :cache-read 20 :cache-creation 5)
+                    :output-messages (list (make-message
+                                            :role :assistant
+                                            :parts (list (make-tool-call-part
+                                                          :id "tc1" :name "search"
+                                                          :input-json "{}"))))
+                    :duration-seconds 2.5d0
+                    :ttft-seconds 0.3d0)
+        (recorder-end rec)
+        (let ((reg (sigil-cl::client-metric-registry client)))
+          (check "operation.duration recorded"
+                 (= (length (%series-named reg "gen_ai.client.operation.duration")) 1))
+          (check "time_to_first_token recorded"
+                 (= (length (%series-named reg "gen_ai.client.time_to_first_token")) 1))
+          (check "tool_calls_per_operation recorded"
+                 (= (length (%series-named reg "gen_ai.client.tool_calls_per_operation")) 1))
+          ;; one token.usage series per non-zero token type (all 5 here)
+          (let ((token-series (%series-named reg "gen_ai.client.token.usage")))
+            (check "token.usage: one series per non-zero token type"
+                   (= (length token-series) 5))
+            (let ((types (mapcar (lambda (st) (%series-attr st "gen_ai.token.type"))
+                                 token-series)))
+              (check "token types present"
+                     (and (member "input" types :test #'equal)
+                          (member "output" types :test #'equal)
+                          (member "reasoning" types :test #'equal)
+                          (member "cache_read" types :test #'equal)
+                          (member "cache_write" types :test #'equal)))))
+          ;; identity + operation attrs on duration series
+          (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+            (check "duration operation.name = streamText"
+                   (equal (%series-attr dur "gen_ai.operation.name") "streamText"))
+            (check "duration provider attr" (equal (%series-attr dur "gen_ai.provider.name") "openai"))
+            (check "duration model attr" (equal (%series-attr dur "gen_ai.request.model") "gpt-4"))
+            (check "duration agent name attr" (equal (%series-attr dur "gen_ai.agent.name") "test-agent"))
+            (check "duration error.type empty (no error)"
+                   (equal (%series-attr dur "error.type") ""))
+            (check "duration 2.5s in bucket index 8"
+                   (= (nth 8 (sigil-cl::hist-state-counts dur)) 1)))
+          ;; tool_calls value = 1 -> bucket index 1 (bound 1)
+          (let ((tc (first (%series-named reg "gen_ai.client.tool_calls_per_operation"))))
+            (check "tool_calls sum = 1" (= (sigil-cl::hist-state-sum tc) 1d0))))))
+
+    ;; --- Token type: only non-zero types produce series ---
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4")))
+        (set-result rec :usage (make-token-usage :input 100 :output 0)
+                        :duration-seconds 1.0d0)
+        (recorder-end rec)
+        (let* ((reg (sigil-cl::client-metric-registry client))
+               (token-series (%series-named reg "gen_ai.client.token.usage")))
+          (check "only input token.usage series (output zero)"
+                 (= (length token-series) 1))
+          (check "the single series is input type"
+                 (equal (%series-attr (first token-series) "gen_ai.token.type") "input")))))
+
+    ;; --- Export POSTs a resourceMetrics envelope to metrics-endpoint ---
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4")))
+        (set-result rec :usage (make-token-usage :input 10 :output 5)
+                        :duration-seconds 1.0d0)
+        (recorder-end rec)
+        (client-flush client)
+        (let* ((reqs (funcall get-requests))
+               (metric-posts (remove-if-not
+                              (lambda (r) (search "/v1/metrics" (first r)))
+                              reqs)))
+          (check "one metrics POST" (= (length metric-posts) 1))
+          (let ((parsed (jzon:parse (second (first metric-posts)))))
+            (check "POST body has resourceMetrics" (jget parsed "resourceMetrics"))
+            (let* ((rm (aref (jget parsed "resourceMetrics") 0))
+                   (sm (aref (jget rm "scopeMetrics") 0)))
+              (check "POST scope name sigil-cl"
+                     (equal (jget* sm "scope" "name") "sigil-cl"))
+              (check "POST has metrics" (plusp (length (jget sm "metrics")))))))))
+
+    ;; --- Embedding records duration + input token.usage ---
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-embedding client :model-provider "openai"
+                                         :model-name "text-embedding-3-small")))
+        (set-result rec :input-count 3 :input-tokens 42 :duration-seconds 0.5d0)
+        (recorder-end rec)
+        (let ((reg (sigil-cl::client-metric-registry client)))
+          (check "embedding duration recorded"
+                 (= (length (%series-named reg "gen_ai.client.operation.duration")) 1))
+          (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+            (check "embedding op name" (equal (%series-attr dur "gen_ai.operation.name") "embeddings")))
+          (let ((tok (%series-named reg "gen_ai.client.token.usage")))
+            (check "embedding token.usage input series" (= (length tok) 1))
+            (check "embedding token type input"
+                   (equal (%series-attr (first tok) "gen_ai.token.type") "input"))))))
+
+    ;; --- Tool execution records duration only ---
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc1")))
+        (set-result rec :result "ok" :duration-seconds 0.2d0)
+        (recorder-end rec)
+        (let ((reg (sigil-cl::client-metric-registry client)))
+          (check "tool execution duration recorded"
+                 (= (length (%series-named reg "gen_ai.client.operation.duration")) 1))
+          (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+            (check "tool op name" (equal (%series-attr dur "gen_ai.operation.name") "execute_tool"))
+            (check "tool name attr" (equal (%series-attr dur "gen_ai.tool.name") "search"))))))
+
+    ;; --- Disabled by default: no recording, no POST ---
+    (multiple-value-bind (client get-requests) (make-test-client) ; metrics-enabled nil
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4")))
+        (set-result rec :usage (make-token-usage :input 100 :output 50)
+                        :duration-seconds 1.0d0)
+        (recorder-end rec)
+        (client-flush client)
+        (let ((reg (sigil-cl::client-metric-registry client)))
+          (check "registry empty when metrics disabled"
+                 (zerop (hash-table-count (sigil-cl::metric-registry-table reg)))))
+        (let ((metric-posts (remove-if-not
+                             (lambda (r) (search "/v1/metrics" (first r)))
+                             (funcall get-requests))))
+          (check "no metrics POST when disabled" (null metric-posts)))))))
+
+;;; ================================================================
 ;;; Main test runner
 ;;; ================================================================
 
@@ -1342,7 +1568,8 @@
                            #'run-workflow-step-tests
                            #'run-client-tests
                            #'run-macro-tests
-                           #'run-normalize-tests))
+                           #'run-normalize-tests
+                           #'run-metrics-tests))
       (multiple-value-bind (ok pass fail) (funcall test-fn)
         (declare (ignore ok))
         (incf total-pass pass)

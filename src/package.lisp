@@ -36,6 +36,9 @@
    #:config-agent-version
    #:config-extra-headers
    #:config-debug
+   #:config-metrics-endpoint
+   #:config-metrics-enabled
+   #:config-metrics-forward-auth
    ;; Types + constructors
    #:message
    #:text-part

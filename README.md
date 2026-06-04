@@ -101,6 +101,9 @@ Convert raw LLM API hash-tables into SDK types:
 | `:generation-enabled` | `nil` | Enable generation recording |
 | `:traces-endpoint` | `nil` | Full URL for OTLP trace export |
 | `:traces-enabled` | `nil` | Enable trace/span export |
+| `:metrics-endpoint` | `nil` | Full URL for OTLP metrics export (e.g. `https://{host}/v1/metrics`) |
+| `:metrics-enabled` | `nil` | Enable built-in GenAI histogram metrics export |
+| `:metrics-forward-auth` | `t` | Forward the same auth headers to the metrics endpoint |
 | `:auth-mode` | `:none` | `:none`, `:basic`, `:bearer`, or `:tenant` |
 | `:auth-user` | `nil` | Basic auth username (falls back to tenant-id) |
 | `:auth-password` | `nil` | Auth password/token |
@@ -182,6 +185,35 @@ agent fields and finally to the service fields, so applications that only set
 | `:metadata-only` | structure only, text empty | omitted | redacted | redacted |
 
 `:no-tool-content` matches the Go SDK's `ContentCaptureModeNoToolContent` semantics: keep generation content for evaluation, but redact tool execution span attributes (where untrusted tool I/O accumulates).
+
+### Metrics
+
+With `:metrics-enabled t` and a `:metrics-endpoint` set, the SDK aggregates four
+GenAI histograms in memory and periodically POSTs them as an OTLP
+`resourceMetrics` payload to the metrics endpoint, using cumulative aggregation
+temporality (suitable for Mimir/Prometheus ingestion). Export cadence follows
+`:flush-interval-sec`; a final export runs on shutdown. Metrics are disabled by
+default and independent of the user `:metrics-fn` callback.
+
+| Metric | Unit | Buckets |
+|--------|------|---------|
+| `gen_ai.client.operation.duration` | `s` | duration |
+| `gen_ai.client.token.usage` | `token` | token |
+| `gen_ai.client.time_to_first_token` | `s` | duration |
+| `gen_ai.client.tool_calls_per_operation` | `count` | `[0,1,2,4,8,16,32,64]` |
+
+Duration and token bucket boundaries match the current OTel GenAI semantic
+conventions. `gen_ai.client.time_to_first_token` and
+`gen_ai.client.tool_calls_per_operation` are Sigil-custom metric names, not part
+of the OTel spec; they preserve parity with the reference SDK's wire output. The
+spec's standardized TTFT equivalent is
+`gen_ai.client.operation.time_to_first_chunk` (Development stability). The
+tool-call buckets are a deliberate divergence from the reference (which relies on
+OTel's default `[0..10000]` set, wrongly scaled for tool counts).
+
+Since Common Lisp has no OpenTelemetry SDK to delegate to, the aggregation and
+OTLP serialization are hand-rolled here; the reference SDK gets these for free
+from the OTel `Meter`.
 
 ## Running tests
 

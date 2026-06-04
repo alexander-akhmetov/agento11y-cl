@@ -40,6 +40,15 @@ Each with-generation call binds this per-thread via LET.")
           ;; Wake the background worker
           (bt2:with-lock-held ((client-lock client))
             (bt2:condition-notify (client-wake-cv client)))
+          ;; Built-in OTLP metrics (independent of the user metrics-fn callback)
+          (let ((config (client-config client)))
+            (when (config-metrics-enabled config)
+              (handler-case
+                  (record-builtin-metrics rec (client-metric-registry client) config)
+                (error (e)
+                  (sigil-log config :warn "metrics"
+                            (format nil "builtin metric record failed: ~a"
+                                    (princ-to-string e)))))))
           ;; Metrics callback
           (let ((metrics-fn (config-metrics-fn (client-config client))))
             (when metrics-fn
@@ -753,3 +762,112 @@ when reasoning or cache tokens are counted separately)."
         (queue-enqueue (client-workflow-queue (recorder-client rec)) payload))
       (when span
         (queue-enqueue (client-trace-queue (recorder-client rec)) span)))))
+
+;;; ================================================================
+;;; Built-in metric recording (record-builtin-metrics methods)
+;;;
+;;; The generic is declared in metrics.lisp; methods specialize on the recorder
+;;; classes defined above. All four GenAI histograms are recorded here at end.
+;;; ================================================================
+
+(defun count-output-tool-calls (rec)
+  "Count tool-call parts across a generation recorder's output messages."
+  (let ((total 0))
+    (dolist (msg (gen-rec-output-messages rec))
+      (dolist (part (message-parts msg))
+        (when (typep part 'tool-call-part)
+          (incf total))))
+    total))
+
+(defmethod record-builtin-metrics ((rec generation-recorder) registry config)
+  (let* ((op (if (eq (gen-rec-mode rec) :stream) "streamText" "generateText"))
+         (err (recorder-call-error rec))
+         (id (metric-identity-attrs config
+                                    (gen-rec-model-provider rec)
+                                    (gen-rec-model-name rec)
+                                    (gen-rec-agent-name rec)
+                                    (gen-rec-agent-version rec)))
+         (dur-attrs (append id
+                            (list (cons "gen_ai.operation.name" op)
+                                  (cons "error.type" (if err "provider_call_error" ""))
+                                  (cons "error.category" (or (classify-error err) ""))))))
+    (when (gen-rec-duration-seconds rec)
+      (record-histogram registry "gen_ai.client.operation.duration" "s"
+                        +duration-buckets+ dur-attrs (gen-rec-duration-seconds rec)))
+    (when (gen-rec-ttft-seconds rec)
+      (record-histogram registry "gen_ai.client.time_to_first_token" "s"
+                        +duration-buckets+ id (gen-rec-ttft-seconds rec)))
+    (let ((u (gen-rec-usage rec)))
+      (when u
+        (dolist (pair (list (cons "input" (token-usage-input-tokens u))
+                            (cons "output" (token-usage-output-tokens u))
+                            (cons "reasoning" (token-usage-reasoning-tokens u))
+                            (cons "cache_read" (token-usage-cache-read-tokens u))
+                            (cons "cache_write" (token-usage-cache-creation-tokens u))))
+          (when (and (cdr pair) (plusp (cdr pair)))
+            (record-histogram registry "gen_ai.client.token.usage" "token"
+                              +token-buckets+
+                              (append id
+                                      (list (cons "gen_ai.operation.name" op)
+                                            (cons "gen_ai.token.type" (car pair))))
+                              (cdr pair))))))
+    (record-histogram registry "gen_ai.client.tool_calls_per_operation" "count"
+                      +tool-call-buckets+ id (count-output-tool-calls rec))))
+
+(defmethod record-builtin-metrics ((rec embedding-recorder) registry config)
+  (let* ((err (recorder-call-error rec))
+         (id (metric-identity-attrs config
+                                    (emb-rec-model-provider rec)
+                                    (emb-rec-model-name rec)
+                                    (emb-rec-agent-name rec)
+                                    (emb-rec-agent-version rec)))
+         (dur-attrs (append id
+                            (list (cons "gen_ai.operation.name" "embeddings")
+                                  (cons "error.type" (if err "provider_call_error" ""))
+                                  (cons "error.category" (or (classify-error err) ""))))))
+    (when (emb-rec-duration-seconds rec)
+      (record-histogram registry "gen_ai.client.operation.duration" "s"
+                        +duration-buckets+ dur-attrs (emb-rec-duration-seconds rec)))
+    (let ((tokens (emb-rec-input-tokens rec)))
+      (when (and tokens (plusp tokens))
+        (record-histogram registry "gen_ai.client.token.usage" "token"
+                          +token-buckets+
+                          (append id
+                                  (list (cons "gen_ai.operation.name" "embeddings")
+                                        (cons "gen_ai.token.type" "input")))
+                          tokens)))))
+
+(defmethod record-builtin-metrics ((rec tool-execution-recorder) registry config)
+  (let* ((err (or (tool-rec-error-message rec) (recorder-call-error rec)))
+         (id (metric-identity-attrs config
+                                    (tool-rec-model-provider rec)
+                                    (tool-rec-model-name rec)
+                                    (tool-rec-agent-name rec)
+                                    (tool-rec-agent-version rec)))
+         (dur-attrs (append id
+                            (list (cons "gen_ai.operation.name" "execute_tool")
+                                  (cons "gen_ai.tool.name"
+                                        (let ((n (tool-rec-tool-name rec)))
+                                          (if (stringp n)
+                                              (string-trim '(#\Space #\Tab #\Newline #\Return) n)
+                                              "")))
+                                  (cons "error.type" (if err "tool_execution_error" ""))
+                                  (cons "error.category" (or (classify-error err) ""))))))
+    (when (tool-rec-duration-seconds rec)
+      (record-histogram registry "gen_ai.client.operation.duration" "s"
+                        +duration-buckets+ dur-attrs (tool-rec-duration-seconds rec)))))
+
+(defmethod record-builtin-metrics ((rec workflow-step-recorder) registry config)
+  (let* ((err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
+         (id (metric-identity-attrs config
+                                    ""
+                                    ""
+                                    (wfs-rec-agent-name rec)
+                                    (wfs-rec-agent-version rec)))
+         (dur-attrs (append id
+                            (list (cons "gen_ai.operation.name" "workflow_step")
+                                  (cons "error.type" (if err "workflow_step_error" ""))
+                                  (cons "error.category" (or (classify-error err) ""))))))
+    (when (wfs-rec-duration-seconds rec)
+      (record-histogram registry "gen_ai.client.operation.duration" "s"
+                        +duration-buckets+ dur-attrs (wfs-rec-duration-seconds rec)))))
