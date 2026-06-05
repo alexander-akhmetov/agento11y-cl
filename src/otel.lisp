@@ -150,6 +150,13 @@ encoded as uint64 strings (OTLP JSON convention); sum stays a JSON number."
 
 ;;; --- Common span attributes ---
 
+(defun prefixed-tag-pairs (tags)
+  "Turn a tags alist into (\"sigil.tag.<key>\" . value) pairs, skipping
+non-string entries. Mirrors the reference SDK's sigil.tag.* promotion."
+  (loop for pair in tags
+        when (and (consp pair) (stringp (car pair)) (stringp (cdr pair)))
+          collect (cons (concatenate 'string "sigil.tag." (car pair)) (cdr pair))))
+
 (defun common-span-attrs (config &key provider model agent-name agent-version
                                       conversation-id)
   "Build list of common OTLP attributes for Sigil spans."
@@ -170,4 +177,6 @@ encoded as uint64 strings (OTLP JSON convention); sum stays a JSON number."
         (let ((uid-str (princ-to-string uid)))
           (when (plusp (length uid-str))
             (push (otel-string-attr "user.id" uid-str) attrs)))))
+    (dolist (kv (prefixed-tag-pairs (config-tags config)))
+      (push (otel-string-attr (car kv) (cdr kv)) attrs))
     attrs))

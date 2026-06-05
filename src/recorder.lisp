@@ -396,7 +396,7 @@ when reasoning or cache tokens are counted separately)."
             (push (otel-int-attr "gen_ai.usage.cache_read_input_tokens" cr) attrs)))
         (let ((cc (token-usage-cache-creation-tokens usage)))
           (when (plusp cc)
-            (push (otel-int-attr "gen_ai.usage.cache_creation_input_tokens" cc) attrs)))))
+            (push (otel-int-attr "gen_ai.usage.cache_write_input_tokens" cc) attrs)))))
     ;; Request controls
     (when (gen-rec-temperature rec)
       (push (otel-string-attr "gen_ai.request.temperature"

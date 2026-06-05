@@ -34,8 +34,8 @@ startTimeUnixNano on every export."
 (defun metric-identity-attrs (config provider model agent-name agent-version)
   "Build the provider/model/agent identity attribute alist shared by all four
 metrics. Provider, model, and agent name are always present (empty string when
-unset); agent version only when non-empty. Mirrors the reference SDK."
-  (declare (ignore config))
+unset); agent version only when non-empty. Client-level config tags are
+appended as sigil.tag.* attributes. Mirrors the reference SDK."
   (flet ((trimmed (v) (if (stringp v) (string-trim '(#\Space #\Tab #\Newline #\Return) v) "")))
     (let ((attrs (list (cons "gen_ai.provider.name" (trimmed provider))
                        (cons "gen_ai.request.model" (trimmed model))
@@ -43,6 +43,7 @@ unset); agent version only when non-empty. Mirrors the reference SDK."
       (let ((ver (trimmed agent-version)))
         (when (plusp (length ver))
           (setf attrs (append attrs (list (cons "gen_ai.agent.version" ver))))))
+      (setf attrs (append attrs (prefixed-tag-pairs (config-tags config))))
       attrs)))
 
 (defun record-histogram (registry metric-name unit bounds attrs-alist value)
