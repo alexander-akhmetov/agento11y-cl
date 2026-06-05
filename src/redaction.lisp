@@ -87,12 +87,16 @@ heuristic. Used for tool-call input, tool results, and system prompts."
 (defun apply-secret-redaction (redactor mode text)
   "Redact TEXT according to MODE (:none, :light, or :full).
 Returns TEXT unchanged when REDACTOR is nil, MODE is :none, or TEXT is empty.
-Fails closed: if redaction raises an error the field is emitted as a safe
-\"[REDACTED]\" marker rather than leaking unredacted content."
-  (if (or (null redactor) (eq mode :none) (null text) (zerop (length text)))
+Fails closed: a non-string TEXT and any error raised during redaction both
+produce a \"[REDACTED]\" marker rather than leaking unredacted content."
+  (if (or (null redactor)
+          (eq mode :none)
+          (null text)
+          (and (stringp text) (zerop (length text))))
       text
       (handler-case
-          (ecase mode
-            (:light (redact-light redactor text))
-            (:full  (redact-full redactor text)))
+          (let ((s (if (stringp text) text "[REDACTED]")))
+            (ecase mode
+              (:light (redact-light redactor s))
+              (:full  (redact-full redactor s))))
         (error () "[REDACTED]"))))
