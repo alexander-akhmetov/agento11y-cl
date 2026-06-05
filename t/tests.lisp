@@ -1179,7 +1179,56 @@
                (eq thread1 (sigil-cl::client-worker-thread client))))
       (client-shutdown client :timeout-sec 2)
       (check "client stopped" (not (sigil-cl::client-running-p client)))
-      (check "worker thread nil" (null (sigil-cl::client-worker-thread client))))))
+      (check "worker thread nil" (null (sigil-cl::client-worker-thread client))))
+
+    ;; Client config tags promoted onto the generation span as sigil.tag.*
+    (flet ((span-attr (span key)
+             (let ((found nil))
+               (loop for a across (jget span "attributes")
+                     when (equal (jget a "key") key)
+                       do (setf found (jget* a "value" "stringValue")))
+               found)))
+      (let ((client (make-client
+                     (make-config :traces-endpoint "http://x/v1/traces"
+                                  :traces-enabled t
+                                  :tags '(("env" . "prod") (1 . 2) ("team" . "ai")))
+                     :env-fn (constantly nil))))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "openai" :model-name "gpt-4")))
+          (set-result rec :usage (make-token-usage :input 10 :output 5))
+          (recorder-end rec))
+        (let ((span (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-trace-queue client)))))
+          (check "span: sigil.tag.env present"
+                 (equal (span-attr span "sigil.tag.env") "prod"))
+          (check "span: sigil.tag.team present"
+                 (equal (span-attr span "sigil.tag.team") "ai"))
+          (check "span: invalid tag cons skipped"
+                 (null (span-attr span "sigil.tag.1"))))))
+
+    ;; Cache-write span attr renamed; JSON payload keeps cache_creation_input_tokens
+    (flet ((span-int-attr (span key)
+             (let ((found nil))
+               (loop for a across (jget span "attributes")
+                     when (equal (jget a "key") key)
+                       do (setf found (jget* a "value" "intValue")))
+               found)))
+      (multiple-value-bind (client get-requests) (make-test-client)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "anthropic" :model-name "claude")))
+          (set-result rec :usage (make-token-usage :input 10 :output 5 :cache-creation 7))
+          (recorder-end rec))
+        (let ((gen (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-generation-queue client))))
+              (span (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-trace-queue client)))))
+          (check "span: cache_write_input_tokens set"
+                 (equal (span-int-attr span "gen_ai.usage.cache_write_input_tokens") "7"))
+          (check "span: no cache_creation_input_tokens attr"
+                 (null (span-int-attr span "gen_ai.usage.cache_creation_input_tokens")))
+          (check "payload: keeps cache_creation_input_tokens"
+                 (= (jget* gen "usage" "cache_creation_input_tokens") 7)))))))
 
 (defun run-macro-tests ()
   (with-test-suite ("Macros")
@@ -1249,7 +1298,31 @@
           (check "with-span: falls back to service-name"
                  (equal (span-attr span "gen_ai.agent.name") "legacy-app"))
           (check "with-span: falls back to service-version"
-                 (equal (span-attr span "gen_ai.agent.version") "0.9")))))))
+                 (equal (span-attr span "gen_ai.agent.version") "0.9"))))
+
+      ;; Config tags reach every span kind: generation, embedding, tool, workflow-step, with-span
+      (let ((client (make-client
+                     (make-config :traces-endpoint "http://x/v1/traces"
+                                  :traces-enabled t
+                                  :workflow-steps-endpoint "http://x/api/v1/workflow-steps:export"
+                                  :workflow-steps-enabled t
+                                  :tags '(("env" . "prod")))
+                     :env-fn (constantly nil))))
+        (with-generation (g client :mode :sync :model-provider "openai" :model-name "gpt-4")
+          g)
+        (with-embedding (e client :model-provider "openai" :model-name "text-embedding-3-small")
+          e)
+        (with-tool-execution (tr client :tool-name "search" :tool-call-id "tc1")
+          tr)
+        (with-workflow-step (w client :step-name "step-1")
+          w)
+        (with-span (client "rerank")
+          nil)
+        (let ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client))))
+          (check "all span kinds enqueued" (= (length spans) 5))
+          (check "every span carries sigil.tag.env"
+                 (every (lambda (s) (equal (span-attr s "sigil.tag.env") "prod"))
+                        spans)))))))
 
 (defun run-normalize-tests ()
   (with-test-suite ("Normalize")
@@ -1533,6 +1606,31 @@
           (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
             (check "tool op name" (equal (%series-attr dur "gen_ai.operation.name") "execute_tool"))
             (check "tool name attr" (equal (%series-attr dur "gen_ai.tool.name") "search"))))))
+
+    ;; --- Client config tags promoted onto metric series; per-call tags are not ---
+    (let ((client (make-client
+                   (make-config :metrics-endpoint "http://x/v1/metrics"
+                                :metrics-enabled t
+                                :service-name "test-service"
+                                :tags '(("env" . "prod")))
+                   :env-fn (constantly nil))))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4"
+                                          :tags '(("request_id" . "r-1")))))
+        (set-result rec :usage (make-token-usage :input 100 :output 50)
+                        :duration-seconds 1.0d0)
+        (recorder-end rec)
+        (let ((reg (sigil-cl::client-metric-registry client)))
+          (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+            (check "duration series carries sigil.tag.env"
+                   (equal (%series-attr dur "sigil.tag.env") "prod"))
+            (check "duration series omits per-call tag"
+                   (null (%series-attr dur "sigil.tag.request_id"))))
+          (let ((tok (first (%series-named reg "gen_ai.client.token.usage"))))
+            (check "token.usage series carries sigil.tag.env"
+                   (equal (%series-attr tok "sigil.tag.env") "prod"))
+            (check "token.usage series omits per-call tag"
+                   (null (%series-attr tok "sigil.tag.request_id")))))))
 
     ;; --- Disabled by default: no recording, no POST ---
     (multiple-value-bind (client get-requests) (make-test-client) ; metrics-enabled nil

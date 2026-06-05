@@ -83,6 +83,8 @@ ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto
                          (push (otel-string-attr "gen_ai.agent.name" agent) base-attrs))
                        (when (and agent-ver (plusp (length agent-ver)))
                          (push (otel-string-attr "gen_ai.agent.version" agent-ver) base-attrs)))
+                     (dolist (kv (prefixed-tag-pairs (config-tags cfg)))
+                       (push (otel-string-attr (car kv) (cdr kv)) base-attrs))
                      (dolist (a ,attrs-var)
                        (push a base-attrs))
                      (queue-enqueue
