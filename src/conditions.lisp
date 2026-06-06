@@ -22,3 +22,13 @@
   ()
   (:report (lambda (c stream)
              (format stream "Sigil validation error: ~a" (sigil-error-message c)))))
+
+(define-condition sigil-not-found-error (sigil-error)
+  ()
+  (:report (lambda (c stream)
+             (format stream "Sigil not found error: ~a" (sigil-error-message c)))))
+
+(define-condition sigil-conflict-error (sigil-error)
+  ()
+  (:report (lambda (c stream)
+             (format stream "Sigil conflict error: ~a" (sigil-error-message c)))))

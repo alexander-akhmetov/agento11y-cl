@@ -180,6 +180,12 @@ series on each recorder end."
       (config-agent-version config)
       (config-service-version config)))
 
+(defvar *experiment-run* nil
+  "Current experiment run. Bound by WITH-EXPERIMENT and read by START-GENERATION.")
+
+(declaim (ftype function %experiment-run-prepare-generation-options
+                %experiment-run-register-recorder))
+
 (defun start-generation (client &key (mode :sync) conversation-id conversation-title
                                       user-id agent-name agent-version
                                       model-provider model-name
@@ -187,19 +193,33 @@ series on each recorder end."
                                       temperature top-p max-tokens tool-choice
                                       (thinking-enabled :unset)
                                       parent-generation-ids
-                                      tags metadata)
+                                      tags metadata generation-id)
   "Create and start a generation recorder.
 When called inside a `with-workflow-step` (or any other context that binds
 `*trace-context*`), the generation inherits the workflow's trace-id and uses
 its span-id as parent so spans nest under the workflow span."
   (let* ((config (client-config client))
+         (run *experiment-run*)
          (ctx *trace-context*)
          (inherited-trace-id (getf ctx :trace-id))
          (inherited-parent-span-id (getf ctx :span-id)))
-    (make-instance 'generation-recorder
+    (when run
+      (let ((prepared (%experiment-run-prepare-generation-options
+                       run client
+                       :conversation-id conversation-id
+                       :agent-name agent-name
+                       :agent-version agent-version
+                       :tags tags
+                       :metadata metadata)))
+        (setf conversation-id (getf prepared :conversation-id conversation-id)
+              agent-name (getf prepared :agent-name agent-name)
+              agent-version (getf prepared :agent-version agent-version)
+              tags (getf prepared :tags tags)
+              metadata (getf prepared :metadata metadata))))
+    (let ((rec (make-instance 'generation-recorder
       :client client
       :started-at (iso8601-now)
-      :generation-id (generate-id)
+      :generation-id (or generation-id (generate-id))
       :trace-id (or inherited-trace-id (generate-trace-id))
       :span-id (generate-span-id)
       :parent-span-id inherited-parent-span-id
@@ -222,6 +242,9 @@ its span-id as parent so spans nest under the workflow span."
       :parent-generation-ids parent-generation-ids
       :tags tags
       :metadata metadata)))
+      (when run
+        (%experiment-run-register-recorder run rec))
+      rec)))
 
 (defun start-tool-execution (client &key tool-name tool-call-id tool-type tool-description
                                           conversation-id agent-name agent-version

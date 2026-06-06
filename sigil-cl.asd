@@ -21,7 +21,9 @@
                (:file "recorder")
                (:file "rating")
                (:file "client")
+               (:file "eval")
                (:file "macros")
+               (:file "experiment")
                (:file "normalize")))
 
 (defsystem :sigil-cl/t

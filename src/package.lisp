@@ -28,6 +28,29 @@
    #:with-span
    ;; Ratings
    #:submit-conversation-rating
+   ;; Experiments and scores
+   #:create-experiment
+   #:get-experiment
+   #:update-experiment
+   #:complete-experiment
+   #:cancel-experiment
+   #:get-experiment-report
+   #:list-experiment-scores
+   #:export-scores
+   #:experiment-url
+   #:with-experiment
+   #:experiment-run
+   #:experiment-run-add-scores
+   #:experiment-run-finalize
+   #:experiment-run-url
+   #:experiment-run-report
+   #:experiment-run-produced-generation-ids
+   #:experiment-run-track-generation-id
+   #:experiment-run-reset-capture
+   #:experiment-run-active-conversation-id
+   #:experiment-run-accepted-count
+   #:make-score
+   #:stable-id
    ;; Config
    #:sigil-config
    #:make-config
@@ -39,6 +62,10 @@
    #:config-metrics-endpoint
    #:config-metrics-enabled
    #:config-metrics-forward-auth
+   #:config-eval-endpoint
+   #:config-eval-path-prefix
+   #:config-scores-export-path
+   #:config-experiment-url-template
    ;; Types + constructors
    #:message
    #:text-part
@@ -101,4 +128,6 @@
    #:sigil-config-error
    #:sigil-export-error
    #:sigil-export-error-status-code
-   #:sigil-validation-error))
+   #:sigil-validation-error
+   #:sigil-not-found-error
+   #:sigil-conflict-error))

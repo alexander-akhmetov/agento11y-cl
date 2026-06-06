@@ -99,6 +99,10 @@ Convert raw LLM API hash-tables into SDK types:
 |--------|---------|-------------|
 | `:generation-endpoint` | `nil` | Full URL for generation export |
 | `:generation-enabled` | `nil` | Enable generation recording |
+| `:eval-endpoint` | `nil` | Base URL for experiment control-plane and score export; falls back to the generation endpoint host |
+| `:eval-path-prefix` | `"/api/v1"` | Path prefix for experiment routes |
+| `:scores-export-path` | `"/api/v1/scores:export"` | Score export route |
+| `:experiment-url-template` | `nil` | Optional UI URL template with `{base}` and `{run_id}` placeholders |
 | `:traces-endpoint` | `nil` | Full URL for OTLP trace export |
 | `:traces-enabled` | `nil` | Enable trace/span export |
 | `:metrics-endpoint` | `nil` | Full URL for OTLP metrics export (e.g. `https://{host}/v1/metrics`) |
@@ -133,6 +137,9 @@ schema defaults. This matches the canonical sigil-sdk schema (Go, Python, JS).
 | Variable | Config slot | Notes |
 |----------|-------------|-------|
 | `SIGIL_ENDPOINT` | `:generation-endpoint` | Full URL; sigil-cl is HTTP-only, no scheme auto-prepend |
+| `SIGIL_EVAL_ENDPOINT` | `:eval-endpoint` | Base URL for experiment control-plane requests |
+| `SIGIL_EVAL_PATH_PREFIX` | `:eval-path-prefix` | Defaults to `/api/v1` |
+| `SIGIL_EXPERIMENT_URL_TEMPLATE` | `:experiment-url-template` | Supports `{base}` and `{run_id}` |
 | `SIGIL_HEADERS` | `:extra-headers` | `k=v,k2=v2`; merged into auth headers (user header wins on case-insensitive collision) |
 | `SIGIL_AUTH_MODE` | `:auth-mode` | `none` / `tenant` / `bearer` / `basic`; unknown values warn and are ignored |
 | `SIGIL_AUTH_TENANT_ID` | `:tenant-id` | |
@@ -214,6 +221,42 @@ OTel's default `[0..10000]` set, wrongly scaled for tool counts).
 Since Common Lisp has no OpenTelemetry SDK to delegate to, the aggregation and
 OTLP serialization are hand-rolled here; the reference SDK gets these for free
 from the OTel `Meter`.
+
+## Experiments
+
+Use `with-experiment` to create or reopen an offline-evaluation run. Generations
+recorded inside the dynamic extent are tagged with `experiment.run_id`, include
+`experiment_run_id` metadata, and are captured so scores can attach to them.
+
+```lisp
+(sigil-cl:with-experiment (run client :run-id "exp-prompt-a" :name "prompt A")
+  (let ((rec (sigil-cl:start-generation client
+               :model-provider "anthropic"
+               :model-name "claude-sonnet"
+               :input-messages input)))
+    ;; Call the model, then record the result.
+    (sigil-cl:set-result rec :output-messages output :usage usage)
+    (sigil-cl:recorder-end rec)
+
+    (sigil-cl:experiment-run-add-scores
+     run
+     (list (sigil-cl:make-score :evaluator-id "verifier"
+                                :evaluator-version "1"
+                                :score-key "reward"
+                                :value 0.9
+                                :passed t)))))
+```
+
+`with-experiment` finalizes the run as `succeeded` on normal exit, `failed` on
+errors, and cancels it on non-local exits such as interrupts. A `409 Conflict`
+from run creation reopens the run by patching it back to `running` before the
+body runs.
+
+Experiment control-plane calls are synchronous. Configure them with
+`:eval-endpoint`, `:eval-path-prefix`, `:scores-export-path`, and
+`:experiment-url-template`, or the matching `SIGIL_EVAL_*` environment variables.
+If `:eval-endpoint` is unset, the SDK derives the base URL from
+`:generation-endpoint`.
 
 ## Running tests
 
