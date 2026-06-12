@@ -24,6 +24,7 @@
                (:file "eval")
                (:file "macros")
                (:file "experiment")
+               (:file "conversations")
                (:file "normalize")))
 
 (defsystem :sigil-cl/t

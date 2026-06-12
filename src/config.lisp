@@ -7,6 +7,7 @@
    ;; Eval control plane and score export
    (eval-endpoint :initarg :eval-endpoint :reader config-eval-endpoint :initform nil)
    (eval-path-prefix :initarg :eval-path-prefix :reader config-eval-path-prefix :initform "/api/v1")
+   (eval-auth-token :initarg :eval-auth-token :reader config-eval-auth-token :initform nil)
    (scores-export-path :initarg :scores-export-path :reader config-scores-export-path
                        :initform "/api/v1/scores:export")
    (experiment-url-template :initarg :experiment-url-template

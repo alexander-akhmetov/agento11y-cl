@@ -4,10 +4,6 @@
 (defparameter +experiment-run-id-metadata-key+ "experiment_run_id")
 (defparameter +experiment-score-source-kind+ "experiment")
 
-(defparameter +fnv64-offset-basis+ 14695981039346656037)
-(defparameter +fnv64-prime+ 1099511628211)
-(defparameter +uint64-modulus+ #.(expt 2 64))
-
 (defun %join-stable-id-parts (parts)
   (with-output-to-string (out)
     (loop for part in parts
@@ -18,13 +14,15 @@
                (write-string (princ-to-string part) out)))))
 
 (defun stable-id (prefix &rest parts)
-  "Return a deterministic id using FNV-1a over PARTS."
-  (let ((hash +fnv64-offset-basis+)
-        (joined (%join-stable-id-parts parts)))
-    (loop for ch across joined
-          do (setf hash (mod (* (logxor hash (char-code ch)) +fnv64-prime+)
-                             +uint64-modulus+)))
-    (format nil "~a-~(~16,'0x~)" prefix hash)))
+  "Return a deterministic id from PARTS for idempotent retries.
+Matches StableID in the Go and Python SDKs (first 16 hex chars of SHA-1
+over the parts joined with #\Us), so reruns from another SDK dedupe to the
+same score and conversation ids. Cross-SDK parity holds for string parts;
+non-string parts are printed with PRINC-TO-STRING, whose output (e.g. for
+booleans and floats) differs from Go fmt.Sprint and Python str."
+  (let ((joined (%join-stable-id-parts parts)))
+    (format nil "~a-~a" prefix
+            (subseq (sha1-hex (string-to-utf8-octets joined)) 0 16))))
 
 (defun make-score (&key evaluator-id evaluator-version score-key
                         (value nil value-supplied-p)
@@ -50,6 +48,8 @@
   ((client :initarg :client :reader experiment-run-client)
    (run-id :initarg :run-id :reader experiment-run-run-id)
    (name :initarg :name :reader experiment-run-name)
+   (upload :initarg :upload :reader experiment-run-upload :initform :continuous)
+   (buffer :initform nil :accessor experiment-run-buffer)
    (dataset :initarg :dataset :accessor experiment-run-dataset :initform nil)
    (candidate :initarg :candidate :accessor experiment-run-candidate :initform nil)
    (lock :initform (bt2:make-lock :name "sigil-experiment-run")
@@ -65,19 +65,22 @@
    (accepted-count :initform 0 :accessor experiment-run-accepted-count)
    (finalized-p :initform nil :accessor experiment-run-finalized-p)))
 
-(defun %validate-upload-mode (upload)
+(defun %normalize-upload-mode (upload)
   (let ((mode (or upload :continuous)))
-    (unless (eq mode :continuous)
+    (unless (member mode '(:continuous :bulk :manual))
       (error 'sigil-validation-error
-             :message "with-experiment only supports :upload :continuous"))
+             :message (format nil "unknown upload mode ~s; expected :continuous, :bulk, or :manual"
+                              mode)))
     mode))
 
 (defun %make-experiment-run (&key client run-id name dataset candidate
+                                  (upload :continuous)
                                   agent-name agent-version extra-tags extra-metadata)
   (make-instance 'experiment-run
                  :client client
                  :run-id (%trimmed-text run-id)
                  :name (%text name)
+                 :upload upload
                  :dataset dataset
                  :candidate candidate
                  :agent-name agent-name
@@ -329,7 +332,10 @@
         out))))
 
 (defun experiment-run-add-scores (run scores &key item generation-ids conversation-id trial-id)
-  "Attach SCORES to this experiment run and export them. Returns accepted count."
+  "Attach SCORES to this experiment run. In :continuous upload mode (the
+default) they are exported immediately and the accepted count is returned.
+In :bulk and :manual modes they are buffered and the buffered count is
+returned; EXPERIMENT-RUN-PUBLISH exports them."
   (when (null scores)
     (return-from experiment-run-add-scores 0))
   (multiple-value-bind (ids conv-id)
@@ -340,11 +346,39 @@
     (let ((items (mapcar (lambda (score)
                            (%build-score-item run score item ids conv-id trial-id))
                          scores)))
-      (client-flush (experiment-run-client run))
-      (let ((accepted (export-scores (experiment-run-client run) items)))
-        (bt2:with-lock-held ((experiment-run-lock run))
-          (incf (experiment-run-accepted-count run) accepted))
-        accepted))))
+      (if (eq (experiment-run-upload run) :continuous)
+          (progn
+            (client-flush (experiment-run-client run))
+            (let ((accepted (export-scores (experiment-run-client run) items)))
+              (bt2:with-lock-held ((experiment-run-lock run))
+                (incf (experiment-run-accepted-count run) accepted))
+              accepted))
+          (bt2:with-lock-held ((experiment-run-lock run))
+            (setf (experiment-run-buffer run)
+                  (append (experiment-run-buffer run) items))
+            (length items))))))
+
+(defun experiment-run-publish (run)
+  "Export scores buffered by the :bulk and :manual upload modes. Returns the
+newly accepted count. The buffer is kept on export failure so a retry
+publishes the same items (their score ids are stable)."
+  (let ((items (bt2:with-lock-held ((experiment-run-lock run))
+                 (copy-list (experiment-run-buffer run)))))
+    (if (null items)
+        0
+        (progn
+          (client-flush (experiment-run-client run))
+          (let ((accepted (export-scores (experiment-run-client run) items)))
+            (bt2:with-lock-held ((experiment-run-lock run))
+              (incf (experiment-run-accepted-count run) accepted)
+              (setf (experiment-run-buffer run)
+                    (nthcdr (length items) (experiment-run-buffer run))))
+            accepted)))))
+
+(defun experiment-run-buffered-score-count (run)
+  "Number of scores waiting for EXPERIMENT-RUN-PUBLISH."
+  (bt2:with-lock-held ((experiment-run-lock run))
+    (length (experiment-run-buffer run))))
 
 (defun experiment-run-finalize (run &key (status "succeeded") ((:error error-message)) metadata)
   "Finalize RUN once. Later calls are ignored."
@@ -375,7 +409,7 @@
     (error 'sigil-validation-error :message "experiment run_id is required"))
   (when (%blank-string-p name)
     (error 'sigil-validation-error :message "experiment name is required"))
-  (%validate-upload-mode upload)
+  (setf upload (%normalize-upload-mode upload))
   (let* ((create-metadata (%run-metadata metadata dataset candidate))
          (run-tags tags))
     (when (and collection-id (not (%blank-string-p collection-id)))
@@ -399,6 +433,7 @@
     (%make-experiment-run :client client
                           :run-id run-id
                           :name name
+                          :upload upload
                           :dataset dataset
                           :candidate candidate
                           :agent-name agent-name
@@ -411,10 +446,14 @@
       (funcall thunk)
     (error () nil)))
 
+(defun %experiment-log (run message)
+  (sigil-log (client-config (experiment-run-client run)) :info "experiment" message))
+
 (defun %call-with-experiment (client body-fn &key run-id name description tags metadata
                                       dataset candidate collection-id agent-name agent-version
                                       extra-tags extra-metadata (source "external")
-                                      (on-conflict :reopen) (upload :continuous))
+                                      (on-conflict :reopen) (upload :continuous)
+                                      (print-url t))
   (let ((run (%open-experiment-run client
                                    :run-id run-id
                                    :name name
@@ -445,7 +484,32 @@
              (error e)))
       (case exit-kind
         (:succeeded
-         (experiment-run-finalize run :status "succeeded"))
+         (if (eq (experiment-run-upload run) :manual)
+             (when print-url
+               (ignore-errors
+                 (%experiment-log
+                  run
+                  (format nil "experiment ~a left open (manual mode): ~d score(s) buffered; call experiment-run-publish then experiment-run-finalize"
+                          (experiment-run-run-id run)
+                          (experiment-run-buffered-score-count run)))))
+             (progn
+               (handler-case
+                   (experiment-run-publish run)
+                 (error (e)
+                   (%safe-finalize
+                    (lambda ()
+                      (experiment-run-finalize run :status "failed"
+                                               :error (princ-to-string e))))
+                   (error e)))
+               (experiment-run-finalize run :status "succeeded")
+               (when print-url
+                 (ignore-errors
+                   (%experiment-log
+                    run
+                    (format nil "experiment ~a finished (~d scores): ~a"
+                            (experiment-run-run-id run)
+                            (experiment-run-accepted-count run)
+                            (experiment-run-url run))))))))
         (:failed
          (%safe-finalize
           (lambda ()
@@ -458,8 +522,106 @@
            (setf (experiment-run-finalized-p run) t)))))))
 
 (defmacro with-experiment ((run client &rest options) &body body)
-  "Create or reopen an experiment run, bind it, and finalize it on exit."
+  "Create or reopen an experiment run, bind it, and finalize it on exit.
+On normal exit buffered scores are published and the run is finalized
+succeeded (:upload :manual instead leaves the run open for the caller to
+publish and finalize); on error it is finalized failed; on a non-local exit
+it is canceled."
   `(%call-with-experiment ,client
                           (lambda (,run)
                             ,@body)
                           ,@options))
+
+;;; --- Dataset runner ---
+
+(defun make-dataset-item (&key id input expected metadata)
+  "Build a dataset item for RUN-EXPERIMENT."
+  (let ((item (jobj "id" (%text id))))
+    (when input (setf (gethash "input" item) (%jsonify input)))
+    (when expected (setf (gethash "expected" item) (%jsonify expected)))
+    (when metadata (setf (gethash "metadata" item) (%jsonify metadata)))
+    item))
+
+(defun make-target-result (&key output generation-ids conversation-id metadata)
+  "Build a target result for RUN-EXPERIMENT targets."
+  (let ((result (jobj)))
+    (when output (setf (gethash "output" result) (%jsonify output)))
+    (when generation-ids
+      (setf (gethash "generation_ids" result)
+            (coerce (mapcar #'%text generation-ids) 'vector)))
+    (when conversation-id
+      (setf (gethash "conversation_id" result) (%text conversation-id)))
+    (when metadata (setf (gethash "metadata" result) (%jsonify metadata)))
+    result))
+
+(defun %id-list (value)
+  (let ((raw (cond
+               ((null value) nil)
+               ((stringp value) (list value))
+               ((listp value) value)
+               ((vectorp value) (coerce value 'list))
+               (t nil))))
+    (remove-if #'%blank-string-p (mapcar #'%trimmed-text raw))))
+
+(defun %scorer-outputs (produced)
+  "Normalize one scorer's return value to a list of score outputs.
+A bare MAKE-SCORE plist is wrapped in a list."
+  (cond
+    ((null produced) nil)
+    ((and (listp produced) (keywordp (first produced))) (list produced))
+    ((and (vectorp produced) (not (stringp produced))) (coerce produced 'list))
+    ((listp produced) produced)
+    (t (list produced))))
+
+(defun run-experiment (client items target scorers
+                       &key run-id name description tags metadata dataset candidate
+                            collection-id agent-name agent-version extra-tags extra-metadata
+                            (source "external") (on-conflict :reopen)
+                            (upload :continuous) (print-url t) (fetch-report t))
+  "Run TARGET over dataset ITEMS inside an experiment and export scores.
+
+For each item the run's capture is reset with a stable per-item
+conversation id, TARGET is called as (funcall target item run), and each
+scorer in SCORERS is called as (funcall scorer item result) where RESULT is
+TARGET's return value (or an empty object when it returns NIL; see
+MAKE-TARGET-RESULT). Scorers return lists of score outputs (see
+MAKE-SCORE). Scores fall back to the generation ids captured by the run
+when the target result does not name them.
+
+Returns a plist with :run-id, :accepted-scores, :url, and :report (NIL
+unless FETCH-REPORT is set and the report fetch succeeds)."
+  (let ((completed-run nil))
+    (with-experiment (run client
+                      :run-id run-id :name name :description description
+                      :tags tags :metadata metadata :dataset dataset
+                      :candidate candidate :collection-id collection-id
+                      :agent-name agent-name :agent-version agent-version
+                      :extra-tags extra-tags :extra-metadata extra-metadata
+                      :source source :on-conflict on-conflict
+                      :upload upload :print-url print-url)
+      (setf completed-run run)
+      (dolist (item items)
+        (experiment-run-reset-capture
+         run
+         :conversation-id (stable-id "conv" (experiment-run-run-id run) (%item-id item)))
+        (let* ((result (or (funcall target item run) (jobj)))
+               (generation-ids
+                 (or (%id-list (nth-value 0 (%field result "generation_ids" :generation-ids)))
+                     (experiment-run-produced-generation-ids run)))
+               (conv-id
+                 (let ((cid (%trimmed-text
+                             (nth-value 0 (%field result "conversation_id" :conversation-id)))))
+                   (if (plusp (length cid))
+                       cid
+                       (experiment-run-active-conversation-id run))))
+               (outputs (loop for scorer in scorers
+                              append (%scorer-outputs (funcall scorer item result)))))
+          (experiment-run-add-scores run outputs
+                                     :item item
+                                     :generation-ids generation-ids
+                                     :conversation-id conv-id))))
+    (list :run-id (experiment-run-run-id completed-run)
+          :accepted-scores (experiment-run-accepted-count completed-run)
+          :url (experiment-run-url completed-run)
+          :report (when fetch-report
+                    (%safe-finalize (lambda () (experiment-run-report completed-run)))))))

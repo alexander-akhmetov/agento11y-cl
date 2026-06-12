@@ -90,6 +90,91 @@ Parses fractional seconds if present. Returns NIL for invalid input."
   (bt2:with-lock-held (*id-lock*)
     (format nil "~16,'0x" (random (expt 2 64) *id-random-state*))))
 
+;;; --- UTF-8 + SHA-1 ---
+;;;
+;;; Hand-rolled because stable experiment ids must match the SHA-1-based
+;;; StableID in the Go/Python SDKs byte-for-byte, and the project keeps its
+;;; dependency list small. Not used for anything security-sensitive.
+
+(defun string-to-utf8-octets (string)
+  "Encode STRING as UTF-8 octets. Assumes CHAR-CODE returns the Unicode
+codepoint (true on SBCL, CCL, ECL)."
+  (let ((out (make-array (length string) :element-type '(unsigned-byte 8)
+                                         :adjustable t :fill-pointer 0)))
+    (loop for ch across string
+          for code = (char-code ch)
+          do (cond
+               ((< code #x80)
+                (vector-push-extend code out))
+               ((< code #x800)
+                (vector-push-extend (logior #xC0 (ash code -6)) out)
+                (vector-push-extend (logior #x80 (logand code #x3F)) out))
+               ((< code #x10000)
+                (vector-push-extend (logior #xE0 (ash code -12)) out)
+                (vector-push-extend (logior #x80 (logand (ash code -6) #x3F)) out)
+                (vector-push-extend (logior #x80 (logand code #x3F)) out))
+               (t
+                (vector-push-extend (logior #xF0 (ash code -18)) out)
+                (vector-push-extend (logior #x80 (logand (ash code -12) #x3F)) out)
+                (vector-push-extend (logior #x80 (logand (ash code -6) #x3F)) out)
+                (vector-push-extend (logior #x80 (logand code #x3F)) out))))
+    out))
+
+(defun sha1-hex (octets)
+  "Return the SHA-1 digest of OCTETS as a lowercase hex string."
+  (let* ((msg-len (length octets))
+         (bit-len (* 8 msg-len))
+         ;; message + 0x80 byte + zero padding + 8-byte big-endian bit length,
+         ;; rounded up to a multiple of 64 bytes.
+         (total (* 64 (ceiling (+ msg-len 9) 64)))
+         (buf (make-array total :element-type '(unsigned-byte 8) :initial-element 0))
+         (w (make-array 80 :element-type '(unsigned-byte 32)))
+         (h0 #x67452301) (h1 #xEFCDAB89) (h2 #x98BADCFE)
+         (h3 #x10325476) (h4 #xC3D2E1F0))
+    (replace buf octets)
+    (setf (aref buf msg-len) #x80)
+    (loop for i from 0 below 8
+          do (setf (aref buf (- total 1 i))
+                   (logand (ash bit-len (* -8 i)) #xFF)))
+    (flet ((rotl (x n)
+             (logand #xFFFFFFFF (logior (ash x n) (ash x (- n 32))))))
+      (loop for chunk from 0 below total by 64
+            do (loop for i from 0 below 16
+                     do (setf (aref w i)
+                              (logior (ash (aref buf (+ chunk (* 4 i))) 24)
+                                      (ash (aref buf (+ chunk (* 4 i) 1)) 16)
+                                      (ash (aref buf (+ chunk (* 4 i) 2)) 8)
+                                      (aref buf (+ chunk (* 4 i) 3)))))
+               (loop for i from 16 below 80
+                     do (setf (aref w i)
+                              (rotl (logxor (aref w (- i 3)) (aref w (- i 8))
+                                            (aref w (- i 14)) (aref w (- i 16)))
+                                    1)))
+               (let ((a h0) (b h1) (c h2) (d h3) (e h4))
+                 (loop for i from 0 below 80
+                       do (multiple-value-bind (f k)
+                              (cond
+                                ((< i 20) (values (logior (logand b c) (logandc1 b d))
+                                                  #x5A827999))
+                                ((< i 40) (values (logxor b c d) #x6ED9EBA1))
+                                ((< i 60) (values (logior (logand b c) (logand b d)
+                                                          (logand c d))
+                                                  #x8F1BBCDC))
+                                (t (values (logxor b c d) #xCA62C1D6)))
+                            (let ((tmp (logand #xFFFFFFFF
+                                               (+ (rotl a 5) f e k (aref w i)))))
+                              (setf e d
+                                    d c
+                                    c (rotl b 30)
+                                    b a
+                                    a tmp))))
+                 (setf h0 (logand #xFFFFFFFF (+ h0 a))
+                       h1 (logand #xFFFFFFFF (+ h1 b))
+                       h2 (logand #xFFFFFFFF (+ h2 c))
+                       h3 (logand #xFFFFFFFF (+ h3 d))
+                       h4 (logand #xFFFFFFFF (+ h4 e))))))
+    (format nil "~(~8,'0x~8,'0x~8,'0x~8,'0x~8,'0x~)" h0 h1 h2 h3 h4)))
+
 ;;; --- Backoff ---
 
 (defun backoff-seconds (attempt initial-sec max-sec)

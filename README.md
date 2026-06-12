@@ -11,6 +11,8 @@ Sigil captures LLM generations, tool executions, and embeddings from your applic
 - **Embedding tracing** — track embedding API calls with input counts and token usage
 - **Ad-hoc spans** — wrap arbitrary code blocks in OTel spans via `with-span`
 - **Conversation ratings** — submit user feedback ratings to the Sigil API
+- **Offline experiments** — create eval runs, record tagged generations, export scores, and loop a dataset through a target and scorers
+- **Collection datasets** — read Sigil collections and conversations to build experiment datasets from saved conversations
 - **Message normalization** — convert raw Anthropic and OpenAI API responses into SDK types
 - **Background export** — batched, async HTTP export with exponential backoff retry
 - **Content capture modes** — `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only`
@@ -99,9 +101,10 @@ Convert raw LLM API hash-tables into SDK types:
 |--------|---------|-------------|
 | `:generation-endpoint` | `nil` | Full URL for generation export |
 | `:generation-enabled` | `nil` | Enable generation recording |
-| `:eval-endpoint` | `nil` | Base URL for experiment control-plane and score export; falls back to the generation endpoint host |
+| `:eval-endpoint` | `nil` | Base URL for experiment control-plane requests; falls back to the generation endpoint host |
 | `:eval-path-prefix` | `"/api/v1"` | Path prefix for experiment routes |
-| `:scores-export-path` | `"/api/v1/scores:export"` | Score export route |
+| `:eval-auth-token` | `nil` | Bearer token for control-plane requests; replaces the generation auth headers when set. Score export always uses generation auth |
+| `:scores-export-path` | `"/api/v1/scores:export"` | Score export route on the generation endpoint host |
 | `:experiment-url-template` | `nil` | Optional UI URL template with `{base}` and `{run_id}` placeholders |
 | `:traces-endpoint` | `nil` | Full URL for OTLP trace export |
 | `:traces-enabled` | `nil` | Enable trace/span export |
@@ -139,6 +142,7 @@ schema defaults. This matches the canonical sigil-sdk schema (Go, Python, JS).
 | `SIGIL_ENDPOINT` | `:generation-endpoint` | Full URL; sigil-cl is HTTP-only, no scheme auto-prepend |
 | `SIGIL_EVAL_ENDPOINT` | `:eval-endpoint` | Base URL for experiment control-plane requests |
 | `SIGIL_EVAL_PATH_PREFIX` | `:eval-path-prefix` | Defaults to `/api/v1` |
+| `SIGIL_EVAL_AUTH_TOKEN` | `:eval-auth-token` | Sent as `Bearer` on control-plane requests, replacing generation auth; not used for score export |
 | `SIGIL_EXPERIMENT_URL_TEMPLATE` | `:experiment-url-template` | Supports `{base}` and `{run_id}` |
 | `SIGIL_HEADERS` | `:extra-headers` | `k=v,k2=v2`; merged into auth headers (user header wins on case-insensitive collision) |
 | `SIGIL_AUTH_MODE` | `:auth-mode` | `none` / `tenant` / `bearer` / `basic`; unknown values warn and are ignored |
@@ -250,13 +254,80 @@ recorded inside the dynamic extent are tagged with `experiment.run_id`, include
 `with-experiment` finalizes the run as `succeeded` on normal exit, `failed` on
 errors, and cancels it on non-local exits such as interrupts. A `409 Conflict`
 from run creation reopens the run by patching it back to `running` before the
-body runs.
+body runs (a sigil-cl extension; the reference SDKs fail on duplicate run ids —
+pass `:on-conflict :error` for that behavior).
+
+### Upload modes
+
+`:upload` controls when scores reach the server, matching the reference SDKs:
+
+| Mode | `experiment-run-add-scores` | On normal exit |
+|------|-----------------------------|----------------|
+| `:continuous` (default) | exports immediately, returns accepted count | finalized `succeeded` |
+| `:bulk` | buffers, returns buffered count | buffered scores published, then finalized `succeeded` |
+| `:manual` | buffers, returns buffered count | left open; call `experiment-run-publish` then `experiment-run-finalize` yourself |
+
+`experiment-run-buffered-score-count` reports what is waiting;
+`experiment-run-publish` exports the buffer and returns the newly accepted
+count. Score ids are deterministic (`stable-id`, SHA-1, identical to the
+Go/Python SDKs), so re-publishing after a partial failure dedupes server-side.
+
+### Dataset runner
+
+`run-experiment` loops a dataset through a target function and scorers under
+one run, the counterpart of `ExperimentRunner` in the reference SDKs:
+
+```lisp
+(sigil-cl:run-experiment
+ client
+ (list (sigil-cl:make-dataset-item :id "it1" :input "2+2?")
+       (sigil-cl:make-dataset-item :id "it2" :input "3+3?"))
+ ;; target: run the agent for one item; generations recorded here are
+ ;; captured and tagged automatically
+ (lambda (item run)
+   (declare (ignore run))
+   (my-agent (sigil-cl:jget item "input"))
+   nil)                                  ; or (make-target-result ...)
+ ;; scorers: grade one item, return a list of score outputs
+ (list (lambda (item result)
+         (declare (ignore item result))
+         (list (sigil-cl:make-score :evaluator-id "judge"
+                                    :evaluator-version "1"
+                                    :score-key "quality"
+                                    :value 1.0))))
+ :run-id "exp-prompt-a" :name "prompt A")
+```
+
+Each item gets a stable per-item conversation id
+(`(stable-id "conv" run-id item-id)`), so generations and scores link up in the
+Sigil UI and reruns are idempotent. The return value is a plist with
+`:run-id`, `:accepted-scores`, `:url`, and `:report`.
+
+### Datasets from collections
+
+`dataset-from-collection` turns a Sigil collection of saved conversations into
+dataset items by fetching each conversation and recovering its initial user
+prompt. The underlying read calls (`list-collection-members`,
+`get-conversation`, `initial-user-prompt`) are also exported:
+
+```lisp
+(let ((items (sigil-cl:dataset-from-collection client "col-123")))
+  (sigil-cl:run-experiment client items target scorers
+                           :run-id "exp-col" :name "collection eval"
+                           :collection-id "col-123"))
+```
 
 Experiment control-plane calls are synchronous. Configure them with
-`:eval-endpoint`, `:eval-path-prefix`, `:scores-export-path`, and
-`:experiment-url-template`, or the matching `SIGIL_EVAL_*` environment variables.
-If `:eval-endpoint` is unset, the SDK derives the base URL from
-`:generation-endpoint`.
+`:eval-endpoint`, `:eval-path-prefix`, `:eval-auth-token`,
+`:scores-export-path`, and `:experiment-url-template`, or the matching
+`SIGIL_EVAL_*` environment variables. If `:eval-endpoint` is unset, the SDK
+derives the base URL from `:generation-endpoint`. `:eval-auth-token` (or
+`SIGIL_EVAL_AUTH_TOKEN`) sends a separate `Bearer` token on control-plane
+requests — useful when generation export uses tenant/basic auth but the Sigil
+plugin API needs a service-account token. Score export is intentionally
+independent of the `SIGIL_EVAL_*` settings: scores are a tenant ingest write
+that goes to the generation endpoint host with generation auth, same as the
+reference SDKs.
 
 ## Running tests
 

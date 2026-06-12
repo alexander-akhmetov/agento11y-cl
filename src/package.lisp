@@ -39,8 +39,11 @@
    #:export-scores
    #:experiment-url
    #:with-experiment
+   #:run-experiment
    #:experiment-run
    #:experiment-run-add-scores
+   #:experiment-run-publish
+   #:experiment-run-buffered-score-count
    #:experiment-run-finalize
    #:experiment-run-url
    #:experiment-run-report
@@ -50,7 +53,14 @@
    #:experiment-run-active-conversation-id
    #:experiment-run-accepted-count
    #:make-score
+   #:make-dataset-item
+   #:make-target-result
    #:stable-id
+   ;; Conversations and collections (read-only)
+   #:list-collection-members
+   #:get-conversation
+   #:initial-user-prompt
+   #:dataset-from-collection
    ;; Config
    #:sigil-config
    #:make-config
@@ -64,6 +74,7 @@
    #:config-metrics-forward-auth
    #:config-eval-endpoint
    #:config-eval-path-prefix
+   #:config-eval-auth-token
    #:config-scores-export-path
    #:config-experiment-url-template
    ;; Types + constructors

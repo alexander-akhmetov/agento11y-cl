@@ -56,13 +56,12 @@
 
 (defun %url-encode (value)
   (with-output-to-string (out)
-    (loop for ch across (%trimmed-text value)
-          for code = (char-code ch)
-          do (if (or (and (>= code (char-code #\a)) (<= code (char-code #\z)))
-                     (and (>= code (char-code #\A)) (<= code (char-code #\Z)))
-                     (and (>= code (char-code #\0)) (<= code (char-code #\9)))
-                     (member ch '(#\- #\_ #\. #\~) :test #'char=))
-                 (write-char ch out)
+    (loop for code across (string-to-utf8-octets (%trimmed-text value))
+          do (if (or (<= (char-code #\a) code (char-code #\z))
+                     (<= (char-code #\A) code (char-code #\Z))
+                     (<= (char-code #\0) code (char-code #\9))
+                     (member code '#.(mapcar #'char-code '(#\- #\_ #\. #\~))))
+                 (write-char (code-char code) out)
                  (format out "%~2,'0X" code)))))
 
 (defun %query-encode (pairs)
@@ -265,11 +264,29 @@
                          :connect-timeout (config-export-timeout-sec config)
                          :read-timeout (config-export-timeout-sec config)))))
 
-(defun request-eval-json (config method url payload label)
-  "Send one eval JSON request and return the parsed response body."
+(defun build-eval-auth-headers (config)
+  "Auth headers for eval control-plane requests (experiment lifecycle,
+reports, conversations). When :eval-auth-token is set it replaces the
+generation auth headers with a single bearer Authorization header (matching
+SIGIL_EVAL_AUTH_TOKEN in the reference SDKs); otherwise the generation
+export auth headers are reused. Score export deliberately does not use
+this: it is a tenant ingest write that goes out with generation auth."
+  (let ((token (%trimmed-text (config-eval-auth-token config))))
+    (if (plusp (length token))
+        (list (cons "Authorization"
+                    (if (and (>= (length token) 7)
+                             (string-equal (subseq token 0 7) "bearer "))
+                        token
+                        (concatenate 'string "Bearer " token))))
+        (build-auth-headers config))))
+
+(defun request-eval-json (config method url payload label &key headers)
+  "Send one eval JSON request and return the parsed response body.
+HEADERS overrides the default eval auth headers (score export passes the
+generation auth headers instead)."
   (let* ((body (when payload (jzon:stringify payload)))
          (headers (append (list (cons "Content-Type" "application/json"))
-                          (build-auth-headers config)))
+                          (or headers (build-eval-auth-headers config))))
          (attempts (max 1 (config-max-retries config))))
     (loop for attempt from 0 below attempts
           do (handler-case
@@ -387,6 +404,15 @@
                   base)))
     (request-eval-json config :get url nil "experiment scores list")))
 
+(defun %scores-base-url (config)
+  "Scheme and host for score export. Scores are a tenant ingest write that
+goes to the generation-export host with generation auth, independent of the
+eval control-plane target (matching the reference SDKs); the eval base is
+only a fallback when no generation endpoint is configured."
+  (if (config-generation-endpoint config)
+      (%base-url-from-endpoint (config-generation-endpoint config))
+      (eval-base-url config)))
+
 (defun export-scores (client score-items)
   "Export SCORE-ITEMS to the Sigil scores ingest API. Returns accepted count."
   (when (null score-items)
@@ -395,9 +421,10 @@
          (serialized (mapcar #'%serialize-score-item score-items))
          (payload (jobj "scores" (coerce serialized 'vector)))
          (url (format nil "~a~a"
-                      (%strip-trailing-slash (eval-base-url config))
+                      (%strip-trailing-slash (%scores-base-url config))
                       (%ensure-leading-slash (config-scores-export-path config))))
-         (response (request-eval-json config :post url payload "score export"))
+         (response (request-eval-json config :post url payload "score export"
+                                      :headers (build-auth-headers config)))
          (results (jget response "results"))
          (accepted 0)
          (rejected nil))

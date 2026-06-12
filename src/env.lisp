@@ -119,7 +119,7 @@ Resolution precedence per slot: caller value (explicit) > env > schema default.
 
 Recognized variables:
   SIGIL_ENDPOINT, SIGIL_EVAL_ENDPOINT, SIGIL_EVAL_PATH_PREFIX,
-  SIGIL_EXPERIMENT_URL_TEMPLATE, SIGIL_HEADERS, SIGIL_AUTH_MODE,
+  SIGIL_EVAL_AUTH_TOKEN, SIGIL_EXPERIMENT_URL_TEMPLATE, SIGIL_HEADERS, SIGIL_AUTH_MODE,
   SIGIL_AUTH_TENANT_ID, SIGIL_AUTH_TOKEN, SIGIL_AGENT_NAME,
   SIGIL_AGENT_VERSION, SIGIL_USER_ID, SIGIL_TAGS,
   SIGIL_CONTENT_CAPTURE_MODE, SIGIL_DEBUG.
@@ -135,6 +135,7 @@ against deployment env must either set the matching SIGIL_* var or unset it."
   (let* ((endpoint  (env-trimmed env-fn "SIGIL_ENDPOINT"))
          (eval-endpoint (env-trimmed env-fn "SIGIL_EVAL_ENDPOINT"))
          (eval-path-prefix (env-trimmed env-fn "SIGIL_EVAL_PATH_PREFIX"))
+         (eval-auth-token (env-trimmed env-fn "SIGIL_EVAL_AUTH_TOKEN"))
          (experiment-url-template (env-trimmed env-fn "SIGIL_EXPERIMENT_URL_TEMPLATE"))
          (headers   (env-trimmed env-fn "SIGIL_HEADERS"))
          (auth-mode (env-trimmed env-fn "SIGIL_AUTH_MODE"))
@@ -163,6 +164,8 @@ against deployment env must either set the matching SIGIL_* var or unset it."
         (when (and eval-path-prefix
                    (equal (config-eval-path-prefix config) "/api/v1"))
           (override :eval-path-prefix eval-path-prefix))
+        (when (and eval-auth-token (null (config-eval-auth-token config)))
+          (override :eval-auth-token eval-auth-token))
         (when (and experiment-url-template
                    (null (config-experiment-url-template config)))
           (override :experiment-url-template experiment-url-template))
