@@ -4,6 +4,14 @@
   (;; Generation export
    (generation-endpoint :initarg :generation-endpoint :reader config-generation-endpoint :initform nil)
    (generation-enabled  :initarg :generation-enabled  :reader config-generation-enabled  :initform nil)
+   ;; Eval control plane and score export
+   (eval-endpoint :initarg :eval-endpoint :reader config-eval-endpoint :initform nil)
+   (eval-path-prefix :initarg :eval-path-prefix :reader config-eval-path-prefix :initform "/api/v1")
+   (scores-export-path :initarg :scores-export-path :reader config-scores-export-path
+                       :initform "/api/v1/scores:export")
+   (experiment-url-template :initarg :experiment-url-template
+                            :reader config-experiment-url-template
+                            :initform nil)
    ;; Trace export
    (traces-endpoint     :initarg :traces-endpoint     :reader config-traces-endpoint     :initform nil)
    (traces-enabled      :initarg :traces-enabled      :reader config-traces-enabled      :initform nil)

@@ -118,9 +118,11 @@ is called with each variable name and must return a string or nil.
 Resolution precedence per slot: caller value (explicit) > env > schema default.
 
 Recognized variables:
-  SIGIL_ENDPOINT, SIGIL_HEADERS, SIGIL_AUTH_MODE, SIGIL_AUTH_TENANT_ID,
-  SIGIL_AUTH_TOKEN, SIGIL_AGENT_NAME, SIGIL_AGENT_VERSION, SIGIL_USER_ID,
-  SIGIL_TAGS, SIGIL_CONTENT_CAPTURE_MODE, SIGIL_DEBUG.
+  SIGIL_ENDPOINT, SIGIL_EVAL_ENDPOINT, SIGIL_EVAL_PATH_PREFIX,
+  SIGIL_EXPERIMENT_URL_TEMPLATE, SIGIL_HEADERS, SIGIL_AUTH_MODE,
+  SIGIL_AUTH_TENANT_ID, SIGIL_AUTH_TOKEN, SIGIL_AGENT_NAME,
+  SIGIL_AGENT_VERSION, SIGIL_USER_ID, SIGIL_TAGS,
+  SIGIL_CONTENT_CAPTURE_MODE, SIGIL_DEBUG.
 
 SIGIL_PROTOCOL is not supported (sigil-cl is HTTP-only); a warning is logged
 when set to anything other than http/https. SIGIL_INSECURE is a no-op since
@@ -131,6 +133,9 @@ Note: an explicit caller value of :none for :auth-mode or :metadata-only for
 WILL be overridden by env. Callers that need to enforce these defaults
 against deployment env must either set the matching SIGIL_* var or unset it."
   (let* ((endpoint  (env-trimmed env-fn "SIGIL_ENDPOINT"))
+         (eval-endpoint (env-trimmed env-fn "SIGIL_EVAL_ENDPOINT"))
+         (eval-path-prefix (env-trimmed env-fn "SIGIL_EVAL_PATH_PREFIX"))
+         (experiment-url-template (env-trimmed env-fn "SIGIL_EXPERIMENT_URL_TEMPLATE"))
          (headers   (env-trimmed env-fn "SIGIL_HEADERS"))
          (auth-mode (env-trimmed env-fn "SIGIL_AUTH_MODE"))
          (tenant    (env-trimmed env-fn "SIGIL_AUTH_TENANT_ID"))
@@ -152,6 +157,15 @@ against deployment env must either set the matching SIGIL_* var or unset it."
         ;; Endpoint.
         (when (and endpoint (null (config-generation-endpoint config)))
           (override :generation-endpoint endpoint))
+        ;; Eval endpoint and links.
+        (when (and eval-endpoint (null (config-eval-endpoint config)))
+          (override :eval-endpoint eval-endpoint))
+        (when (and eval-path-prefix
+                   (equal (config-eval-path-prefix config) "/api/v1"))
+          (override :eval-path-prefix eval-path-prefix))
+        (when (and experiment-url-template
+                   (null (config-experiment-url-template config)))
+          (override :experiment-url-template experiment-url-template))
         ;; Auth mode (caller :none is treated as "not set").
         (when (and auth-mode (eq (config-auth-mode config) :none))
           (let ((parsed (%parse-auth-mode auth-mode config)))

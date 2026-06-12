@@ -7,10 +7,15 @@
                                (metrics-enabled nil)
                                (capture :metadata-only)
                                (generation-endpoint "http://test-sigil:4318/api/v1/generations:export")
+                               eval-endpoint
+                               (eval-path-prefix "/api/v1")
+                               (scores-export-path "/api/v1/scores:export")
+                               experiment-url-template
                                (traces-endpoint "http://test-sigil:4318/v1/traces")
                                (workflow-steps-endpoint
                                 "http://test-sigil:4318/api/v1/workflow-steps:export")
-                               (metrics-endpoint "http://test-sigil:4318/v1/metrics"))
+                               (metrics-endpoint "http://test-sigil:4318/v1/metrics")
+                               http-fn)
   "Create a client with mock HTTP that captures requests."
   (let ((requests nil))
     (values
@@ -18,6 +23,10 @@
       (make-config
        :generation-endpoint generation-endpoint
        :generation-enabled generation-enabled
+       :eval-endpoint eval-endpoint
+       :eval-path-prefix eval-path-prefix
+       :scores-export-path scores-export-path
+       :experiment-url-template experiment-url-template
        :traces-endpoint traces-endpoint
        :traces-enabled traces-enabled
        :workflow-steps-endpoint workflow-steps-endpoint
@@ -29,10 +38,11 @@
        :service-version "1.0.0"
        :auth-mode :bearer
        :auth-password "test-token"
-       :http-fn (lambda (url &key headers content)
-                  (declare (ignore headers))
-                  (push (list url content) requests)
-                  (values "{}" 200)))
+       :http-fn (or http-fn
+                    (lambda (url &key method headers content &allow-other-keys)
+                      (declare (ignore method headers))
+                      (push (list url content) requests)
+                      (values "{}" 200))))
       :env-fn (constantly nil))
      (lambda () (reverse requests)))))
 
@@ -254,9 +264,39 @@
 
       ;; --- SIGIL_ENDPOINT ---
       (let ((cfg (resolve '(("SIGIL_ENDPOINT" . "https://example/api/v1/generations:export")))))
-        (check "SIGIL_ENDPOINT lands in generation-endpoint"
+        (check "SIGIL_ENDPOINT sets generation-endpoint"
                (equal (sigil-cl::config-generation-endpoint cfg)
                       "https://example/api/v1/generations:export")))
+
+      ;; --- SIGIL_EVAL_* ---
+      (let ((cfg (resolve '(("SIGIL_EVAL_ENDPOINT" . "https://eval.example/api")
+                            ("SIGIL_EVAL_PATH_PREFIX" . "/custom/v1")
+                            ("SIGIL_EXPERIMENT_URL_TEMPLATE" . "https://ui/runs/{run_id}")))))
+        (check "SIGIL_EVAL_ENDPOINT -> eval-endpoint"
+               (equal (config-eval-endpoint cfg) "https://eval.example/api"))
+        (check "SIGIL_EVAL_PATH_PREFIX -> eval-path-prefix"
+               (equal (config-eval-path-prefix cfg) "/custom/v1"))
+        (check "SIGIL_EXPERIMENT_URL_TEMPLATE -> experiment-url-template"
+               (equal (config-experiment-url-template cfg) "https://ui/runs/{run_id}")))
+      (let ((cfg (resolve '(("SIGIL_EVAL_ENDPOINT" . "https://env.example")
+                            ("SIGIL_EVAL_PATH_PREFIX" . "/env")
+                            ("SIGIL_EXPERIMENT_URL_TEMPLATE" . "https://env/{run_id}"))
+                          :eval-endpoint "https://caller.example/path"
+                          :eval-path-prefix "/caller"
+                          :experiment-url-template "https://caller/{run_id}")))
+        (check "caller eval-endpoint beats env"
+               (equal (config-eval-endpoint cfg) "https://caller.example/path"))
+        (check "caller eval-path-prefix beats env"
+               (equal (config-eval-path-prefix cfg) "/caller"))
+        (check "caller experiment-url-template beats env"
+               (equal (config-experiment-url-template cfg) "https://caller/{run_id}")))
+      (let ((cfg (resolve '(("SIGIL_EVAL_PATH_PREFIX" . "/env")
+                            ("SIGIL_EXPERIMENT_URL_TEMPLATE" . "https://env/{run_id}"))
+                          :eval-endpoint "https://caller.example")))
+        (check "env still fills unset eval-path-prefix"
+               (equal (config-eval-path-prefix cfg) "/env"))
+        (check "env still fills unset experiment-url-template"
+               (equal (config-experiment-url-template cfg) "https://env/{run_id}")))
 
       ;; --- SIGIL_AUTH_* (env layered when caller does not set) ---
       (let ((cfg (resolve '(("SIGIL_AUTH_MODE" . "basic")
@@ -1402,6 +1442,493 @@
       (check "build-output: text last" (typep (third (message-parts msg)) 'text-part)))))
 
 ;;; ================================================================
+;;; Experiment tests
+;;; ================================================================
+
+(defun run-experiment-tests ()
+  (with-test-suite ("Experiments")
+    (labels ((signals-condition-p (thunk expected-type)
+               (handler-case
+                   (progn (funcall thunk) nil)
+                 (sigil-error (e) (typep e expected-type))))
+             (empty-jobj-p (obj)
+               (and (hash-table-p obj) (zerop (hash-table-count obj))))
+             (ends-with-p (suffix text)
+               (let ((pos (search suffix text :from-end t)))
+                 (and pos (= (+ pos (length suffix)) (length text)))))
+             (payload (call)
+               (jzon:parse (third call)))
+             (patch-statuses (calls)
+               (loop for call in calls
+                     when (eq (first call) :patch)
+                       collect (jget (payload call) "status")))
+             (experiment-http-response (run-id status)
+               (jzon:stringify (jobj "run_id" run-id
+                                     "name" "prompt A"
+                                     "source" "external"
+                                     "status" status)))
+             (make-score-response (content)
+               (let* ((parsed (jzon:parse content))
+                      (scores (jget parsed "scores"))
+                      (results nil))
+                 (loop for score across scores
+                       do (push (jobj "score_id" (jget score "score_id")
+                                      "accepted" t)
+                                results))
+                 (jzon:stringify (jobj "results" (coerce (nreverse results) 'vector))))))
+      ;; Eval base derivation and URL generation.
+      (let ((cfg (make-config
+                  :generation-endpoint "https://sigil.example.test/api/v1/generations:export")))
+        (check "eval-base-url derives scheme and host from generation-endpoint"
+               (equal (sigil-cl::eval-base-url cfg) "https://sigil.example.test")))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test/ignored/path"
+                            :generation-enabled nil
+                            :traces-enabled nil)
+        (declare (ignore get-requests))
+        (check "experiment-url default uses eval base"
+               (equal (experiment-url client "exp-prompt-a")
+                      "https://sigil.example.test/a/grafana-sigil-app/evaluation/experiments/exp-prompt-a")))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :experiment-url-template "{base}/custom/{run_id}"
+                            :generation-enabled nil
+                            :traces-enabled nil)
+        (declare (ignore get-requests))
+        (check "experiment-url template replaces base and run_id"
+               (equal (experiment-url client "exp-prompt-a")
+                      "https://sigil.example.test/custom/exp-prompt-a")))
+      (let* ((array (sigil-cl::%jsonify '("good" "bad")))
+             (object (sigil-cl::%jsonify '(("good" . "bad"))))
+             (nested (sigil-cl::%jsonify '(("tags" . ("good" "bad"))))))
+        (check "%jsonify keeps plain string lists as arrays"
+               (and (vectorp array)
+                    (= (length array) 2)
+                    (equal (aref array 0) "good")
+                    (equal (aref array 1) "bad")))
+        (check "%jsonify keeps cons alists as objects"
+               (and (hash-table-p object)
+                    (equal (jget object "good") "bad")))
+        (check "%jsonify keeps nested plain lists as arrays"
+               (let ((tags (jget nested "tags")))
+                 (and (vectorp tags)
+                      (equal (aref tags 0) "good")
+                      (equal (aref tags 1) "bad")))))
+
+      ;; Transport parsing, typed errors, and retry.
+      (let ((cfg (make-config :auth-mode :none
+                              :max-retries 1
+                              :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                         (declare (ignore url method headers content))
+                                         (values "{\"ok\":true}" 200)))))
+        (check "request-eval-json parses 2xx JSON body"
+               (eq (jget (sigil-cl::request-eval-json cfg :get "https://x" nil "ok")
+                         "ok")
+                   t)))
+      (let ((cfg (make-config :auth-mode :none
+                              :max-retries 1
+                              :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                         (declare (ignore url method headers content))
+                                         (values "" 204)))))
+        (check "request-eval-json returns empty object for empty 2xx"
+               (empty-jobj-p (sigil-cl::request-eval-json cfg :get "https://x" nil "empty"))))
+      (dolist (case '((400 sigil-validation-error)
+                      (422 sigil-validation-error)
+                      (404 sigil-not-found-error)
+                      (409 sigil-conflict-error)))
+        (destructuring-bind (status condition-type) case
+          (let ((cfg (make-config :auth-mode :none
+                                  :max-retries 1
+                                  :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                             (declare (ignore url method headers content))
+                                             (values "error" status)))))
+            (check (format nil "request-eval-json maps ~d to ~a" status condition-type)
+                   (signals-condition-p
+                    (lambda ()
+                      (sigil-cl::request-eval-json cfg :get "https://x" nil "status"))
+                    condition-type)))))
+      (let ((attempts 0)
+            (cfg nil))
+        (setf cfg (make-config :auth-mode :none
+                               :max-retries 2
+                               :initial-backoff-sec 0
+                               :max-backoff-sec 0
+                               :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                          (declare (ignore url method headers content))
+                                          (incf attempts)
+                                          (if (= attempts 1)
+                                              (values "rate limited" 429)
+                                              (values "{\"ok\":true}" 200)))))
+        (check "request-eval-json retries 429"
+               (and (eq (jget (sigil-cl::request-eval-json cfg :get "https://x" nil "retry")
+                              "ok")
+                        t)
+                    (= attempts 2))))
+      (let ((attempts 0)
+            (cfg nil))
+        (setf cfg (make-config :auth-mode :none
+                               :max-retries 2
+                               :initial-backoff-sec 0
+                               :max-backoff-sec 0
+                               :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                          (declare (ignore url method headers content))
+                                          (incf attempts)
+                                          (if (= attempts 1)
+                                              (values "server error" 500)
+                                              (values "{\"ok\":true}" 200)))))
+        (check "request-eval-json retries 5xx"
+               (and (eq (jget (sigil-cl::request-eval-json cfg :get "https://x" nil "retry")
+                              "ok")
+                        t)
+                    (= attempts 2))))
+
+      ;; Control plane create payload.
+      (let ((calls nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test/ignored/path"
+             :generation-enabled nil
+             :traces-enabled nil
+             :http-fn (lambda (url &key method headers content &allow-other-keys)
+                        (declare (ignore headers))
+                        (push (list method url content) calls)
+                        (values (experiment-http-response "exp-prompt-a" "running") 200)))
+          (declare (ignore get-requests))
+          (let ((created (create-experiment client
+                                            :run-id "exp-prompt-a"
+                                            :name "prompt A"
+                                            :source "external")))
+            (check "create-experiment returns parsed run"
+                   (equal (jget created "run_id") "exp-prompt-a"))
+            (let* ((call (first (reverse calls)))
+                   (posted (payload call)))
+              (check "create-experiment POSTs to eval experiments"
+                     (and (eq (first call) :post)
+                          (equal (second call)
+                                 "https://sigil.example.test/api/v1/eval/experiments")))
+              (check "create-experiment payload has run_id"
+                     (equal (jget posted "run_id") "exp-prompt-a"))
+              (check "create-experiment payload has name"
+                     (equal (jget posted "name") "prompt A"))
+              (check "create-experiment payload has source"
+                     (equal (jget posted "source") "external"))))))
+
+      ;; Direct score export, value serialization, and rejected scores.
+      (let ((calls nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test"
+             :generation-enabled nil
+             :traces-enabled nil
+             :http-fn (lambda (url &key method headers content &allow-other-keys)
+                        (declare (ignore headers))
+                        (push (list method url content) calls)
+                        (values (make-score-response content) 202)))
+          (declare (ignore get-requests))
+          (let ((accepted (export-scores
+                           client
+                           (list (jobj "score_id" "score-1"
+                                       "generation_id" "gen-1"
+                                       "evaluator_id" "judge"
+                                       "evaluator_version" "1"
+                                       "score_key" "quality"
+                                       "run_id" "exp-prompt-a"
+                                       "value" 0.9)))))
+            (check "export-scores returns accepted count" (= accepted 1))
+            (let* ((call (first (reverse calls)))
+                   (posted (payload call))
+                   (score (aref (jget posted "scores") 0)))
+              (check "export-scores POSTs scores path"
+                     (equal (second call) "https://sigil.example.test/api/v1/scores:export"))
+              (check "numeric score value serializes as number"
+                     (let ((value (jget* score "value" "number")))
+                       (and (numberp value)
+                            (< (abs (- value 0.9)) 0.001))))))))
+      (let ((cfg-calls nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test"
+             :generation-enabled nil
+             :traces-enabled nil
+             :http-fn (lambda (url &key method headers content &allow-other-keys)
+                        (declare (ignore headers content))
+                        (push (list method url content) cfg-calls)
+                        (values "{\"results\":[{\"score_id\":\"score-bad\",\"accepted\":false,\"error\":\"bad\"}]}" 202)))
+          (declare (ignore get-requests))
+          (check "export-scores signals rejected score ids"
+                 (signals-condition-p
+                  (lambda ()
+                    (export-scores client
+                                   (list (jobj "score_id" "score-bad"
+                                               "generation_id" "gen-1"
+                                               "evaluator_id" "judge"
+                                               "evaluator_version" "1"
+                                               "score_key" "quality"
+                                               "value" 0.9))))
+                  'sigil-export-error))))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil
+                            :traces-enabled nil)
+        (declare (ignore get-requests))
+        (let ((run (sigil-cl::%make-experiment-run :client client
+                                                   :run-id "exp-prompt-a"
+                                                   :name "prompt A")))
+          (check "make-score without value signals validation"
+                 (signals-condition-p
+                  (lambda ()
+                    (experiment-run-add-scores
+                     run
+                     (list (make-score :evaluator-id "judge"
+                                       :evaluator-version "1"
+                                       :score-key "quality"))
+                     :generation-ids '("gen-1")))
+                  'sigil-validation-error))
+          (check "export-scores without value signals validation"
+                 (signals-condition-p
+                  (lambda ()
+                    (export-scores client
+                                   (list (jobj "score_id" "score-missing"
+                                               "generation_id" "gen-1"
+                                               "evaluator_id" "judge"
+                                               "evaluator_version" "1"
+                                               "score_key" "quality"))))
+                  'sigil-validation-error))))
+      (let ((calls nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test"
+             :generation-enabled nil
+             :traces-enabled nil
+             :http-fn (lambda (url &key method headers content &allow-other-keys)
+                        (declare (ignore url method headers))
+                        (push content calls)
+                        (values (make-score-response content) 202)))
+          (declare (ignore get-requests))
+          (let ((run (sigil-cl::%make-experiment-run :client client
+                                                     :run-id "exp-prompt-a"
+                                                     :name "prompt A")))
+            (experiment-run-add-scores
+             run
+             (list (make-score :evaluator-id "judge"
+                               :evaluator-version "1"
+                               :score-key "quality"
+                               :value 0.9))
+             :item (jobj "id" "it1"
+                         "input" "what is the capital of France?"
+                         "expected" "Paris")
+             :generation-ids '("gen-1"))
+            (let* ((posted (jzon:parse (first (reverse calls))))
+                   (score (aref (jget posted "scores") 0))
+                   (metadata (jget score "metadata")))
+              (check "score metadata keeps item_id"
+                     (equal (jget metadata "item_id") "it1"))
+              (check "score metadata does not copy item input"
+                     (null (jget metadata "input")))
+              (check "score metadata does not copy item expected"
+                     (null (jget metadata "expected")))))))
+      (let ((create-count 0))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore url method headers content))
+                 (incf create-count)
+                 (values "{}" 200)))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :generation-enabled nil
+                                :traces-enabled nil
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (let ((signaled
+                    (signals-condition-p
+                     (lambda ()
+                       (with-experiment (run client :run-id "exp-manual"
+                                             :name "prompt A"
+                                             :upload :manual)
+                         (declare (ignore run))))
+                     'sigil-validation-error)))
+              (check "with-experiment rejects unsupported upload mode before create"
+                     (and signaled (zerop create-count)))))))
+
+      ;; with-experiment tags generations, captures generation ids for scores,
+      ;; serializes bool/string scores, and finalizes succeeded.
+      (let ((calls nil)
+            (accepted nil)
+            (recorded-id nil)
+            (run-object nil))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore headers))
+                 (push (list method url content) calls)
+                 (cond
+                   ((search "/api/v1/scores:export" url)
+                    (values (make-score-response content) 202))
+                   ((search "generations:export" url)
+                    (values "{}" 200))
+                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
+                    (values (experiment-http-response "exp-prompt-a" "running") 200))
+                   ((eq method :patch)
+                    (values (experiment-http-response "exp-prompt-a" (jget (jzon:parse content) "status")) 200))
+                   (t (values "{}" 200)))))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :traces-enabled nil
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (with-experiment (run client :run-id "exp-prompt-a" :name "prompt A"
+                                  :agent-name "judge-agent"
+                                  :agent-version "1.0"
+                                  :extra-tags '(("candidate" . "a"))
+                                  :extra-metadata '(("run.note" . "yes")))
+              (setf run-object run)
+              (let ((rec (start-generation client
+                             :mode :sync
+                             :model-provider "openai"
+                             :model-name "gpt-4"
+                             :tags '(("caller" . "tag"))
+                             :metadata '(("caller.meta" . "yes")))))
+                (setf recorded-id (gen-rec-generation-id rec))
+                (recorder-end rec)
+                (setf accepted
+                      (experiment-run-add-scores
+                       run
+                       (list (make-score :evaluator-id "judge"
+                                         :evaluator-version "1"
+                                         :score-key "passed"
+                                         :value t
+                                         :passed t)
+                             (make-score :evaluator-id "judge"
+                                         :evaluator-version "1"
+                                         :score-key "label"
+                                         :value "pass")
+                             (make-score :evaluator-id "judge"
+                                         :evaluator-version "1"
+                                         :score-key "failed"
+                                         :value nil)))))))
+          (check "experiment-run-add-scores accepted all scores" (= accepted 3))
+          (check "run captured generation id"
+                 (equal (experiment-run-produced-generation-ids run-object)
+                        (list recorded-id)))
+          (let* ((ordered (reverse calls))
+                 (gen-call (find-if (lambda (call) (search "generations:export" (second call)))
+                                    ordered))
+                 (gen-payload (payload gen-call))
+                 (generation (aref (jget gen-payload "generations") 0))
+                 (score-call (find-if (lambda (call) (search "/api/v1/scores:export" (second call)))
+                                      ordered))
+                 (score-payload (payload score-call))
+                 (first-score (aref (jget score-payload "scores") 0))
+                 (second-score (aref (jget score-payload "scores") 1))
+                 (third-score (aref (jget score-payload "scores") 2)))
+            (check "generation has experiment.run_id tag"
+                   (equal (jget* generation "tags" "experiment.run_id") "exp-prompt-a"))
+            (check "generation has experiment_run_id metadata"
+                   (equal (jget* generation "metadata" "experiment_run_id") "exp-prompt-a"))
+            (check "generation keeps caller tag"
+                   (equal (jget* generation "tags" "caller") "tag"))
+            (check "generation uses experiment agent identity"
+                   (and (equal (jget generation "agent_name") "judge-agent")
+                        (equal (jget generation "agent_version") "1.0")))
+            (check "score uses captured generation id"
+                   (equal (jget first-score "generation_id") recorded-id))
+            (check "score includes run_id"
+                   (equal (jget first-score "run_id") "exp-prompt-a"))
+            (check "score includes experiment source"
+                   (and (equal (jget* first-score "source" "kind") "experiment")
+                        (equal (jget* first-score "source" "id") "exp-prompt-a")))
+            (check "boolean score value serializes as bool"
+                   (eq (jget* first-score "value" "bool") t))
+            (check "string score value serializes as string"
+                   (equal (jget* second-score "value" "string") "pass"))
+            (check "explicit nil score value serializes as false bool"
+                   (multiple-value-bind (value found-p)
+                       (gethash "bool" (jget third-score "value"))
+                     (and found-p (null value))))
+            (check "score conversation_id matches generation"
+                   (equal (jget first-score "conversation_id")
+                          (jget generation "conversation_id")))
+            (check "with-experiment finalizes succeeded"
+                   (member "succeeded" (patch-statuses ordered) :test #'equal)))))
+
+      ;; Conflict creates are reopened by PATCHing status=running before the body.
+      (let ((calls nil)
+            (create-count 0)
+            (body-ran nil))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore headers))
+                 (push (list method url content) calls)
+                 (cond
+                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
+                    (incf create-count)
+                    (if (= create-count 1)
+                        (values "exists" 409)
+                        (values (experiment-http-response "exp-prompt-a" "running") 200)))
+                   ((eq method :patch)
+                    (values (experiment-http-response "exp-prompt-a" (jget (jzon:parse content) "status")) 200))
+                   (t (values "{}" 200)))))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :generation-enabled nil
+                                :traces-enabled nil
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (with-experiment (run client :run-id "exp-prompt-a" :name "prompt A")
+              (declare (ignore run))
+              (setf body-ran t)))
+          (let ((statuses (patch-statuses (reverse calls))))
+            (check "with-experiment body runs after conflict reopen" body-ran)
+            (check "conflict reopen PATCHes running"
+                   (member "running" statuses :test #'equal))
+            (check "conflict run still finalizes succeeded"
+                   (member "succeeded" statuses :test #'equal)))))
+
+      ;; Error and non-local exits map to failed/canceled finalization.
+      (let ((calls nil))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore headers))
+                 (push (list method url content) calls)
+                 (cond
+                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
+                    (values (experiment-http-response "exp-fail" "running") 200))
+                   ((eq method :patch)
+                    (values (experiment-http-response "exp-fail" (jget (jzon:parse content) "status")) 200))
+                   (t (values "{}" 200)))))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :generation-enabled nil
+                                :traces-enabled nil
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (handler-case
+                (with-experiment (run client :run-id "exp-fail" :name "prompt A")
+                  (declare (ignore run))
+                  (error "boom"))
+              (error () nil)))
+          (check "with-experiment finalizes failed on error"
+                 (member "failed" (patch-statuses (reverse calls)) :test #'equal))))
+      (let ((calls nil))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore headers content))
+                 (push (list method url content) calls)
+                 (cond
+                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
+                    (values (experiment-http-response "exp-cancel" "running") 200))
+                   ((and (eq method :post) (search ":cancel" url))
+                    (values (experiment-http-response "exp-cancel" "canceled") 200))
+                   (t (values "{}" 200)))))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :generation-enabled nil
+                                :traces-enabled nil
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (catch 'abort
+              (with-experiment (run client :run-id "exp-cancel" :name "prompt A")
+                (declare (ignore run))
+                (throw 'abort :done))))
+          (check "with-experiment cancels on non-local exit"
+                 (some (lambda (call) (search ":cancel" (second call)))
+                       (reverse calls))))))))
+
+;;; ================================================================
 ;;; Metrics tests
 ;;; ================================================================
 
@@ -1667,6 +2194,7 @@
                            #'run-client-tests
                            #'run-macro-tests
                            #'run-normalize-tests
+                           #'run-experiment-tests
                            #'run-metrics-tests))
       (multiple-value-bind (ok pass fail) (funcall test-fn)
         (declare (ignore ok))
