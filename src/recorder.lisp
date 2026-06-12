@@ -181,6 +181,19 @@ when reasoning or cache tokens are counted separately)."
       (subseq str 0 +tool-attr-max-length+)
       str))
 
+;;; --- Elapsed time ---
+
+(defun recorder-elapsed-seconds (rec)
+  "Seconds between the recorder's started-at and completed-at timestamps.
+Returns NIL when either timestamp is missing or completed-at precedes
+started-at. Second granularity (ISO timestamps carry no fraction)."
+  (let ((start (iso8601-to-unix-nano (recorder-started-at rec)))
+        (end (iso8601-to-unix-nano (recorder-completed-at rec))))
+    (when (and start end)
+      (let ((delta (- (parse-integer end) (parse-integer start))))
+        (when (>= delta 0)
+          (/ delta 1d9))))))
+
 ;;; ================================================================
 ;;; Generation recorder
 ;;; ================================================================
@@ -791,9 +804,10 @@ when reasoning or cache tokens are counted separately)."
                             (list (cons "gen_ai.operation.name" op)
                                   (cons "error.type" (if err "provider_call_error" ""))
                                   (cons "error.category" (or (classify-error err) ""))))))
-    (when (gen-rec-duration-seconds rec)
-      (record-histogram registry "gen_ai.client.operation.duration" "s"
-                        +duration-buckets+ dur-attrs (gen-rec-duration-seconds rec)))
+    (let ((dur (or (gen-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+      (when dur
+        (record-histogram registry "gen_ai.client.operation.duration" "s"
+                          +duration-buckets+ dur-attrs dur)))
     (when (gen-rec-ttft-seconds rec)
       (record-histogram registry "gen_ai.client.time_to_first_token" "s"
                         +duration-buckets+ id (gen-rec-ttft-seconds rec)))
@@ -825,9 +839,10 @@ when reasoning or cache tokens are counted separately)."
                             (list (cons "gen_ai.operation.name" "embeddings")
                                   (cons "error.type" (if err "provider_call_error" ""))
                                   (cons "error.category" (or (classify-error err) ""))))))
-    (when (emb-rec-duration-seconds rec)
-      (record-histogram registry "gen_ai.client.operation.duration" "s"
-                        +duration-buckets+ dur-attrs (emb-rec-duration-seconds rec)))
+    (let ((dur (or (emb-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+      (when dur
+        (record-histogram registry "gen_ai.client.operation.duration" "s"
+                          +duration-buckets+ dur-attrs dur)))
     (let ((tokens (emb-rec-input-tokens rec)))
       (when (and tokens (plusp tokens))
         (record-histogram registry "gen_ai.client.token.usage" "token"
@@ -853,9 +868,10 @@ when reasoning or cache tokens are counted separately)."
                                               "")))
                                   (cons "error.type" (if err "tool_execution_error" ""))
                                   (cons "error.category" (or (classify-error err) ""))))))
-    (when (tool-rec-duration-seconds rec)
-      (record-histogram registry "gen_ai.client.operation.duration" "s"
-                        +duration-buckets+ dur-attrs (tool-rec-duration-seconds rec)))))
+    (let ((dur (or (tool-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+      (when dur
+        (record-histogram registry "gen_ai.client.operation.duration" "s"
+                          +duration-buckets+ dur-attrs dur)))))
 
 (defmethod record-builtin-metrics ((rec workflow-step-recorder) registry config)
   (let* ((err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
@@ -868,6 +884,7 @@ when reasoning or cache tokens are counted separately)."
                             (list (cons "gen_ai.operation.name" "workflow_step")
                                   (cons "error.type" (if err "workflow_step_error" ""))
                                   (cons "error.category" (or (classify-error err) ""))))))
-    (when (wfs-rec-duration-seconds rec)
-      (record-histogram registry "gen_ai.client.operation.duration" "s"
-                        +duration-buckets+ dur-attrs (wfs-rec-duration-seconds rec)))))
+    (let ((dur (or (wfs-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+      (when dur
+        (record-histogram registry "gen_ai.client.operation.duration" "s"
+                          +duration-buckets+ dur-attrs dur)))))

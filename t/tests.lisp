@@ -2590,6 +2590,75 @@
             (check "tool op name" (equal (%series-attr dur "gen_ai.operation.name") "execute_tool"))
             (check "tool name attr" (equal (%series-attr dur "gen_ai.tool.name") "search"))))))
 
+    ;; --- Duration falls back to started-at/completed-at when not set ---
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4")))
+        (set-result rec :usage (make-token-usage :input 10 :output 5))
+        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:02Z")
+        (recorder-end rec)
+        (let* ((reg (sigil-cl::client-metric-registry client))
+               (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+          (check "generation duration from timestamps recorded" (not (null dur)))
+          (check "generation duration from timestamps = 2s"
+                 (= (sigil-cl::hist-state-sum dur) 2d0)))))
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc1")))
+        (set-result rec :result "ok")
+        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:01Z")
+        (recorder-end rec)
+        (let* ((reg (sigil-cl::client-metric-registry client))
+               (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+          (check "tool duration from timestamps recorded" (not (null dur)))
+          (check "tool duration from timestamps = 1s"
+                 (= (sigil-cl::hist-state-sum dur) 1d0)))))
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-embedding client :model-provider "openai"
+                                         :model-name "text-embedding-3-small")))
+        (set-result rec :input-count 1 :input-tokens 10)
+        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:03Z")
+        (recorder-end rec)
+        (let* ((reg (sigil-cl::client-metric-registry client))
+               (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+          (check "embedding duration from timestamps recorded" (not (null dur)))
+          (check "embedding duration from timestamps = 3s"
+                 (= (sigil-cl::hist-state-sum dur) 3d0)))))
+
+    (multiple-value-bind (client get-requests)
+        (make-test-client :metrics-enabled t :workflow-steps-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client :conversation-id "conv-1"
+                                                       :step-name "classify")))
+        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:01Z")
+        (sigil-cl::recorder-end rec)
+        (let* ((reg (sigil-cl::client-metric-registry client))
+               (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+          (check "workflow step duration from timestamps recorded" (not (null dur)))
+          (check "workflow step duration from timestamps = 1s"
+                 (= (sigil-cl::hist-state-sum dur) 1d0)))))
+
+    ;; --- Explicit duration-seconds wins over timestamps ---
+    (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4")))
+        (set-result rec :usage (make-token-usage :input 10 :output 5)
+                        :duration-seconds 0.5d0)
+        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:02Z")
+        (recorder-end rec)
+        (let* ((reg (sigil-cl::client-metric-registry client))
+               (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
+          (check "explicit duration wins over timestamps"
+                 (= (sigil-cl::hist-state-sum dur) 0.5d0)))))
+
     ;; --- Client config tags promoted onto metric series; per-call tags are not ---
     (let ((client (make-client
                    (make-config :metrics-endpoint "http://x/v1/metrics"
