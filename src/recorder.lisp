@@ -596,6 +596,9 @@ when reasoning or cache tokens are counted separately)."
         (when (and (emb-rec-input-tokens rec) (plusp (emb-rec-input-tokens rec)))
           (push (otel-int-attr "gen_ai.usage.input_tokens"
                                 (emb-rec-input-tokens rec)) attrs))
+        (when (and (emb-rec-dimensions rec) (plusp (emb-rec-dimensions rec)))
+          (push (otel-int-attr "gen_ai.embeddings.dimension.count"
+                                (emb-rec-dimensions rec)) attrs))
         (let ((src (emb-rec-source rec)))
           (when (and src (stringp src) (plusp (length src)))
             (push (otel-string-attr "sigil.embeddings.source" src) attrs)))

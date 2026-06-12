@@ -918,13 +918,38 @@
                    :model-provider "openai"
                    :model-name "text-embedding-3-small"
                    :source "test-source")))
-        (set-result rec :input-count 5 :input-tokens 100 :duration-seconds 0.2d0)
+        (set-result rec :input-count 5 :input-tokens 100 :dimensions 1536
+                        :duration-seconds 0.2d0)
         (recorder-end rec)
         (let ((span (first (sigil-cl::queue-drain-all
                             (sigil-cl::client-trace-queue client)))))
           (check "embedding span enqueued" (not (null span)))
           (check "embedding span name"
-                 (search "embeddings" (jget span "name"))))))))
+                 (search "embeddings" (jget span "name")))
+          (flet ((span-int-attr (span key)
+                   (let ((found nil))
+                     (loop for a across (jget span "attributes")
+                           when (equal (jget a "key") key)
+                             do (setf found (jget* a "value" "intValue")))
+                     found)))
+            (check "embedding span dimension.count"
+                   (equal (span-int-attr span "gen_ai.embeddings.dimension.count")
+                          "1536"))))))
+
+    ;; Embedding without dimensions omits the attribute
+    (multiple-value-bind (client get-requests) (make-test-client :generation-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (start-embedding client
+                   :model-provider "openai"
+                   :model-name "text-embedding-3-small")))
+        (set-result rec :input-count 5 :input-tokens 100)
+        (recorder-end rec)
+        (let ((span (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-trace-queue client)))))
+          (check "embedding span omits dimension.count when unset"
+                 (loop for a across (jget span "attributes")
+                       never (equal (jget a "key")
+                                    "gen_ai.embeddings.dimension.count"))))))))
 
 (defun run-workflow-step-tests ()
   (with-test-suite ("WorkflowStep")
