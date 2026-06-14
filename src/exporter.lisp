@@ -24,8 +24,11 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
                      (do-http-post config url headers body)
                    (cond
                      ((<= 200 status 299)
-                      (sigil-log config :debug "exporter"
-                                (format nil "~a exported (~d items)" label count))
+                      ;; metrics flush every few seconds; skip the per-export
+                      ;; success line so debug logs aren't flooded.
+                      (unless (string= label "metrics")
+                        (sigil-log config :debug "exporter"
+                                  (format nil "~a exported (~d items)" label count)))
                       (return (values t resp-body)))
                      ((<= 400 status 499)
                       (sigil-log config :warn "exporter"
