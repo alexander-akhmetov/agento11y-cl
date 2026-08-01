@@ -131,6 +131,18 @@ and :metadata-only redact it."
                  (error () nil)))))
          (jobj "tool_result" tr
                "metadata" (jobj "provider_type" "tool_result"))))
+      (media-part
+       ;; Redaction clears only the URL, which can carry the bytes inline as a
+       ;; data: URI. kind, mime_type, and name survive.
+       (let ((obj (jobj "media"
+                        (jobj "kind" (media-part-kind part)
+                              "url" (if redact "" (media-part-url part))
+                              "mime_type" (media-part-mime-type part)
+                              "name" (media-part-name part))))
+             (provider-type (media-part-provider-type part)))
+         (when (and (stringp provider-type) (plusp (length provider-type)))
+           (setf (gethash "metadata" obj) (jobj "provider_type" provider-type)))
+         obj))
       (t nil))))
 
 (defun serialize-message (msg capture-mode)

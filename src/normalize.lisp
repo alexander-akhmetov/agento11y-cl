@@ -41,6 +41,41 @@ Handles both Anthropic (content blocks) and OpenAI (tool_calls array) formats."
                                (when name
                                  (setf (gethash id map) name))))))))))))))
 
+(defun trimmed-string (value)
+  "Return VALUE trimmed of surrounding whitespace, or \"\" when it is not a string.
+A parsed JSON null is a symbol, and STRING-TRIM accepts a symbol as a string
+designator, so without the type check a null would become the string \"NULL\"."
+  (if (stringp value)
+      (string-trim '(#\Space #\Tab #\Newline #\Return) value)
+      ""))
+
+(defun media-type-from-data-url (url)
+  "Return the lowercased media type of a data: URL, or \"\" when URL is not one."
+  (let ((trimmed (trimmed-string url)))
+    (if (and (>= (length trimmed) 5)
+             (string-equal "data:" trimmed :end2 5))
+        (let* ((payload (subseq trimmed 5))
+               (stop (position-if (lambda (c) (or (char= c #\;) (char= c #\,))) payload)))
+          (if stop
+              (string-downcase (trimmed-string (subseq payload 0 stop)))
+              ""))
+        "")))
+
+(defun make-image-media-part (base64-data media-type source-url)
+  "Build an image media-part from a provider image source, or NIL when unusable.
+Falls back to a data: URL built from MEDIA-TYPE and BASE64-DATA when SOURCE-URL
+is absent. A non-string value counts as absent."
+  (let ((url (trimmed-string source-url))
+        (mime (string-downcase (trimmed-string media-type))))
+    (when (zerop (length mime))
+      (setf mime (media-type-from-data-url url)))
+    (when (zerop (length url))
+      (let ((data (trimmed-string base64-data)))
+        (when (or (zerop (length mime)) (zerop (length data)))
+          (return-from make-image-media-part nil))
+        (setf url (concatenate 'string "data:" mime ";base64," data))))
+    (make-media-part :kind "image" :url url :mime-type mime :provider-type "image")))
+
 (defun normalize-content-to-parts (content &optional tool-name-map)
   "Convert raw API content (string or vector of content blocks) into CLOS parts.
 Returns a list of part objects (text-part, tool-call-part, etc.)."
@@ -86,7 +121,21 @@ Returns a list of part objects (text-part, tool-call-part, etc.)."
                               :name tool-name
                               :content content-str
                               :is-error (jget block "is_error"))
-                             parts))))))
+                             parts)))
+                    ;; Anthropic image block
+                    ((equal type "image")
+                     (let* ((source (jget block "source"))
+                            (part (when (hash-table-p source)
+                                    (make-image-media-part (jget source "data")
+                                                           (jget source "media_type")
+                                                           (jget source "url")))))
+                       (when part (push part parts))))
+                    ;; OpenAI image_url block
+                    ((equal type "image_url")
+                     (let* ((image (jget block "image_url"))
+                            (url (if (hash-table-p image) (jget image "url") image))
+                            (part (make-image-media-part nil nil url)))
+                       (when part (push part parts)))))))
        (nreverse parts)))
     (t nil)))
 

@@ -736,6 +736,77 @@ the cdr of CALLS-PLACE as (method url content), newest first."
           (check "full capture: call error not redacted"
                  (equal (jget gen "call_error") "test error")))))
 
+    ;; Media parts: full capture emits the wire shape and conditional metadata
+    (multiple-value-bind (client get-requests) (make-test-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :input-messages
+                                          (list (make-message
+                                                 :role :user
+                                                 :parts (list (make-media-part
+                                                               :kind "image"
+                                                               :url "https://example.test/i.png"
+                                                               :mime-type "image/png"
+                                                               :name "i.png"
+                                                               :provider-type "image")
+                                                              (make-media-part
+                                                               :kind "image"
+                                                               :url "https://example.test/i.png")
+                                                              (make-media-part
+                                                               :kind "image"
+                                                               :url "https://example.test/i.png"
+                                                               :provider-type :image)))))))
+        (recorder-end rec)
+        (let* ((gen (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-generation-queue client))))
+               (parts (jget (aref (jget gen "input") 0) "parts"))
+               (with-meta (aref parts 0))
+               (no-meta (aref parts 1))
+               (non-string-meta (aref parts 2)))
+          (check "media full: kind" (equal (jget* with-meta "media" "kind") "image"))
+          (check "media full: url"
+                 (equal (jget* with-meta "media" "url") "https://example.test/i.png"))
+          (check "media full: mime_type"
+                 (equal (jget* with-meta "media" "mime_type") "image/png"))
+          (check "media full: name" (equal (jget* with-meta "media" "name") "i.png"))
+          (check "media full: provider_type"
+                 (equal (jget* with-meta "metadata" "provider_type") "image"))
+          (check "media full: media object present" (jget no-meta "media"))
+          (check "media full: unset provider-type omits metadata"
+                 (not (nth-value 1 (gethash "metadata" no-meta))))
+          (check "media full: non-string provider-type omits metadata"
+                 (not (nth-value 1 (gethash "metadata" non-string-meta))))
+          (check "media full: non-string provider-type keeps the media object"
+                 (equal (jget* non-string-meta "media" "kind") "image")))))
+
+    ;; Media parts: redacting modes clear only the URL
+    (dolist (mode '(:metadata-only :metadata-with-system-prompt))
+      (multiple-value-bind (client get-requests) (make-test-client :capture mode)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :input-messages
+                                            (list (make-message
+                                                   :role :user
+                                                   :parts (list (make-media-part
+                                                                 :kind "image"
+                                                                 :url "https://example.test/i.png"
+                                                                 :mime-type "image/png"
+                                                                 :name "i.png")))))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (part (aref (jget (aref (jget gen "input") 0) "parts") 0)))
+            (check (format nil "media ~a: url cleared" mode)
+                   (equal (jget* part "media" "url") ""))
+            (check (format nil "media ~a: kind kept" mode)
+                   (equal (jget* part "media" "kind") "image"))
+            (check (format nil "media ~a: mime_type kept" mode)
+                   (equal (jget* part "media" "mime_type") "image/png"))
+            (check (format nil "media ~a: name kept" mode)
+                   (equal (jget* part "media" "name") "i.png"))))))
+
     ;; Metadata-only preserves message structure
     (multiple-value-bind (client get-requests) (make-test-client :capture :metadata-only)
       (declare (ignore get-requests))
@@ -1771,6 +1842,133 @@ the cdr of CALLS-PLACE as (method url content), newest first."
            (normalized (normalize-input-messages messages)))
       (check "normalize-input: 2 messages (no system)" (= (length normalized) 2))
       (check "normalize-input: first is user" (eq (message-role (first normalized)) :user)))
+
+    ;; media-part construction
+    (let ((part (make-media-part :kind "image" :url "https://example.test/i.png"
+                                 :mime-type "image/png")))
+      (check "media-part: kind" (equal (media-part-kind part) "image"))
+      (check "media-part: url" (equal (media-part-url part) "https://example.test/i.png"))
+      (check "media-part: mime-type" (equal (media-part-mime-type part) "image/png"))
+      (check "media-part: name defaults to empty" (equal (media-part-name part) ""))
+      (check "media-part: provider-type defaults to nil"
+             (null (media-part-provider-type part))))
+
+    (let ((part (make-media-part :kind nil :url nil :mime-type nil :name nil)))
+      (check "media-part: nil strings become empty"
+             (and (equal (media-part-kind part) "")
+                  (equal (media-part-url part) "")
+                  (equal (media-part-mime-type part) "")
+                  (equal (media-part-name part) "")))
+      (check "media-part: nil provider-type stays nil"
+             (null (media-part-provider-type part))))
+
+    ;; media symbols are external
+    (check "media symbols exported"
+           (every (lambda (name)
+                    (multiple-value-bind (sym status) (find-symbol name :sigil-cl)
+                      (and sym (eq status :external))))
+                  '("MEDIA-PART" "MAKE-MEDIA-PART" "MEDIA-PART-KIND" "MEDIA-PART-URL"
+                    "MEDIA-PART-MIME-TYPE" "MEDIA-PART-NAME" "MEDIA-PART-PROVIDER-TYPE")))
+
+    ;; Anthropic inline base64 image -> data URL
+    (let* ((content (vector (jobj "type" "image"
+                                  "source" (jobj "type" "base64"
+                                                 "media_type" "image/png"
+                                                 "data" "AQID"))))
+           (parts (normalize-content-to-parts content)))
+      (check "anthropic image: one part" (= (length parts) 1))
+      (let ((part (first parts)))
+        (check "anthropic image: media part" (typep part 'media-part))
+        (check "anthropic image: kind" (equal (media-part-kind part) "image"))
+        (check "anthropic image: mime-type" (equal (media-part-mime-type part) "image/png"))
+        (check "anthropic image: data url"
+               (equal (media-part-url part) "data:image/png;base64,AQID"))
+        (check "anthropic image: provider-type"
+               (equal (media-part-provider-type part) "image"))))
+
+    ;; Anthropic url image source passes through
+    (let* ((content (vector (jobj "type" "image"
+                                  "source" (jobj "type" "url"
+                                                 "url" "https://example.test/i.png"))))
+           (parts (normalize-content-to-parts content)))
+      (check "anthropic url image: one part" (= (length parts) 1))
+      (check "anthropic url image: url unchanged"
+             (equal (media-part-url (first parts)) "https://example.test/i.png")))
+
+    ;; Malformed Anthropic image sources are dropped
+    (let ((parts (normalize-content-to-parts
+                  (vector (jobj "type" "image" "source" (jobj "type" "base64" "data" "AQID"))
+                          (jobj "type" "image" "source" (jobj "type" "base64"
+                                                              "media_type" "image/png"))
+                          (jobj "type" "image")))))
+      (check "anthropic image: malformed sources dropped" (null parts)))
+
+    ;; OpenAI image_url block
+    (let* ((content (vector (jobj "type" "image_url"
+                                  "image_url" (jobj "url" "https://example.test/i.png"))))
+           (parts (normalize-content-to-parts content)))
+      (check "openai image_url: one part" (= (length parts) 1))
+      (let ((part (first parts)))
+        (check "openai image_url: media part" (typep part 'media-part))
+        (check "openai image_url: url unchanged"
+               (equal (media-part-url part) "https://example.test/i.png"))
+        (check "openai image_url: kind" (equal (media-part-kind part) "image"))
+        (check "openai image_url: no mime-type for plain url"
+               (equal (media-part-mime-type part) ""))
+        (check "openai image_url: provider-type"
+               (equal (media-part-provider-type part) "image"))))
+
+    ;; OpenAI image_url carrying a data URI keeps the URL and derives the mime type
+    (let* ((content (vector (jobj "type" "image_url"
+                                  "image_url" (jobj "url" "data:image/jpeg;base64,AQID"))))
+           (parts (normalize-content-to-parts content)))
+      (check "openai data uri: url unchanged"
+             (equal (media-part-url (first parts)) "data:image/jpeg;base64,AQID"))
+      (check "openai data uri: mime-type derived"
+             (equal (media-part-mime-type (first parts)) "image/jpeg")))
+
+    ;; Missing OpenAI image URL is dropped
+    (check "openai image_url: missing url dropped"
+           (null (normalize-content-to-parts
+                  (vector (jobj "type" "image_url" "image_url" (jobj))))))
+
+    ;; A JSON null field counts as absent, not as the string "NULL".
+    ;; Parsed here rather than built with jobj so the null reaches the code the
+    ;; same way a real API response would.
+    (let* ((content (jget (jzon:parse
+                           "{\"content\":[{\"type\":\"image\",
+                                           \"source\":{\"type\":\"base64\",
+                                                       \"url\":null,
+                                                       \"media_type\":\"image/png\",
+                                                       \"data\":\"AQID\"}}]}")
+                          "content"))
+           (parts (normalize-content-to-parts content)))
+      (check "anthropic image: null url falls back to the data url"
+             (equal (media-part-url (first parts)) "data:image/png;base64,AQID")))
+
+    (check "anthropic image: all-null source dropped"
+           (null (normalize-content-to-parts
+                  (jget (jzon:parse
+                         "{\"content\":[{\"type\":\"image\",
+                                         \"source\":{\"url\":null,
+                                                     \"media_type\":null,
+                                                     \"data\":null}}]}")
+                        "content"))))
+
+    (check "openai image_url: null url dropped"
+           (null (normalize-content-to-parts
+                  (jget (jzon:parse
+                         "{\"content\":[{\"type\":\"image_url\",
+                                         \"image_url\":{\"url\":null}}]}")
+                        "content"))))
+
+    ;; Non-string fields are dropped rather than signalling out of normalization
+    (check "image blocks: non-string fields dropped"
+           (null (normalize-content-to-parts
+                  (vector (jobj "type" "image"
+                                "source" (jobj "url" 42 "media_type" 7 "data" 9))
+                          (jobj "type" "image_url" "image_url" (jobj "url" 42))
+                          (jobj "type" "image_url" "image_url" 42)))))
 
     ;; build-output-message
     (let ((msg (build-output-message :text "Hello"

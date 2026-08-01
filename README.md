@@ -97,6 +97,34 @@ count wins over the requested one on the span.
 or `:no-tool-content`. The SDK keeps the first `:embedding-max-input-items`
 texts in order and cuts each one to `:embedding-max-text-length` characters.
 
+### Message parts
+
+A message carries a list of parts. There are five kinds:
+
+| Constructor | Wire field | Notes |
+|-------------|-----------|-------|
+| `make-text-part` | `text` | Plain text |
+| `make-thinking-part` | `thinking` | Reasoning text |
+| `make-tool-call-part` | `tool_call` | `:id`, `:name`, `:input-json` |
+| `make-tool-result-part` | `tool_result` | `:tool-call-id`, `:name`, `:content`, `:is-error` |
+| `make-media-part` | `media` | Images and other non-text content |
+
+`make-media-part` takes `:kind`, `:url`, `:mime-type`, `:name`, and `:provider-type`.
+The four string fields default to `""`; `:provider-type` defaults to `nil`.
+
+```lisp
+(sigil-cl:make-media-part :kind "image"
+                          :url "https://example.com/chart.png"
+                          :mime-type "image/png"
+                          :name "chart.png"
+                          :provider-type "image")
+```
+
+The URL can hold the bytes inline as a `data:` URI. `:provider-type` sets the
+part's `metadata.provider_type`; when it is `nil` or empty the SDK omits the
+`metadata` object. Under `:metadata-only` and `:metadata-with-system-prompt` the
+SDK clears `url` and keeps `kind`, `mime_type`, and `name`.
+
 ### Normalize API responses
 
 Convert raw LLM API hash-tables into SDK types:
@@ -114,6 +142,11 @@ Convert raw LLM API hash-tables into SDK types:
     :input-messages input
     :output-messages (list output)))
 ```
+
+Anthropic `image` blocks and OpenAI `image_url` blocks become media parts with
+`kind` and `provider_type` set to `"image"`. An inline Anthropic source becomes a
+`data:<mime>;base64,<data>` URL; a URL source passes through unchanged. A block
+with neither a URL nor both a media type and inline data is dropped.
 
 ### Shutdown
 
