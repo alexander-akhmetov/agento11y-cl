@@ -53,6 +53,19 @@
 (defparameter +ingest-actor-header+ "X-Agento11y-Ingest-Actor")
 (defparameter +max-eval-response-bytes+ (* 8 1024 1024))
 
+;;; Cloud trial evaluation (experimental).
+;;;
+;;;   POST /api/v1/experiment-runs/{id}/trials/{trial_id}:evaluate
+;;;   GET  /api/v1/experiment-runs/{id}/trials/{trial_id}/evaluations/{eval_id}
+;;;   POST /api/v1/experiment-runs/{id}/trials/{trial_id}/artifacts:upload
+(defparameter +trial-evaluation-statuses+ '("queued" "claimed" "success" "failed"))
+(defparameter +trial-evaluation-terminal-statuses+ '("success" "failed"))
+(defparameter +default-evaluation-timeout-sec+ 300)
+(defparameter +default-evaluation-poll-interval-sec+ 0.5)
+;; Ceiling for the poll backoff, so a long wait costs tens of status reads
+;; rather than hundreds. A caller asking for a slower cadence keeps it.
+(defparameter +max-evaluation-poll-interval-sec+ 5)
+
 (defun %blank-string-p (value)
   (or (null value)
       (and (stringp value)
@@ -468,15 +481,18 @@ this: it is a tenant ingest write that goes out with generation auth."
   "Auth headers for score export: generation auth plus the ingest actor."
   (append (build-auth-headers config) (%ingest-actor-headers config)))
 
-(defun request-eval-json (config method url payload label
-                          &key (headers nil headers-supplied-p))
-  "Send one eval JSON request and return the parsed response body.
-Passing HEADERS replaces the default eval auth headers, including when the
-caller's header list is empty: score export supplies generation auth, and an
+(defun %request-eval (config method url body content-type label
+                      &key headers headers-supplied-p)
+  "Send one eval request with an already-encoded BODY and return the parsed
+JSON response. Holds the retry loop, the 429/5xx policy, and the status
+mapping for every eval call, whatever the body encoding.
+
+HEADERS-SUPPLIED-P replaces the default eval auth headers with HEADERS, and
+an empty HEADERS still counts: score export supplies generation auth, and an
 unauthenticated deployment builds no headers at all. Falling back on an empty
-list would send the eval token to the generation host."
-  (let* ((body (when payload (jzon:stringify payload)))
-         (headers (append (list (cons "Content-Type" "application/json"))
+list would send the eval token to the generation host. The wrappers pass their
+own supplied-p through, which is why this takes it as a plain argument."
+  (let* ((headers (append (list (cons "Content-Type" content-type))
                           (if headers-supplied-p
                               headers
                               (build-eval-auth-headers config))))
@@ -515,6 +531,28 @@ list would send the eval token to the generation host."
                      (error 'sigil-export-error
                             :message (format nil "~a request failed: ~a"
                                              label (princ-to-string e)))))))))
+
+(defun request-eval-json (config method url payload label
+                          &key (headers nil headers-supplied-p))
+  "Send one eval JSON request and return the parsed response body.
+See %REQUEST-EVAL for what supplying HEADERS means."
+  (%request-eval config method url
+                 (when payload (jzon:stringify payload))
+                 "application/json" label
+                 :headers headers :headers-supplied-p headers-supplied-p))
+
+(defun request-eval-bytes-json (config method url body content-type label
+                                &key (headers nil headers-supplied-p))
+  "Send raw BODY bytes and return the parsed JSON response.
+Artifact upload posts the content as the request body, so it cannot go through
+REQUEST-EVAL-JSON, which stringifies its payload. A blank CONTENT-TYPE falls
+back to application/octet-stream."
+  (%request-eval config method url body
+                 (if (%blank-string-p content-type)
+                     "application/octet-stream"
+                     (%trimmed-text content-type))
+                 label
+                 :headers headers :headers-supplied-p headers-supplied-p))
 
 (defun upsert-experiment-run (client &key experiment-id run-id name description tags
                                       suite-id suite-version candidate planned-trial-count

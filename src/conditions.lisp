@@ -56,3 +56,30 @@
   (:report (lambda (c stream)
              (format stream "Sigil hook transport error: ~a"
                      (sigil-error-message c)))))
+
+(define-condition sigil-experimental-disabled-error (sigil-error)
+  ()
+  (:report (lambda (c stream)
+             (format stream "Sigil experimental feature disabled: ~a"
+                     (sigil-error-message c)))))
+
+;; Both evaluation conditions carry the evaluation id: the row survives on the
+;; backend, and triggering the same combination again returns that same id, so a
+;; caller can resume the wait instead of queueing a second evaluation.
+(define-condition sigil-trial-evaluation-failed-error (sigil-error)
+  ((evaluation-id :initarg :evaluation-id :reader sigil-trial-evaluation-error-id
+                  :initform nil)
+   (detail :initarg :detail :reader sigil-trial-evaluation-error-detail
+           :initform nil))
+  (:report (lambda (c stream)
+             (format stream "Sigil trial evaluation failed (~a): ~a"
+                     (or (sigil-trial-evaluation-error-id c) "?")
+                     (sigil-error-message c)))))
+
+(define-condition sigil-trial-evaluation-timeout-error (sigil-error)
+  ((evaluation-id :initarg :evaluation-id :reader sigil-trial-evaluation-error-id
+                  :initform nil))
+  (:report (lambda (c stream)
+             (format stream "Sigil trial evaluation timed out (~a): ~a"
+                     (or (sigil-trial-evaluation-error-id c) "?")
+                     (sigil-error-message c)))))

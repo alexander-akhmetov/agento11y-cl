@@ -84,6 +84,33 @@
    #:trial-span-id
    #:trial-created-p
    #:trial-closed-p
+   ;; Cloud trial evaluation (experimental)
+   #:trigger-trial-evaluation
+   #:get-trial-evaluation
+   #:trial-evaluation-terminal-p
+   #:trial-evaluate
+   ;; Trial artifacts
+   #:upload-trial-artifact
+   #:trial-artifact
+   ;; Built-in evaluators
+   #:evaluate-output
+   #:evaluation-result
+   #:make-evaluation-result
+   #:evaluation-result-p
+   #:evaluation-result-evaluator-id
+   #:evaluation-result-evaluator-version
+   #:evaluation-result-evaluator-kind
+   #:evaluation-result-value
+   #:evaluation-result-passed
+   #:evaluation-result-explanation
+   #:evaluation-result-score-key
+   #:evaluation-result-metadata
+   #:evaluation-result-grader
+   #:llm-judge
+   #:make-llm-judge
+   #:regex-judge
+   #:make-regex-judge
+   #:trial-record-evaluation
    ;; Local suites
    #:test-suite
    #:test-case
@@ -175,6 +202,7 @@
    #:config-embedding-capture-input
    #:config-embedding-max-input-items
    #:config-embedding-max-text-length
+   #:config-experimental-features
    ;; Types + constructors
    #:message
    #:text-part
@@ -254,4 +282,9 @@
    #:sigil-not-found-error
    #:sigil-conflict-error
    #:sigil-conflict-error-kind
-   #:sigil-actor-mismatch-error))
+   #:sigil-actor-mismatch-error
+   #:sigil-experimental-disabled-error
+   #:sigil-trial-evaluation-failed-error
+   #:sigil-trial-evaluation-timeout-error
+   #:sigil-trial-evaluation-error-id
+   #:sigil-trial-evaluation-error-detail))

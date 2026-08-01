@@ -12,6 +12,9 @@ Sigil captures LLM generations, tool executions, and embeddings from your applic
 - **Ad-hoc spans** — wrap arbitrary code blocks in OTel spans via `with-span`
 - **Conversation ratings** — submit user feedback ratings to the Sigil API
 - **Offline experiments** — create eval runs, record tagged generations, export scores, and loop a dataset through a target and scorers
+- **Built-in evaluators** — grade output in-process with an LLM judge or a regex judge, and record the grader's own generation alongside the score
+- **Trial artifacts** — attach files, text, or raw bytes to a trial
+- **Cloud trial evaluation** — queue a tenant-stored evaluator against a trial and wait for its verdict (experimental)
 - **Collection datasets** — read Sigil collections and conversations to build experiment datasets from saved conversations
 - **Synchronous hook evaluation** — opt-in preflight/postflight guard checks against the Sigil hooks API with allow/deny semantics, fail-open transport handling, and `transformed_input` rewrite passthrough
 - **Message normalization** — convert raw Anthropic and OpenAI API responses into SDK types
@@ -288,6 +291,7 @@ schema defaults. This matches the canonical sigil-sdk schema (Go, Python, JS).
 | `SIGIL_TAGS` | `:tags` | `k=v,k2=v2`; env is the base layer, caller-supplied tags win on key collision |
 | `SIGIL_CONTENT_CAPTURE_MODE` | `:content-capture-mode` | Accepts `full` / `no_tool_content` / `metadata_only`; unknown values warn and are ignored. `:metadata-with-system-prompt` is a code-only extension |
 | `SIGIL_DEBUG` | `:debug` | `1` / `true` / `yes` / `on` → t, otherwise nil |
+| `SIGIL_ENABLE_EXPERIMENTAL_FEATURES` | `:experimental-features` | Same truthy values as `SIGIL_DEBUG`. Also read from `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES`; the `SIGIL_` spelling wins when both are set |
 
 `SIGIL_PROTOCOL` is not supported (sigil-cl is HTTP-only); a warning is logged
 when set to anything other than `http`/`https`. `SIGIL_INSECURE` is a no-op
@@ -464,6 +468,117 @@ If a trial cannot be closed, the run still attempts the remaining closes, then
 finalizes `failed` and omits `score_count` — a partial run has no trustworthy
 local count.
 
+### Built-in evaluators
+
+An evaluator grades one output in this process and returns an
+`evaluation-result`. `trial-record-evaluation` turns that result into a score on
+a trial.
+
+The LLM judge calls no provider itself: you pass an `:invoke` closure that takes
+the rendered prompt and returns the reply text, plus an optional `token-usage`
+as a second value. The dependency list stays as it is, and any client adapts in
+a few lines.
+
+```lisp
+(let ((judge (sigil-cl:make-llm-judge
+              :evaluator-id "helpfulness"
+              :model-name "claude-sonnet-4-5"
+              :model-provider "anthropic"
+              :invoke (lambda (prompt)
+                        (values (my-llm-call prompt) (my-usage))))))
+  (sigil-cl:with-trial (trial run "case-1")
+    (sigil-cl:trial-bind-conversation trial conversation-id)
+    (sigil-cl:trial-record-evaluation
+     trial
+     (sigil-cl:evaluate-output judge (list :input question
+                                           :output answer
+                                           :expected reference)))))
+```
+
+The default prompt asks for `{"score": <0..1>, "passed": <boolean>,
+"explanation": "<brief reason>"}`. The parser finds complete top-level JSON
+objects inside surrounding prose, takes the last one carrying a numeric `score`,
+clamps it to `[0,1]`, and derives `passed` from the threshold (0.5 by default)
+unless the reply sets `passed` or `pass`. `explanation` falls back to `reason`.
+Pass `:parser` to replace the whole step.
+
+`make-regex-judge` is the deterministic counterpart. Its value is the boolean.
+
+```lisp
+(sigil-cl:make-regex-judge :evaluator-id "no-secrets"
+                           :pattern "sk-[A-Za-z0-9]+"
+                           :negate t)
+```
+
+`:full-match` requires the leftmost match to span the whole output, which is
+what `cl-ppcre:scan` reports and what Go does. Python's `re.fullmatch` backtracks
+inside the pattern to find a match that spans the whole string, so it accepts
+patterns this leftmost-match check rejects.
+
+`trial-record-evaluation` records the judge's own generation first, under ids
+derived from `(stable-id "grader" run-id trial-id score-key evaluator-id)`, and
+exports it before building the score. A rescore appends the same occurrence
+counter the score id uses, so the second grading writes its own grader
+generation instead of overwriting the first. That generation is deliberately not
+registered as one the experiment run produced, so it never lands in the graded
+score's generation attribution. Pass `:publish-grader nil` to skip it. Go seeds
+its grader ids from the minted score id instead, so the two SDKs do not produce
+identical grader ids for the same score.
+
+### Cloud trial evaluation (experimental)
+
+`trial-evaluate` grades a trial's bound conversation with an evaluator stored in
+your tenant, instead of a score computed locally.
+
+```lisp
+(sigil-cl:trial-bind-conversation trial conversation-id)
+(sigil-cl:trial-evaluate trial "my-stored-evaluator" :timeout-sec 120)
+```
+
+It persists the conversation binding, flushes pending generations so the
+evaluator can read what it is asked to grade, queues the evaluation, then polls
+until the status is `success` or `failed`. The poll interval starts at 0.5s and
+doubles up to 5s. Worker failure signals `sigil-trial-evaluation-failed-error`
+and an exceeded deadline signals `sigil-trial-evaluation-timeout-error`; both
+carry the evaluation id, and the evaluation keeps running server-side either
+way, so triggering the same combination again returns the same row.
+
+Queuing an evaluation makes the owning run omit `score_count` when it finalizes:
+the evaluator writes a score this process never counted, and asserting the local
+total against it answers `409 score-count-mismatch`. A trial opened outside a
+run cannot mark anything, so that caller must pass `:score-count nil` to
+`experiment-run-finalize` themselves.
+
+`trigger-trial-evaluation` and `get-trial-evaluation` are the transport calls
+underneath, for a caller who wants to queue an evaluation without blocking.
+
+All three are gated: without the experimental flag they signal
+`sigil-experimental-disabled-error` and send no request. Set it on the config
+directly or through the environment:
+
+```lisp
+(sigil-cl:make-config :experimental-features t ...)
+```
+
+### Trial artifacts
+
+`trial-artifact` attaches a file, text, or raw bytes to a trial. Supply exactly
+one of `:content`, `:text`, or `:path`.
+
+```lisp
+(sigil-cl:trial-artifact trial :name "transcript" :text conversation-log)
+(sigil-cl:trial-artifact trial :name "screenshot" :path "/tmp/shot.png")
+```
+
+`:kind` is inferred from the MIME type when unset, and the MIME type is inferred
+from the file extension for `:path`. The content posts as the raw request body;
+`name`, `kind`, and `mime` ride the query string.
+
+> **This SDK does not redact artifacts.** Go and Python strip secrets from
+> text-like artifacts by default. sigil-cl has no secret sanitizer yet, so
+> content uploads exactly as supplied. Code ported from Python that relied on
+> the default redaction has to strip secrets itself.
+
 ### Local suites
 
 `test-suite` and `test-case` describe an evaluation locally. There is no YAML
@@ -597,12 +712,19 @@ statuses already reported were written without it.
 | `sigil-not-found-error` | HTTP 404 |
 | `sigil-conflict-error` | HTTP 409; `sigil-conflict-error-kind` classifies it |
 | `sigil-actor-mismatch-error` | HTTP 401 naming actor ownership; not retried |
-| `sigil-export-error` | any other non-2xx, or rejected scores |
+| `sigil-export-error` | any other non-2xx, rejected scores, or an evaluation response the SDK cannot act on |
+| `sigil-experimental-disabled-error` | an experimental call with the gate off; no request is sent |
+| `sigil-trial-evaluation-failed-error` | a cloud evaluation reported `failed`; carries the evaluation id and the worker's detail |
+| `sigil-trial-evaluation-timeout-error` | a cloud evaluation did not finish in time; carries the evaluation id |
 
 `sigil-conflict-error-kind` returns `:score-count-mismatch`,
 `:running-trials`, `:pending-evaluations`, `:terminal`, `:immutable-field`,
 `:open-draft`, or `:unknown`. `conflict-recoverable-p` says whether the caller
 can fix it and retry. `classify-conflict` exposes the classifier directly.
+
+`sigil-trial-evaluation-error-id` reads the evaluation id off either evaluation
+condition; `sigil-trial-evaluation-error-detail` reads the worker's message off
+the failure.
 
 ### Configuration
 

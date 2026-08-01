@@ -139,7 +139,13 @@ Recognized variables:
   SIGIL_AUTH_TENANT_ID, SIGIL_AUTH_TOKEN, SIGIL_AGENT_NAME,
   SIGIL_AGENT_VERSION, SIGIL_USER_ID, SIGIL_TAGS,
   SIGIL_CONTENT_CAPTURE_MODE, SIGIL_REDACT_SECRETS,
-  SIGIL_REDACT_INPUT_MESSAGES, SIGIL_DEBUG.
+  SIGIL_REDACT_INPUT_MESSAGES, SIGIL_DEBUG,
+  SIGIL_ENABLE_EXPERIMENTAL_FEATURES.
+
+SIGIL_ENABLE_EXPERIMENTAL_FEATURES also reads its agento11y spelling,
+AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES, so a polyglot harness that already
+exports the Go gate unlocks this SDK too. The SIGIL_ name wins when both are
+set.
 
 SIGIL_PROTOCOL is not supported (sigil-cl is HTTP-only); a warning is logged
 when set to anything other than http/https. SIGIL_INSECURE is a no-op since
@@ -173,6 +179,8 @@ wins over env."
          (redact-secrets (env-trimmed env-fn "SIGIL_REDACT_SECRETS"))
          (redact-inputs  (env-trimmed env-fn "SIGIL_REDACT_INPUT_MESSAGES"))
          (debug     (env-trimmed env-fn "SIGIL_DEBUG"))
+         (experimental (or (env-trimmed env-fn +experimental-features-env-var+)
+                           (env-trimmed env-fn "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES")))
          (protocol  (env-trimmed env-fn "SIGIL_PROTOCOL")))
     ;; Warn when SIGIL_PROTOCOL is set to something we don't support.
     (when (and protocol
@@ -247,7 +255,10 @@ wins over env."
                                              #'string-equal))))
         ;; Debug.
         (when (and debug (null (config-debug config)))
-          (override :debug (parse-bool debug))))
+          (override :debug (parse-bool debug)))
+        ;; Experimental feature gate.
+        (when (and experimental (null (config-experimental-features config)))
+          (override :experimental-features (parse-bool experimental))))
       ;; Overrides come first so make-instance picks them over the copied slots
       ;; (CLOS uses the first occurrence of an initarg).
       (apply #'make-instance 'sigil-config

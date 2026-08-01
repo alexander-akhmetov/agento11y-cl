@@ -53,6 +53,10 @@ generation or trial being judged."
    (tracked-generation-ids :initform nil :accessor experiment-run-tracked-generation-ids)
    (accepted-count :initform 0 :accessor experiment-run-accepted-count)
    (finalized-p :initform nil :accessor experiment-run-finalized-p)
+   ;; Set once a trial on this run queued a cloud evaluation. That evaluator
+   ;; writes a score this process never sees, so the local count stops being
+   ;; something the run can assert.
+   (cloud-evaluated-p :initform nil :accessor experiment-run-cloud-evaluated-p)
    ;; Local test suite, when the caller supplied one. Its id and version go on
    ;; the run payload; its cases feed trial snapshots.
    (suite :initarg :suite :accessor experiment-run-suite :initform nil)
@@ -517,6 +521,123 @@ count for EXPERIMENT-RUN-PUBLISH to export."
                                :conversation-id conversation-id
                                :trial trial)))
 
+(defun %grader-id-base (run trial score-key evaluator-id)
+  "The seed the grader's ids hang off.
+Derived from the run, trial, score key, and evaluator rather than from the
+minted score id, so it needs no reach into the score-id counter and still
+addresses the same rows on a rerun. Go seeds its grader ids from the score id
+instead, so the two SDKs do not produce identical grader ids.
+
+The occurrence the score about to be minted will use is read off the run's
+counter and folded in, exactly as %MINT-SCORE-ID does, so rescoring the same
+trial with the same evaluator writes a second grader generation instead of
+overwriting the first. Read, not advanced: %COMMIT-SCORE-IDS advances the
+counter only once the batch validates, so a corrected retry mints the same
+grader ids it did before."
+  (let* ((key (list (%trimmed-text (trial-id trial)) score-key evaluator-id))
+         (occurrence (bt2:with-lock-held ((experiment-run-lock run))
+                       (gethash key (experiment-run-score-occurrences run) 0))))
+    (if (zerop occurrence)
+        (stable-id "grader" (experiment-run-run-id run) (trial-id trial)
+                   score-key evaluator-id)
+        (stable-id "grader" (experiment-run-run-id run) (trial-id trial)
+                   score-key evaluator-id (1+ occurrence)))))
+
+(defun %record-grader-generation (trial grader generation-id conversation-id
+                                  evaluator-id metadata)
+  "Record the judge's own generation, then export it.
+
+The grader is telemetry about the judge, not about the graded run. Binding
+*EXPERIMENT-RUN* to NIL keeps START-GENERATION from registering it as a
+generation the run produced, which would attach it to the graded score's
+`generation_ids`. *TRACE-CONTEXT* is bound with it so the grader span does not
+parent itself under whatever generation is being graded.
+
+CLIENT-FLUSH runs before the caller builds the score, so a score never names a
+grader generation that has not been sent. CLIENT-FLUSH logs an export failure
+rather than signalling it, so a dropped grader generation leaves a warning,
+not an error."
+  (let* ((client (trial-client trial))
+         (run (trial-run trial))
+         (usage (getf grader :usage))
+         (grader-metadata
+           (%merge-metadata metadata
+                            (remove nil
+                                    (list (cons "experiment_run_id" (experiment-run-run-id run))
+                                          (cons "test_case_id" (trial-test-case-id trial))
+                                          (cons "attempt" (trial-attempt trial))
+                                          (when (getf grader :operation-name)
+                                            (cons "operation_name"
+                                                  (getf grader :operation-name)))))))
+         (grader-tags (list (cons +experiment-run-id-tag+ (experiment-run-run-id run))
+                            (cons "test.case.id" (trial-test-case-id trial))
+                            (cons "test.case.attempt" (princ-to-string (trial-attempt trial)))
+                            (cons "evaluator.id" evaluator-id))))
+    (let ((*experiment-run* nil)
+          (*trace-context* nil))
+      (with-generation (rec client
+                            :generation-id generation-id
+                            :conversation-id conversation-id
+                            :model-provider (getf grader :model-provider)
+                            :model-name (getf grader :model-name)
+                            :agent-name (getf grader :agent-name)
+                            :agent-version (getf grader :agent-version)
+                            :tags grader-tags
+                            :metadata grader-metadata)
+        (set-result rec
+                    :input-messages (list (make-message
+                                           :role :user
+                                           :parts (list (make-text-part
+                                                         (%text (getf grader :input))))))
+                    :output-messages (list (make-message
+                                            :role :assistant
+                                            :parts (list (make-text-part
+                                                          (%text (getf grader :output))))))
+                    :usage usage)))
+    (client-flush client)))
+
+(defun trial-record-evaluation (trial result &key score-key (publish-grader t) metadata)
+  "Turn an EVALUATION-RESULT into a score on TRIAL.
+
+Records the judge's own generation first when RESULT carries a grader and
+PUBLISH-GRADER is set, so the stored score points at the call that produced
+it. Returns the number of scores now buffered on the trial."
+  (let* ((run (trial-run trial))
+         (evaluator-id (%trimmed-text (evaluation-result-evaluator-id result)))
+         (key (cond
+                ((not (%blank-string-p score-key)) (%trimmed-text score-key))
+                ((not (%blank-string-p (evaluation-result-score-key result)))
+                 (%trimmed-text (evaluation-result-score-key result)))
+                (t "final")))
+         (grader (evaluation-result-grader result))
+         (grader-generation-id nil)
+         (grader-conversation-id nil))
+    (unless run
+      (error 'sigil-validation-error
+             :message "trial is not attached to an experiment run"))
+    (when (zerop (length evaluator-id))
+      (error 'sigil-validation-error
+             :message "score validation failed: missing evaluator_id"))
+    (when (and grader publish-grader)
+      (let ((base (%grader-id-base run trial key evaluator-id)))
+        (setf grader-generation-id (stable-id "gen" base "grader")
+              grader-conversation-id (stable-id "conv" base "grader"))
+        (%record-grader-generation trial grader grader-generation-id
+                                   grader-conversation-id evaluator-id
+                                   (evaluation-result-metadata result))))
+    (trial-add-scores
+     trial
+     (list (make-score :evaluator-id evaluator-id
+                       :evaluator-version (evaluation-result-evaluator-version result)
+                       :score-key key
+                       :value (evaluation-result-value result)
+                       :passed (and (evaluation-result-passed result) t)
+                       :explanation (evaluation-result-explanation result)
+                       :metadata (%merge-metadata (evaluation-result-metadata result)
+                                                  metadata)
+                       :grader-conversation-id grader-conversation-id
+                       :grader-generation-id grader-generation-id)))))
+
 (defun %trial-flush-scores (trial)
   "Drain TRIAL's score buffer. In :continuous mode the scores are exported
 now; in :bulk and :manual they move to the run buffer for a later publish.
@@ -634,7 +755,13 @@ generation ids captured for ~:[that trial~;those trials~], so scores on ~
                                      :closed-fn (lambda (closed)
                                                   (bt2:with-lock-held ((experiment-run-lock run))
                                                     (remhash (trial-id closed)
-                                                             (experiment-run-open-trials run)))))))
+                                                             (experiment-run-open-trials run))))
+                                     ;; A closure rather than an accessor call:
+                                     ;; trial.lisp loads before this file.
+                                     :cloud-evaluated-fn
+                                     (lambda ()
+                                       (bt2:with-lock-held ((experiment-run-lock run))
+                                         (setf (experiment-run-cloud-evaluated-p run) t))))))
         (bt2:with-lock-held ((experiment-run-lock run))
           (remhash trial-id (experiment-run-opening-trial-ids run))
           (if trial
@@ -714,15 +841,21 @@ one trial failing to close does not stop the rest from being attempted."
 STATUS accepts \"completed\" (or its alias \"succeeded\") and \"failed\";
 anything else signals before a request is sent. SCORE-COUNT defaults to the
 count this run saw accepted; pass NIL to omit it, which is what a run with a
-trial that would not close must do because its local count is incomplete."
+trial that would not close must do because its local count is incomplete.
+
+A run that queued a cloud evaluation omits the count whatever SCORE-COUNT
+says: the evaluator writes a score this process never counted, and asserting
+the local total against it answers 409 score-count-mismatch."
   (bt2:with-lock-held ((experiment-run-lock run))
     (unless (experiment-run-finalized-p run)
       (finalize-experiment-run (experiment-run-client run)
                                (experiment-run-run-id run)
                                :status status
-                               :score-count (if (eq score-count :accepted)
-                                                (experiment-run-accepted-count run)
-                                                score-count)
+                               :score-count (cond
+                                              ((experiment-run-cloud-evaluated-p run) nil)
+                                              ((eq score-count :accepted)
+                                               (experiment-run-accepted-count run))
+                                              (t score-count))
                                :error error-message)
       (setf (experiment-run-finalized-p run) t)))
   run)
