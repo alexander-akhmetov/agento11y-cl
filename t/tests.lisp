@@ -26,6 +26,7 @@
                                (auth-mode :bearer)
                                (auth-password "test-token")
                                (max-retries 5)
+                               experimental-features
                                http-fn log-fn)
   "Create a client with mock HTTP that captures requests."
   (let ((requests nil))
@@ -59,6 +60,7 @@
        :auth-password auth-password
        :max-retries max-retries
        :log-fn log-fn
+       :experimental-features experimental-features
        :http-fn (or http-fn
                     (lambda (url &key method headers content &allow-other-keys)
                       (declare (ignore method headers))
@@ -80,6 +82,10 @@
 (defun payload (call)
   (jzon:parse (third call)))
 
+(defun call-header (call name)
+  "The value of header NAME on a ROUTED-HTTP call, case-insensitively."
+  (cdr (assoc name (fourth call) :test #'string-equal)))
+
 (defun score-call-p (call)
   (and (search "scores:export" (second call)) t))
 
@@ -97,16 +103,42 @@
                         "name" "prompt A"
                         "status" status)))
 
-(defun routed-http (calls-place experiment-id &key (score-status 202) score-body)
+(defun evaluation-body (evaluation-id status &key error-detail extra)
+  "A trial-evaluation response body. EXTRA overrides or adds keys."
+  (let ((out (jobj "evaluation_id" evaluation-id "status" status)))
+    (when error-detail (setf (gethash "error" out) error-detail))
+    (when extra
+      (loop for (k v) on extra by #'cddr
+            do (setf (gethash k out) v)))
+    (jzon:stringify out)))
+
+(defun evaluation-script (&rest bodies)
+  "An EVALUATION-FN for ROUTED-HTTP serving BODIES in order, repeating the last."
+  (let ((remaining bodies))
+    (lambda (url)
+      (declare (ignore url))
+      (let ((body (first remaining)))
+        (when (rest remaining) (pop remaining))
+        (values body 200)))))
+
+(defun routed-http (calls-place experiment-id &key (score-status 202) score-body
+                                                   evaluation-fn artifact-body)
   "One stub covering every route an experiment touches. Calls are pushed onto
-the cdr of CALLS-PLACE as (method url content), newest first."
+the cdr of CALLS-PLACE as (method url content headers), newest first.
+The evaluation and artifact routes are matched before the generic
+experiment-runs branch, whose prefix they share."
   (lambda (url &key method headers content &allow-other-keys)
-    (declare (ignore headers))
-    (push (list method url content) (cdr calls-place))
+    (push (list method url content headers) (cdr calls-place))
     (cond
       ((search "scores:export" url)
        (values (or score-body (make-score-response content)) score-status))
       ((search "generations:export" url) (values "{}" 200))
+      ((or (search ":evaluate" url) (search "/evaluations/" url))
+       (if evaluation-fn
+           (funcall evaluation-fn url)
+           (values (evaluation-body "eval-1" "success") 200)))
+      ((search "artifacts:upload" url)
+       (values (or artifact-body (jzon:stringify (jobj "artifact_id" "art-1"))) 200))
       ((and (eq method :get) (search "/report" url))
        (values (jzon:stringify (jobj "experiment_id" experiment-id)) 200))
       ((search "experiment-runs" url)
@@ -577,6 +609,30 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                (>= warns 1))
         (check "bad SIGIL_REDACT_INPUT_MESSAGES warning omits the value"
                (notany (lambda (m) (search "glc_notabool" m)) messages)))
+
+      ;; --- Experimental gate ---
+      (check "gate is off when unset"
+             (null (config-experimental-features (resolve nil))))
+      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "true")))))
+        (check "SIGIL_ENABLE_EXPERIMENTAL_FEATURES=true -> t"
+               (config-experimental-features cfg)))
+      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "on")))))
+        (check "the gate accepts on" (config-experimental-features cfg)))
+      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "no")))))
+        (check "SIGIL_ENABLE_EXPERIMENTAL_FEATURES=no -> nil"
+               (null (config-experimental-features cfg))))
+      ;; A polyglot harness exporting the Go gate unlocks this SDK too.
+      (let ((cfg (resolve '(("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "1")))))
+        (check "the agento11y spelling sets the gate"
+               (config-experimental-features cfg)))
+      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "true")
+                            ("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "no")))))
+        (check "the SIGIL spelling wins over the agento11y one"
+               (config-experimental-features cfg)))
+      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "no"))
+                          :experimental-features t)))
+        (check "a caller-set gate survives env resolution"
+               (config-experimental-features cfg)))
 
       ;; --- SIGIL_PROTOCOL warning when non-http ---
       (let* ((warns 0)
@@ -4968,6 +5024,821 @@ the cdr of CALLS-PLACE as (method url content), newest first."
 ;;; Local suite tests
 ;;; ================================================================
 
+(defun run-trial-evaluation-tests ()
+  (with-test-suite ("Cloud trial evaluation")
+    (flet ((eval-client (calls &rest routed-args)
+             (make-test-client :eval-endpoint "https://sigil.example.test"
+                               :generation-enabled nil :traces-enabled nil
+                               :experimental-features t
+                               :http-fn (apply #'routed-http calls "exp-1" routed-args))))
+
+      ;; --- The gate blocks every route, and blocks it before any request ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-1"))
+          (declare (ignore get-requests))
+          (check "trigger signals when the gate is off"
+                 (signals-condition-p
+                  (lambda () (trigger-trial-evaluation client "exp-1" "trial-1"
+                                                       :evaluator-id "ev-1"))
+                  'sigil-experimental-disabled-error))
+          (check "status read signals when the gate is off"
+                 (signals-condition-p
+                  (lambda () (get-trial-evaluation client "exp-1" "trial-1" "eval-1"))
+                  'sigil-experimental-disabled-error))
+          (let ((trial (trial-open client "exp-1" "case-gate")))
+            (trial-bind-conversation trial "conv-1")
+            (setf (cdr calls) nil)
+            (check "trial-evaluate signals when the gate is off"
+                   (signals-condition-p (lambda () (trial-evaluate trial "ev-1"))
+                                        'sigil-experimental-disabled-error))
+            (check "a blocked call issues no request" (null (cdr calls))))))
+
+      ;; --- Trigger request ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (eval-client calls :evaluation-fn (evaluation-script
+                                               (evaluation-body "eval-1" "queued")))
+          (declare (ignore get-requests))
+          (trigger-trial-evaluation client "exp-1" "trial:1" :evaluator-id "  ev-9  ")
+          (let* ((call (first (cdr calls)))
+                 (posted (payload call)))
+            (check "trigger POSTs the :evaluate route with the colon escaped"
+                   (and (eq (first call) :post)
+                        (equal (second call)
+                               "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials/trial%3A1:evaluate")))
+            (check "trigger sends the trimmed evaluator id"
+                   (equal (jget posted "evaluator_id") "ev-9"))
+            (check "trigger omits evaluator_version when it is blank"
+                   (null (nth-value 1 (gethash "evaluator_version" posted)))))
+          (setf (cdr calls) nil)
+          (trigger-trial-evaluation client "exp-1" "trial-1"
+                                    :evaluator-id "ev-9" :evaluator-version "3")
+          (check "trigger sends evaluator_version when supplied"
+                 (equal (jget (payload (first (cdr calls))) "evaluator_version") "3"))
+          (check "a blank evaluator id signals before any request"
+                 (signals-condition-p
+                  (lambda () (trigger-trial-evaluation client "exp-1" "trial-1"
+                                                       :evaluator-id "  "))
+                  'sigil-validation-error))))
+
+      ;; --- Status route ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (eval-client calls :evaluation-fn (evaluation-script
+                                               (evaluation-body "eval:2" "claimed")))
+          (declare (ignore get-requests))
+          (get-trial-evaluation client "exp-1" "trial:1" "eval:2")
+          (let ((call (first (cdr calls))))
+            (check "the status route GETs with both ids escaped"
+                   (and (eq (first call) :get)
+                        (equal (second call)
+                               "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials/trial%3A1/evaluations/eval%3A2")))
+            (check "the status read sends no body" (null (third call))))
+          (check "a blank evaluation id signals before any request"
+                 (signals-condition-p
+                  (lambda () (get-trial-evaluation client "exp-1" "trial-1" ""))
+                  'sigil-validation-error))))
+
+      ;; --- Response validation ---
+      (dolist (case '(("queued" "eval-1" :ok)
+                      ("claimed" "eval-1" :ok)
+                      ("success" "eval-1" :ok)
+                      ("failed" "eval-1" :ok)
+                      ("running" "eval-1" :rejected)
+                      ("" "eval-1" :rejected)
+                      ("queued" "" :rejected)
+                      ("queued" "   " :rejected)))
+        (destructuring-bind (status evaluation-id expectation) case
+          (let ((calls (cons :calls nil)))
+            (multiple-value-bind (client get-requests)
+                (eval-client calls :evaluation-fn
+                             (evaluation-script (evaluation-body evaluation-id status)))
+              (declare (ignore get-requests))
+              (let ((rejected (signals-condition-p
+                               (lambda () (trigger-trial-evaluation
+                                           client "exp-1" "trial-1" :evaluator-id "ev-1"))
+                               'sigil-export-error)))
+                (check (format nil "status ~s with id ~s is ~(~a~)"
+                               status evaluation-id expectation)
+                       (if (eq expectation :ok) (not rejected) rejected)))))))
+
+      ;; The status route validates too, so a bad status mid-poll aborts the
+      ;; wait instead of polling to the caller's deadline.
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (eval-client calls :evaluation-fn
+                         (evaluation-script (evaluation-body "eval-1" "running")))
+          (declare (ignore get-requests))
+          (check "an unknown status from the status route signals"
+                 (signals-condition-p
+                  (lambda () (get-trial-evaluation client "exp-1" "trial-1" "eval-1"))
+                  'sigil-export-error))))
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (eval-client calls :evaluation-fn
+                         (evaluation-script (evaluation-body "eval-1" "queued")
+                                            (evaluation-body "eval-1" "running")))
+          (declare (ignore get-requests))
+          (let ((trial (trial-open client "exp-1" "case-badstatus")))
+            (trial-bind-conversation trial "conv-1")
+            (check "an unknown status mid-poll aborts the wait"
+                   (signals-condition-p
+                    (lambda () (trial-evaluate trial "ev-1" :timeout-sec 5
+                                                            :poll-interval-sec 0))
+                    'sigil-export-error)))))
+
+      (check "terminal-p is true only for success and failed"
+             (and (trial-evaluation-terminal-p (jobj "status" "success"))
+                  (trial-evaluation-terminal-p (jobj "status" "failed"))
+                  (not (trial-evaluation-terminal-p (jobj "status" "queued")))
+                  (not (trial-evaluation-terminal-p (jobj "status" "claimed")))))
+
+      ;; --- trial-evaluate argument validation ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests) (eval-client calls)
+          (declare (ignore get-requests))
+          (let ((trial (trial-open client "exp-1" "case-unbound")))
+            (setf (cdr calls) nil)
+            (check "an unbound conversation signals"
+                   (signals-condition-p (lambda () (trial-evaluate trial "ev-1"))
+                                        'sigil-validation-error))
+            (check "an unbound conversation issues no request" (null (cdr calls)))
+            (trial-bind-conversation trial "conv-1")
+            (check "a negative timeout signals"
+                   (signals-condition-p
+                    (lambda () (trial-evaluate trial "ev-1" :timeout-sec -1))
+                    'sigil-validation-error))
+            (check "a negative poll interval signals"
+                   (signals-condition-p
+                    (lambda () (trial-evaluate trial "ev-1" :poll-interval-sec -1))
+                    'sigil-validation-error))
+            (check "argument validation issues no request" (null (cdr calls))))))
+
+      ;; --- trial-evaluate sequences the conversation PATCH before the trigger ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (eval-client calls :evaluation-fn (evaluation-script
+                                               (evaluation-body "eval-1" "success")))
+          (declare (ignore get-requests))
+          (let ((trial (trial-open client "exp-1" "case-order")))
+            (trial-bind-conversation trial "conv-7")
+            (setf (cdr calls) nil)
+            (let ((evaluation (trial-evaluate trial "ev-1" :timeout-sec 0
+                                                           :poll-interval-sec 0)))
+              (check "a successful evaluation is returned"
+                     (equal (jget evaluation "status") "success"))
+              (let* ((ordered (reverse (cdr calls)))
+                     (patch (position-if (lambda (c) (eq (first c) :patch)) ordered))
+                     (trigger (position-if (lambda (c) (search ":evaluate" (second c)))
+                                           ordered)))
+                (check "the conversation is persisted before the trigger"
+                       (and patch trigger (< patch trigger)))
+                (check "the PATCH carries only the conversation id"
+                       (let ((posted (payload (nth patch ordered))))
+                         (and (equal (jget posted "conversation_id") "conv-7")
+                              (= (hash-table-count posted) 1)))))))))
+
+      ;; The deadline is checked before the sleep and never after, so an
+      ;; evaluation that finishes inside the last poll window still counts.
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (eval-client calls :evaluation-fn (evaluation-script
+                                               (evaluation-body "eval-1" "queued")
+                                               (evaluation-body "eval-1" "success")))
+          (declare (ignore get-requests))
+          (let ((trial (trial-open client "exp-1" "case-lastwindow")))
+            (trial-bind-conversation trial "conv-1")
+            (let ((evaluation (trial-evaluate trial "ev-1"
+                                              :timeout-sec 0.05
+                                              :poll-interval-sec 0.06)))
+              (check "an evaluation finishing inside the last window is not a timeout"
+                     (equal (jget evaluation "status") "success"))))))
+
+      ;; --- Worker failure ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (eval-client calls :evaluation-fn
+                         (evaluation-script (evaluation-body "eval-7" "failed"
+                                                             :error-detail "worker exploded")))
+          (declare (ignore get-requests))
+          (let ((trial (trial-open client "exp-1" "case-failed")))
+            (trial-bind-conversation trial "conv-1")
+            (let ((carried
+                    (handler-case (progn (trial-evaluate trial "ev-1" :timeout-sec 0
+                                                                      :poll-interval-sec 0)
+                                         nil)
+                      (sigil-trial-evaluation-failed-error (e)
+                        (list (sigil-trial-evaluation-error-id e)
+                              (sigil-trial-evaluation-error-detail e))))))
+              (check "a failed evaluation signals the failure condition" (and carried t))
+              (check "the failure carries the evaluation id and the detail"
+                     (equal carried (list "eval-7" "worker exploded")))))))
+
+      ;; --- A queued evaluation suppresses the run's score count ---
+      (let ((calls (cons :calls nil))
+            (captured nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :experimental-features t
+                              :http-fn (routed-http calls "exp-cloud"
+                                                    :evaluation-fn
+                                                    (evaluation-script
+                                                     (evaluation-body "eval-1" "success"))))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-cloud" :name "cloud eval"
+                                :print-url nil)
+            (setf captured run)
+            (let ((trial (experiment-run-open-trial run "case-1")))
+              (trial-bind-conversation trial "conv-1")
+              (trial-evaluate trial "ev-1" :timeout-sec 0 :poll-interval-sec 0)
+              (trial-close trial)))
+          (check "a queued evaluation marks the run cloud-evaluated"
+                 (sigil-cl::experiment-run-cloud-evaluated-p captured))
+          (let ((finalize (find-if (lambda (c) (search ":finalize" (second c)))
+                                   (cdr calls))))
+            (check "the run finalizes" (and finalize t))
+            (check "a cloud-evaluated run finalizes without score_count"
+                   (and finalize
+                        (null (nth-value 1 (gethash "score_count" (payload finalize)))))))))
+
+      ;; A wait that times out still leaves the run marked: the row exists and
+      ;; the backend will write its score.
+      (let ((calls (cons :calls nil))
+            (captured nil)
+            (timed-out nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :experimental-features t
+                              :http-fn (routed-http calls "exp-slow"
+                                                    :evaluation-fn
+                                                    (evaluation-script
+                                                     (evaluation-body "eval-5" "queued"))))
+          (declare (ignore get-requests))
+          (handler-case
+              (with-experiment (run client :run-id "exp-slow" :name "slow eval"
+                                    :print-url nil)
+                (setf captured run)
+                (let ((trial (experiment-run-open-trial run "case-1")))
+                  (trial-bind-conversation trial "conv-1")
+                  (trial-evaluate trial "ev-1" :timeout-sec 0 :poll-interval-sec 0)))
+            (sigil-trial-evaluation-timeout-error (e)
+              (setf timed-out (sigil-trial-evaluation-error-id e))))
+          (check "an expired deadline signals the timeout condition with the id"
+                 (equal timed-out "eval-5"))
+          (check "a timed-out wait still marks the run cloud-evaluated"
+                 (sigil-cl::experiment-run-cloud-evaluated-p captured))
+          (let ((finalize (find-if (lambda (c) (search ":finalize" (second c)))
+                                   (cdr calls))))
+            (check "the run finalized after the timeout omits score_count"
+                   (and finalize
+                        (null (nth-value 1 (gethash "score_count" (payload finalize))))))))))))
+
+(defun run-artifact-tests ()
+  (with-test-suite ("Trial artifacts")
+
+    ;; --- Kind inference ---
+    (dolist (case '(("image/png" . "image")
+                    ("image/jpeg" . "image")
+                    ("application/json" . "json")
+                    ("text/markdown" . "markdown")
+                    ("text/x-markdown" . "markdown")
+                    ("text/csv" . "csv")
+                    ("application/pdf" . "pdf")
+                    ("text/plain" . "text")
+                    ("text/html" . "text")
+                    ("APPLICATION/JSON" . "json")
+                    ("application/octet-stream" . "binary")
+                    ("" . "binary")))
+      (check (format nil "kind for ~s is ~a" (car case) (cdr case))
+             (equal (sigil-cl::%artifact-kind-from-mime (car case)) (cdr case))))
+
+    ;; --- Upload wire format ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((record (upload-trial-artifact client "exp-1" "trial:1"
+                                             :name "details" :kind "json"
+                                             :mime "application/json"
+                                             :content "{\"ok\":true}")))
+          (check "upload returns the artifact record"
+                 (equal (jget record "artifact_id") "art-1")))
+        (let ((call (first (cdr calls))))
+          (check "upload POSTs the artifacts route with the colon escaped"
+                 (and (eq (first call) :post)
+                      (equal (second call)
+                             (concatenate 'string
+                                          "https://sigil.example.test/api/v1/experiment-runs/exp-1"
+                                          "/trials/trial%3A1/artifacts:upload"
+                                          "?name=details&kind=json&mime=application%2Fjson"))))
+          (check "Content-Type comes from the MIME"
+                 (equal (call-header call "Content-Type") "application/json"))
+          (check "the body is the raw bytes, unmodified"
+                 (equalp (third call)
+                         (sigil-cl::string-to-utf8-octets "{\"ok\":true}"))))
+        ;; A blank MIME still emits mime= and falls back to octet-stream.
+        (setf (cdr calls) nil)
+        (upload-trial-artifact client "exp-1" "trial-1"
+                               :name "blob" :kind "binary"
+                               :content (sigil-cl::string-to-utf8-octets "raw"))
+        (let ((call (first (cdr calls))))
+          (check "a blank MIME still emits the mime query key"
+                 (search "&mime=" (second call)))
+          (check "Content-Type falls back to application/octet-stream"
+                 (equal (call-header call "Content-Type") "application/octet-stream")))
+
+        ;; --- Validation happens before any request ---
+        (dolist (case (list (list "a missing name" (list :kind "json" :content "x"))
+                            (list "a missing kind" (list :name "n" :content "x"))
+                            (list "empty content" (list :name "n" :kind "json" :content ""))
+                            (list "nil content" (list :name "n" :kind "json"))))
+          (destructuring-bind (label args) case
+            (setf (cdr calls) nil)
+            (check (format nil "~a signals" label)
+                   (signals-condition-p
+                    (lambda () (apply #'upload-trial-artifact client "exp-1" "trial-1" args))
+                    'sigil-validation-error))
+            (check (format nil "~a issues no request" label) (null (cdr calls)))))
+        (check "a blank trial id signals"
+               (signals-condition-p
+                (lambda () (upload-trial-artifact client "exp-1" "  "
+                                                  :name "n" :kind "json" :content "x"))
+                'sigil-validation-error))))
+
+    ;; --- Trial wrapper ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((trial (trial-open client "exp-1" "case-artifact")))
+          (setf (cdr calls) nil)
+          (trial-artifact trial :name "notes" :text "hello")
+          (let ((call (first (cdr calls))))
+            (check "text defaults to kind text and MIME text/plain"
+                   (search "name=notes&kind=text&mime=text%2Fplain" (second call)))
+            (check "text uploads as UTF-8 bytes"
+                   (equalp (third call) (sigil-cl::string-to-utf8-octets "hello"))))
+          (setf (cdr calls) nil)
+          (trial-artifact trial :name "payload" :mime "application/json"
+                                :content "{\"a\":1}")
+          (check "kind is inferred from the MIME when unset"
+                 (search "kind=json" (second (first (cdr calls)))))
+          (setf (cdr calls) nil)
+          (check "supplying no content source signals"
+                 (signals-condition-p (lambda () (trial-artifact trial :name "n"))
+                                      'sigil-validation-error))
+          (check "supplying two content sources signals"
+                 (signals-condition-p
+                  (lambda () (trial-artifact trial :name "n" :text "a" :content "b"))
+                  'sigil-validation-error))
+          (check "resolving the content source issues no request" (null (cdr calls)))
+          ;; A file source infers its MIME from the extension.
+          (let ((path (merge-pathnames "sigil-artifact-test.md"
+                                       (uiop:temporary-directory))))
+            (unwind-protect
+                 (progn
+                   (with-open-file (out path :direction :output :if-exists :supersede)
+                     (write-string "# title" out))
+                   (setf (cdr calls) nil)
+                   (trial-artifact trial :name "report" :path path)
+                   (let ((call (first (cdr calls))))
+                     (check "a .md path infers markdown kind and MIME"
+                            (search "name=report&kind=markdown&mime=text%2Fmarkdown"
+                                    (second call)))
+                     (check "a file uploads its bytes"
+                            (equalp (third call)
+                                    (sigil-cl::string-to-utf8-octets "# title")))))
+              (ignore-errors (delete-file path)))))))))
+
+(defun run-evaluator-tests ()
+  (with-test-suite ("Evaluators")
+
+    ;; --- Top-level object scanning ---
+    (let ((objects (sigil-cl::%top-level-json-objects
+                    "prose {\"score\":0.9,\"passed\":true} tail {\"nested\":{\"score\":0.1}}")))
+      (check "two top-level objects are collected" (= (length objects) 2))
+      (check "a nested object is never collected on its own"
+             (and (= (length objects) 2)
+                  (nth-value 1 (gethash "nested" (second objects)))
+                  (null (nth-value 1 (gethash "score" (second objects)))))))
+    (check "text with no object yields nothing"
+           (null (sigil-cl::%top-level-json-objects "no json at all")))
+    ;; An object that does not parse is stepped over one character at a time,
+    ;; so the scan recovers at the next brace instead of stopping.
+    (check "the scan recovers past an object that does not parse"
+           (equal 2 (length (sigil-cl::%top-level-json-objects
+                             "{\"broken\": {\"a\":1} tail {\"b\":2}"))))
+
+    ;; --- Judge response parsing ---
+    (multiple-value-bind (score passed explanation)
+        (sigil-cl::%parse-judge-response
+         "Here is my grade: {\"score\": 0.9, \"passed\": true, \"explanation\": \"good\"} Hope that helps."
+         0.5)
+      (check "a score wrapped in prose is read" (= score 0.9d0))
+      (check "the response's passed wins" passed)
+      (check "the explanation is read" (equal explanation "good")))
+    (multiple-value-bind (score) (sigil-cl::%parse-judge-response "{\"score\": 1.7}" 0.5)
+      (check "a score above 1 clamps to 1.0" (= score 1.0d0)))
+    (multiple-value-bind (score passed) (sigil-cl::%parse-judge-response "{\"score\": -0.2}" 0.5)
+      (check "a score below 0 clamps to 0.0" (= score 0.0d0))
+      (check "a clamped-to-zero score fails the default threshold" (null passed)))
+    (multiple-value-bind (score passed explanation)
+        (sigil-cl::%parse-judge-response
+         "{\"score\": 0.4, \"pass\": \"yes\", \"reason\": \"close enough\"}" 0.5)
+      (check "the pass alias overrides the threshold verdict"
+             (and (= score 0.4d0) passed))
+      (check "the reason alias is read as the explanation"
+             (equal explanation "close enough")))
+    (multiple-value-bind (score passed)
+        (sigil-cl::%parse-judge-response "{\"score\": \"0.8\"}" 0.5)
+      (check "a numeric string score parses" (= score 0.8d0))
+      (check "a string score still derives passed from the threshold" passed))
+    (check "the last object carrying a score wins"
+           (= 0.2d0 (sigil-cl::%parse-judge-response
+                     "{\"score\":0.9} then {\"score\":0.2}" 0.5)))
+    (check "an object with no score is skipped"
+           (= 0.9d0 (sigil-cl::%parse-judge-response
+                     "{\"score\":0.9} then {\"note\":\"thinking\"}" 0.5)))
+    (let ((no-object (handler-case
+                         (progn (sigil-cl::%parse-judge-response "nothing here" 0.5) nil)
+                       (sigil-error (e) (sigil-error-message e))))
+          (no-score (handler-case
+                        (progn (sigil-cl::%parse-judge-response "{\"note\":\"hi\"}" 0.5) nil)
+                      (sigil-error (e) (sigil-error-message e)))))
+      (check "unusable output signals" (and no-object no-score))
+      (check "no object and no score produce different messages"
+             (not (equal no-object no-score))))
+    ;; The last object is the judge's answer. A score it carries that will not
+    ;; parse has to signal, not fall through to the scratch work above it.
+    (check "a final score that does not parse signals"
+           (handler-case
+               (progn (sigil-cl::%parse-judge-response
+                       "{\"score\":0.2,\"explanation\":\"draft\"} {\"score\":\"N/A\"}" 0.5)
+                      nil)
+             (sigil-validation-error () t)))
+
+    ;; --- Numeric parsing of an untrusted score ---
+    (check "lenient numeric spellings parse"
+           (and (= 0.5d0 (sigil-cl::%parse-real "+0.5"))
+                (= 0.5d0 (sigil-cl::%parse-real ".5"))
+                (= 7.0d0 (sigil-cl::%parse-real "007"))
+                (= 1.0d300 (sigil-cl::%parse-real "1e300"))))
+    (check "a score that overflows a double is not a number"
+           (and (null (sigil-cl::%parse-real "1e309"))
+                (null (sigil-cl::%parse-real "1e400"))
+                (null (sigil-cl::%parse-real "-1e400"))))
+    (check "a score that underflows is zero"
+           (eql 0.0d0 (sigil-cl::%parse-real "9e-400")))
+    ;; The bound is checked before (EXPT 10 N), so this returns instead of
+    ;; building a ten-million-digit bignum. The timing is the assertion.
+    (let ((start (get-internal-real-time)))
+      (check "a wild exponent is rejected without shifting"
+             (null (sigil-cl::%parse-real "1e10000000")))
+      (check "rejecting a wild exponent is immediate"
+             (< (- (get-internal-real-time) start)
+                (* 5 internal-time-units-per-second))))
+    ;; Same shape one level down: every digit folds into a bignum, so a long
+    ;; run costs quadratic time even when the value it spells is small.
+    (let ((start (get-internal-real-time))
+          (run (make-string 300000 :initial-element #\7)))
+      (check "a wild digit run is rejected in the mantissa"
+             (and (null (sigil-cl::%parse-real run))
+                  (null (sigil-cl::%parse-real
+                         (concatenate 'string "0." run)))
+                  (null (sigil-cl::%parse-real
+                         (concatenate 'string "1e" run)))))
+      (check "rejecting a wild digit run is immediate"
+             (< (- (get-internal-real-time) start)
+                (* 5 internal-time-units-per-second))))
+    ;; "0.5" spends two digits, so this padding puts the number exactly on the
+    ;; bound, and one more digit puts it past.
+    (let ((pad (make-string (- sigil-cl::+max-judge-score-digits+ 2)
+                            :initial-element #\0)))
+      (check "a number on the digit bound still parses"
+             (= 0.5d0 (sigil-cl::%parse-real (concatenate 'string "0.5" pad))))
+      (check "one digit past the bound is not a number"
+             (null (sigil-cl::%parse-real (concatenate 'string "0.5" pad "0")))))
+
+    ;; --- Prompt rendering ---
+    (check "the default prompt ends with the JSON shape"
+           (search "{\"score\": <number from 0 to 1>, \"passed\": <boolean>, \"explanation\": \"<brief reason>\"}"
+                   sigil-cl::+default-llm-judge-prompt+))
+    (let ((rendered (sigil-cl::%render-judge-prompt "in={input} out={output} exp={expected}"
+                                                    "A" "B" "C")))
+      (check "placeholders are substituted" (equal rendered "in=A out=B exp=C")))
+    (let ((rendered (sigil-cl::%render-judge-prompt "{input}|{output}" "{output}" "B" "C")))
+      (check "a substituted value is not substituted again"
+             (equal rendered "{output}|B")))
+
+    ;; --- LLM judge ---
+    (let ((seen-prompt nil))
+      (let* ((judge (make-llm-judge
+                     :evaluator-id "judge-1"
+                     :model-name "gpt-4"
+                     :model-provider "openai"
+                     :invoke (lambda (prompt)
+                               (setf seen-prompt prompt)
+                               (values "{\"score\": 0.75, \"explanation\": \"ok\"}"
+                                       (make-token-usage :input 10 :output 4)))))
+             (result (evaluate-output judge (list :input "q" :output "a" :expected "b"))))
+        (check "the judge renders the prompt from the input"
+               (and (search "q" seen-prompt) (search "a" seen-prompt)
+                    (search "b" seen-prompt)))
+        (check "the judge defaults score key, version, and kind"
+               (and (equal (evaluation-result-score-key result) "final")
+                    (equal (evaluation-result-evaluator-version result) "1")
+                    (equal (evaluation-result-evaluator-kind result) "llm_judge")))
+        (check "the judge value is the clamped score"
+               (= (evaluation-result-value result) 0.75d0))
+        (check "passed comes from the default threshold"
+               (evaluation-result-passed result))
+        (check "the judge records the model in metadata"
+               (and (equal (jget (evaluation-result-metadata result) "judge_model") "gpt-4")
+                    (equal (jget (evaluation-result-metadata result) "judge_provider") "openai")))
+        (let ((grader (evaluation-result-grader result)))
+          (check "the grader carries the prompt and the reply"
+                 (and (equal (getf grader :input) seen-prompt)
+                      (equal (getf grader :output)
+                             "{\"score\": 0.75, \"explanation\": \"ok\"}")))
+          (check "the grader carries the judge's identity"
+                 (and (equal (getf grader :agent-name) "agento11y-llm-judge")
+                      (equal (getf grader :operation-name) "llm-judge")
+                      (equal (getf grader :model-name) "gpt-4")))
+          (check "the grader carries the reported usage"
+                 (= 10 (sigil-cl::token-usage-input-tokens (getf grader :usage)))))))
+    (let* ((judge (make-llm-judge :evaluator-id "judge-2" :model-name "m"
+                                  :threshold 0.9
+                                  :invoke (lambda (p) (declare (ignore p))
+                                            (values "{\"score\": 0.8}" nil))))
+           (result (evaluate-output judge (list :output "a"))))
+      (check "a custom threshold decides passed"
+             (null (evaluation-result-passed result))))
+    (let* ((judge (make-llm-judge :evaluator-id "judge-3" :model-name "m"
+                                  :threshold 0
+                                  :invoke (lambda (p) (declare (ignore p))
+                                            (values "{\"score\": 0}" nil))))
+           (result (evaluate-output judge (list :output "a"))))
+      (check "a zero threshold is honoured, not read as unset"
+             (evaluation-result-passed result)))
+    (let* ((judge (make-llm-judge :evaluator-id "judge-4" :model-name "m"
+                                  :parser (lambda (text)
+                                            (declare (ignore text))
+                                            (values 0.25d0 nil "custom"))
+                                  :invoke (lambda (p) (declare (ignore p))
+                                            (values "anything" nil))))
+           (result (evaluate-output judge (list :output "a"))))
+      (check "a supplied parser replaces the default one"
+             (and (= (evaluation-result-value result) 0.25d0)
+                  (equal (evaluation-result-explanation result) "custom"))))
+    (dolist (case (list (list "a blank evaluator id"
+                              (list :model-name "m" :invoke #'identity))
+                        (list "a missing invoke callback"
+                              (list :evaluator-id "e" :model-name "m"))
+                        (list "a blank model name"
+                              (list :evaluator-id "e" :invoke #'identity))
+                        (list "a threshold above 1"
+                              (list :evaluator-id "e" :model-name "m"
+                                    :invoke #'identity :threshold 1.5))
+                        (list "a negative threshold"
+                              (list :evaluator-id "e" :model-name "m"
+                                    :invoke #'identity :threshold -0.1))))
+      (destructuring-bind (label args) case
+        (check (format nil "~a signals" label)
+               (signals-condition-p (lambda () (apply #'make-llm-judge args))
+                                    'sigil-validation-error))))
+
+    ;; --- Regex judge ---
+    (let* ((judge (make-regex-judge :evaluator-id "rx-1" :pattern "he.lo"))
+           (result (evaluate-output judge (list :output "say hello there"))))
+      (check "a partial match passes" (evaluation-result-passed result))
+      (check "the regex judge value is the boolean"
+             (eq (evaluation-result-value result) t))
+      (check "the regex judge defaults score key, version, and kind"
+             (and (equal (evaluation-result-score-key result) "regex_match")
+                  (equal (evaluation-result-evaluator-version result) "1")
+                  (equal (evaluation-result-evaluator-kind result) "deterministic")))
+      (check "the regex judge reports the pattern in metadata"
+             (equal (jget (evaluation-result-metadata result) "pattern") "he.lo")))
+    (let ((judge (make-regex-judge :evaluator-id "rx-2" :pattern "hello" :full-match t)))
+      (check "full-match rejects a substring match"
+             (null (evaluation-result-passed
+                    (evaluate-output judge (list :output "say hello")))))
+      (check "full-match accepts a whole-string match"
+             (evaluation-result-passed
+              (evaluate-output judge (list :output "hello")))))
+    (let ((judge (make-regex-judge :evaluator-id "rx-3" :pattern "secret" :negate t)))
+      (check "negate passes when the pattern is absent"
+             (evaluation-result-passed (evaluate-output judge (list :output "clean"))))
+      (check "negate fails when the pattern is present"
+             (null (evaluation-result-passed
+                    (evaluate-output judge (list :output "a secret")))))
+      (check "negate explains the exclusion"
+             (search "excluded"
+                     (evaluation-result-explanation
+                      (evaluate-output judge (list :output "a secret"))))))
+    (check "case-insensitive matches across case"
+           (evaluation-result-passed
+            (evaluate-output (make-regex-judge :evaluator-id "rx-4" :pattern "hello"
+                                               :case-insensitive t)
+                             (list :output "HELLO"))))
+    (check "multiline anchors each line"
+           (evaluation-result-passed
+            (evaluate-output (make-regex-judge :evaluator-id "rx-5" :pattern "^second"
+                                               :multiline t)
+                             (list :output (format nil "first~%second")))))
+    (check "dot-all lets . cross a newline"
+           (evaluation-result-passed
+            (evaluate-output (make-regex-judge :evaluator-id "rx-6" :pattern "a.b"
+                                               :dot-all t)
+                             (list :output (format nil "a~%b")))))
+    (check "without dot-all a newline stops ."
+           (null (evaluation-result-passed
+                  (evaluate-output (make-regex-judge :evaluator-id "rx-7" :pattern "a.b")
+                                   (list :output (format nil "a~%b"))))))
+    (check "a caller explanation replaces the derived one"
+           (equal "custom"
+                  (evaluation-result-explanation
+                   (evaluate-output (make-regex-judge :evaluator-id "rx-8" :pattern "a"
+                                                      :explanation "custom")
+                                    (list :output "a")))))
+    (check "a blank pattern signals"
+           (signals-condition-p (lambda () (make-regex-judge :evaluator-id "rx" :pattern ""))
+                                'sigil-validation-error))
+    (check "an uncompilable pattern signals"
+           (signals-condition-p (lambda () (make-regex-judge :evaluator-id "rx" :pattern "([a-"))
+                                'sigil-validation-error))
+
+    ;; --- Recording an evaluation as a score ---
+    (let ((calls (cons :calls nil))
+          (graded-ids nil))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :traces-enabled nil
+                            :http-fn (routed-http calls "exp-judge"))
+        (declare (ignore get-requests))
+        (let* ((judge (make-llm-judge
+                       :evaluator-id "judge-1" :model-name "gpt-4"
+                       :invoke (lambda (p) (declare (ignore p))
+                                 (values "{\"score\": 0.8, \"explanation\": \"fine\"}" nil))))
+               (grader-base nil))
+          (with-experiment (run client :run-id "exp-judge" :name "judge run"
+                                :print-url nil)
+            (let ((trial (experiment-run-open-trial run "case-1")))
+              (trial-bind-conversation trial "conv-1")
+              ;; The generation the run produced and is being graded on.
+              (let ((rec (start-generation client :model-provider "openai"
+                                                  :model-name "gpt-4")))
+                (recorder-end rec))
+              (setf grader-base (sigil-cl::%grader-id-base run trial "final" "judge-1"))
+              (setf (cdr calls) nil)
+              (let ((result (evaluate-output judge (list :input "q" :output "a"))))
+                (trial-record-evaluation trial result))
+              (setf graded-ids (experiment-run-produced-generation-ids run))
+              (trial-close trial)))
+          (let* ((grader-generation-id (stable-id "gen" grader-base "grader"))
+                 (grader-conversation-id (stable-id "conv" grader-base "grader"))
+                 (ordered (reverse (cdr calls)))
+                 (score-call (find-if #'score-call-p ordered))
+                 (score (aref (jget (payload score-call) "scores") 0))
+                 (grader-post (find-if (lambda (c)
+                                         (and (search "generations:export" (second c))
+                                              (search grader-generation-id (third c))))
+                                       ordered)))
+            (check "the grader generation is exported" (and grader-post t))
+            (check "the graded score carries the grader ids"
+                   (and (equal (jget score "grader_generation_id") grader-generation-id)
+                        (equal (jget score "grader_conversation_id") grader-conversation-id)))
+            (check "the grader generation is not attributed to the run"
+                   (and (= (length graded-ids) 1)
+                        (not (member grader-generation-id graded-ids :test #'equal))))
+            (check "the graded score does not point at the grader generation"
+                   (not (equal (jget score "generation_id") grader-generation-id)))
+            (check "the score carries the judge's verdict"
+                   (and (equal (jget score "evaluator_id") "judge-1")
+                        (equal (jget score "score_key") "final")
+                        (jget score "passed")
+                        (equal (jget score "explanation") "fine")))
+            (check "the score value is the judge's number"
+                   (= (jget* score "value" "number") 0.8d0))
+            (check "the grader generation is exported before the score"
+                   (< (position grader-post ordered) (position score-call ordered)))))))
+
+    ;; --- Rescoring one trial with one evaluator ---
+    ;; The second grading mints its own score id, so it has to mint its own
+    ;; grader ids too; sharing them would overwrite the first judge call and
+    ;; leave the first score pointing at the second one's prompt.
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :traces-enabled nil
+                            :http-fn (routed-http calls "exp-rescore"))
+        (declare (ignore get-requests))
+        (let* ((replies (list "{\"score\": 0.2, \"explanation\": \"first\"}"
+                              "{\"score\": 0.9, \"explanation\": \"second\"}"))
+               (judge (make-llm-judge
+                       :evaluator-id "judge-1" :model-name "gpt-4"
+                       :invoke (lambda (p) (declare (ignore p))
+                                 (values (pop replies) nil)))))
+          (with-experiment (run client :run-id "exp-rescore" :name "rescore"
+                                :print-url nil)
+            (let ((trial (experiment-run-open-trial run "case-1")))
+              (trial-bind-conversation trial "conv-1")
+              (setf (cdr calls) nil)
+              (trial-record-evaluation trial (evaluate-output judge (list :output "a")))
+              (trial-record-evaluation trial (evaluate-output judge (list :output "a")))
+              (trial-close trial))))
+        (let* ((ordered (reverse (cdr calls)))
+               (score-call (find-if #'score-call-p ordered))
+               (scores (jget (payload score-call) "scores"))
+               (first-score (aref scores 0))
+               (second-score (aref scores 1))
+               (grader-posts (remove-if-not
+                              (lambda (c) (search "generations:export" (second c)))
+                              ordered)))
+          (check "a rescore exports two grader generations"
+                 (= (length grader-posts) 2))
+          (check "a rescore mints two score ids"
+                 (and (= (length scores) 2)
+                      (not (equal (jget first-score "score_id")
+                                  (jget second-score "score_id")))))
+          (check "a rescore mints two grader generation ids"
+                 (not (equal (jget first-score "grader_generation_id")
+                             (jget second-score "grader_generation_id"))))
+          (check "a rescore mints two grader conversation ids"
+                 (not (equal (jget first-score "grader_conversation_id")
+                             (jget second-score "grader_conversation_id"))))
+          (check "each score names a grader generation that was exported"
+                 (every (lambda (score)
+                          (find-if (lambda (c)
+                                     (search (jget score "grader_generation_id")
+                                             (third c)))
+                                   grader-posts))
+                        (list first-score second-score))))))
+
+    ;; --- Suppressing the grader generation ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :traces-enabled nil
+                            :http-fn (routed-http calls "exp-nograder"))
+        (declare (ignore get-requests))
+        (let ((judge (make-llm-judge
+                      :evaluator-id "judge-1" :model-name "gpt-4"
+                      :invoke (lambda (p) (declare (ignore p))
+                                (values "{\"score\": 0.8}" nil)))))
+          (with-experiment (run client :run-id "exp-nograder" :name "no grader"
+                                :print-url nil)
+            (let ((trial (experiment-run-open-trial run "case-1")))
+              (trial-bind-conversation trial "conv-1")
+              (setf (cdr calls) nil)
+              (trial-record-evaluation trial
+                                       (evaluate-output judge (list :output "a"))
+                                       :publish-grader nil)
+              (trial-close trial)))
+          (let* ((score-call (find-if #'score-call-p (reverse (cdr calls))))
+                 (score (aref (jget (payload score-call) "scores") 0)))
+            (check ":publish-grader nil omits the grader ids"
+                   (and (null (nth-value 1 (gethash "grader_generation_id" score)))
+                        (null (nth-value 1 (gethash "grader_conversation_id" score)))))
+            (check ":publish-grader nil records no grader generation"
+                   (notany (lambda (c) (search "generations:export" (second c)))
+                           (cdr calls)))))))
+
+    ;; --- Score key override ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-key"))
+        (declare (ignore get-requests))
+        (let ((judge (make-regex-judge :evaluator-id "rx-1" :pattern "a")))
+          (with-experiment (run client :run-id "exp-key" :name "key" :print-url nil)
+            (let ((trial (experiment-run-open-trial run "case-1")))
+              (setf (cdr calls) nil)
+              (trial-record-evaluation trial
+                                       (evaluate-output judge (list :output "a"))
+                                       :score-key "rubric"
+                                       :metadata '(("note" . "extra")))
+              (trial-close trial)))
+          (let* ((score-call (find-if #'score-call-p (reverse (cdr calls))))
+                 (score (aref (jget (payload score-call) "scores") 0)))
+            (check "an explicit score key wins over the evaluator's"
+                   (equal (jget score "score_key") "rubric"))
+            (check "a boolean verdict serializes as a bool value"
+                   (eq (jget* score "value" "bool") t))
+            (check "the evaluator metadata and the caller metadata both land"
+                   (and (equal (jget* score "metadata" "pattern") "a")
+                        (equal (jget* score "metadata" "note") "extra")))))))))
+
 (defun run-suite-tests ()
   (with-test-suite ("Suites")
 
@@ -5576,6 +6447,9 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                            #'run-normalize-tests
                            #'run-experiment-tests
                            #'run-trial-tests
+                           #'run-trial-evaluation-tests
+                           #'run-artifact-tests
+                           #'run-evaluator-tests
                            #'run-suite-tests
                            #'run-conversations-tests
                            #'run-metrics-tests

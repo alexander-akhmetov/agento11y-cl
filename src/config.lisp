@@ -79,6 +79,12 @@
    (extra-headers :initarg :extra-headers :reader config-extra-headers :initform nil)
    ;; Debug flag (surfaced via SIGIL_DEBUG env var)
    (debug :initarg :debug :reader config-debug :initform nil)
+   ;; Opt-in switch for features that are not stable yet. A slot rather than a
+   ;; process-env read per call, so a caller and a test can both flip it without
+   ;; touching the environment. Env resolution fills it from
+   ;; SIGIL_ENABLE_EXPERIMENTAL_FEATURES.
+   (experimental-features :initarg :experimental-features
+                          :reader config-experimental-features :initform nil)
    ;; Callbacks
    (log-fn     :initarg :log-fn     :reader config-log-fn     :initform nil)
    (metrics-fn :initarg :metrics-fn :reader config-metrics-fn :initform nil)
@@ -112,6 +118,16 @@ NIL path or actor."
                           +default-embedding-max-input-items+)
 (%define-defaulted-reader config-embedding-max-text-length embedding-max-text-length
                           +default-embedding-max-text-length+)
+
+(defparameter +experimental-features-env-var+ "SIGIL_ENABLE_EXPERIMENTAL_FEATURES")
+
+(defun %require-experimental (config feature)
+  "Signal unless the experimental gate is set. FEATURE names the blocked call.
+An experimental feature can change or be removed in any release."
+  (unless (config-experimental-features config)
+    (error 'sigil-experimental-disabled-error
+           :message (format nil "~a is experimental; set ~a=true to use it"
+                            feature +experimental-features-env-var+))))
 
 (defun effective-trace-queue-max (config)
   "Return trace queue max, falling back to queue-max."

@@ -27,6 +27,9 @@
                (:file "suite")
                (:file "trial")
                (:file "macros")
+               ;; Before "experiment": TRIAL-RECORD-EVALUATION reads the
+               ;; EVALUATION-RESULT accessors defined here.
+               (:file "evaluators")
                (:file "experiment")
                (:file "conversations")
                (:file "normalize")))
