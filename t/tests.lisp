@@ -547,6 +547,12 @@ the cdr of CALLS-PLACE as (method url content), newest first."
       (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "0")))))
         (check "SIGIL_REDACT_SECRETS=0 -> nil"
                (null (sigil-cl::config-redact-secrets cfg))))
+      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "t")))))
+        (check "SIGIL_REDACT_SECRETS=t -> t"
+               (sigil-cl::config-redact-secrets cfg)))
+      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "NIL")))))
+        (check "SIGIL_REDACT_SECRETS=NIL -> nil"
+               (null (sigil-cl::config-redact-secrets cfg))))
 
       ;; --- SIGIL_REDACT_INPUT_MESSAGES ---
       (let ((cfg (resolve '(("SIGIL_REDACT_INPUT_MESSAGES" . "yes")))))
@@ -555,16 +561,21 @@ the cdr of CALLS-PLACE as (method url content), newest first."
 
       ;; --- Invalid SIGIL_REDACT_INPUT_MESSAGES warns and stays disabled ---
       (let* ((warns 0)
+             (messages nil)
              (cfg (sigil-cl::resolve-config-from-env
                    (make-config :log-fn (lambda (l c m &rest kvs)
-                                          (declare (ignore c m kvs))
-                                          (when (eq l :warn) (incf warns))))
+                                          (declare (ignore c kvs))
+                                          (when (eq l :warn)
+                                            (incf warns)
+                                            (push m messages))))
                    :env-fn (env-from-alist
-                            '(("SIGIL_REDACT_INPUT_MESSAGES" . "garbage"))))))
+                            '(("SIGIL_REDACT_INPUT_MESSAGES" . "glc_notabool"))))))
         (check "bad SIGIL_REDACT_INPUT_MESSAGES stays disabled"
                (null (sigil-cl::config-redact-input-messages cfg)))
         (check "bad SIGIL_REDACT_INPUT_MESSAGES warns"
-               (>= warns 1)))
+               (>= warns 1))
+        (check "bad SIGIL_REDACT_INPUT_MESSAGES warning omits the value"
+               (notany (lambda (m) (search "glc_notabool" m)) messages)))
 
       ;; --- SIGIL_PROTOCOL warning when non-http ---
       (let* ((warns 0)

@@ -29,16 +29,18 @@ falsy strings to NIL. Unknown values return NIL."
         (t nil)))))
 
 (defun parse-strict-bool (s config var-name)
-  "Strictly map a bool env value: 1/true/yes/on -> T, 0/false/no/off -> NIL
+  "Strictly map a bool env value: 1/true/yes/on/t -> T, 0/false/no/off/nil -> NIL
 (case-insensitive). Any other value logs a warning via sigil-log and returns
-:invalid so a typo can't silently flip behavior."
+:invalid so a typo can't silently flip behavior. The warning never includes the
+value: these vars gate redaction, and a value pasted there by mistake could be a
+secret."
   (let ((normalized (string-downcase (%trim s))))
     (cond
-      ((member normalized '("1" "true" "yes" "on") :test #'string=) t)
-      ((member normalized '("0" "false" "no" "off") :test #'string=) nil)
+      ((member normalized '("1" "true" "yes" "on" "t") :test #'string=) t)
+      ((member normalized '("0" "false" "no" "off" "nil") :test #'string=) nil)
       (t
        (sigil-log config :warn "env"
-                  (format nil "ignoring ~a=~a (unsupported value)" var-name s))
+                  (format nil "ignoring ~a (unsupported value)" var-name))
        :invalid))))
 
 (defun parse-csv-kv (s)

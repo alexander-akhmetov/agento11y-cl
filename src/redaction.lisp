@@ -82,7 +82,8 @@ Used for assistant text and reasoning."
   "Full redaction: tier-1 (and optional email) plus the tier-2 env-value
 heuristic. Used for tool-call input, tool results, and system prompts."
   (let ((s (%apply-tier1 redactor text)))
-    (cl-ppcre:regex-replace-all (cdr +tier2-pattern+) s "\\1[REDACTED:env-secret-value]")))
+    (cl-ppcre:regex-replace-all (cdr +tier2-pattern+) s
+                                (format nil "\\1[REDACTED:~a]" (car +tier2-pattern+)))))
 
 (defun apply-secret-redaction (redactor mode text)
   "Redact TEXT according to MODE (:none, :light, or :full).
