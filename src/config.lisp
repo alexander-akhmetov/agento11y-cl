@@ -48,6 +48,15 @@
    ;; Content capture
    (content-capture-mode :initarg :content-capture-mode :reader config-content-capture-mode
                          :initform :metadata-only)
+   ;; Embedding input text capture. Opt-in, and additionally gated by
+   ;; content-capture-mode: only :full and :no-tool-content keep the texts.
+   ;; The two limits hold NIL until a caller sets them; the readers below apply
+   ;; the defaults. Programmatic only, matching the Go, Python, and JavaScript
+   ;; SDKs, which read no environment variable for these.
+   (embedding-capture-input :initarg :embedding-capture-input
+                            :reader config-embedding-capture-input :initform nil)
+   (embedding-max-input-items :initarg :embedding-max-input-items :initform nil)
+   (embedding-max-text-length :initarg :embedding-max-text-length :initform nil)
    ;; Service identity (OTel resource attributes)
    (service-name    :initarg :service-name    :reader config-service-name    :initform "unknown")
    (service-version :initarg :service-version :reader config-service-version :initform nil)
@@ -70,6 +79,8 @@
 (defparameter +default-eval-path-prefix+ "/api/v1")
 (defparameter +default-scores-export-path+ "/api/v1/scores:export")
 (defparameter +default-ingest-actor+ "ingest:sdk/lisp")
+(defparameter +default-embedding-max-input-items+ 20)
+(defparameter +default-embedding-max-text-length+ 1024)
 
 (defmacro %define-defaulted-reader (name slot default)
   "Define reader NAME returning SLOT, or DEFAULT when SLOT is NIL, plus a
@@ -88,6 +99,10 @@ NIL path or actor."
                           +default-scores-export-path+)
 (%define-defaulted-reader config-ingest-actor ingest-actor
                           +default-ingest-actor+)
+(%define-defaulted-reader config-embedding-max-input-items embedding-max-input-items
+                          +default-embedding-max-input-items+)
+(%define-defaulted-reader config-embedding-max-text-length embedding-max-text-length
+                          +default-embedding-max-text-length+)
 
 (defun effective-trace-queue-max (config)
   "Return trace queue max, falling back to queue-max."

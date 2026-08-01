@@ -6,6 +6,9 @@
                                (workflow-steps-enabled nil)
                                (metrics-enabled nil)
                                (capture :metadata-only)
+                               embedding-capture-input
+                               embedding-max-input-items
+                               embedding-max-text-length
                                (generation-endpoint "http://test-sigil:4318/api/v1/generations:export")
                                eval-endpoint
                                (eval-path-prefix "/api/v1")
@@ -41,6 +44,9 @@
        :metrics-endpoint metrics-endpoint
        :metrics-enabled metrics-enabled
        :content-capture-mode capture
+       :embedding-capture-input embedding-capture-input
+       :embedding-max-input-items embedding-max-input-items
+       :embedding-max-text-length embedding-max-text-length
        :service-name "test-service"
        :service-version "1.0.0"
        :auth-mode auth-mode
@@ -1087,7 +1093,146 @@ the cdr of CALLS-PLACE as (method url content), newest first."
           (let ((span (first (sigil-cl::queue-drain-all
                               (sigil-cl::client-trace-queue client)))))
             (check "embedding success span: no error.category"
-                   (null (span-attr span "error.category")))))))))
+                   (null (span-attr span "error.category")))))))
+
+    ;; Embedding input text capture and request/response parity attributes
+    (labels ((attr-value (span key)
+               (let ((found nil))
+                 (loop for a across (jget span "attributes")
+                       when (equal (jget a "key") key)
+                         do (setf found (jget a "value")))
+                 found))
+             (string-attr (span key)
+               (let ((value (attr-value span key)))
+                 (and value (jget value "stringValue"))))
+             (int-attr (span key)
+               (let ((value (attr-value span key)))
+                 (and value (jget value "intValue"))))
+             (array-attr (span key)
+               (let ((value (attr-value span key)))
+                 (when value
+                   (map 'list (lambda (item) (jget item "stringValue"))
+                        (jget* value "arrayValue" "values")))))
+             (has-attr-p (span key) (and (attr-value span key) t))
+             (input-texts (span) (array-attr span "gen_ai.embeddings.input_texts"))
+             (embedding-span (&key (capture :full) capture-input max-items max-length
+                                   source encoding-format request-dimensions
+                                   dimensions response-model input-texts)
+               (multiple-value-bind (client get-requests)
+                   (make-test-client :generation-enabled nil
+                                     :capture capture
+                                     :embedding-capture-input capture-input
+                                     :embedding-max-input-items max-items
+                                     :embedding-max-text-length max-length)
+                 (declare (ignore get-requests))
+                 (let ((rec (start-embedding client
+                              :model-provider "openai"
+                              :model-name "text-embedding-3-small"
+                              :source source
+                              :dimensions request-dimensions
+                              :encoding-format encoding-format)))
+                   (set-result rec :input-count 2 :input-tokens 10
+                                   :dimensions dimensions
+                                   :response-model response-model
+                                   :input-texts input-texts
+                                   :duration-seconds 0.1d0)
+                   (recorder-end rec)
+                   (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-trace-queue client)))))))
+
+      ;; Capture gating
+      (check "embedding input_texts absent when capture disabled"
+             (null (input-texts (embedding-span :input-texts '("alpha" "beta")))))
+      (check "embedding input_texts present in :full mode"
+             (equal (input-texts (embedding-span :capture-input t
+                                                 :input-texts '("alpha" "beta")))
+                    '("alpha" "beta")))
+      (check "embedding input_texts present in :no-tool-content mode"
+             (equal (input-texts (embedding-span :capture :no-tool-content
+                                                 :capture-input t
+                                                 :input-texts '("alpha")))
+                    '("alpha")))
+      (check "embedding input_texts absent in :metadata-only mode"
+             (null (input-texts (embedding-span :capture :metadata-only
+                                                :capture-input t
+                                                :input-texts '("alpha")))))
+      (check "embedding input_texts absent in :metadata-with-system-prompt mode"
+             (null (input-texts (embedding-span :capture :metadata-with-system-prompt
+                                                :capture-input t
+                                                :input-texts '("alpha")))))
+      (check "embedding input_texts absent when result supplies none"
+             (null (input-texts (embedding-span :capture-input t :input-texts nil))))
+
+      ;; Bounds
+      (check "embedding input_texts honours explicit limits and keeps order"
+             (equal (input-texts (embedding-span :capture-input t
+                                                 :max-items 2 :max-length 5
+                                                 :input-texts '("abcdef" "gh" "ignored")))
+                    '("ab..." "gh")))
+      (let* ((long (make-string 2000 :initial-element #\a))
+             (texts (cons long (loop for i from 1 below 21
+                                     collect (format nil "text-~d" i)))))
+        (check "embedding input_texts fixture has 21 entries" (= (length texts) 21))
+        (dolist (limits '((nil nil "unset") (0 -5 "non-positive")))
+          (destructuring-bind (items length label) limits
+            (let ((captured (input-texts (embedding-span :capture-input t
+                                                         :max-items items
+                                                         :max-length length
+                                                         :input-texts texts))))
+              (check (format nil "embedding input_texts ~a limits keep 20 entries" label)
+                     (= (length captured) 20))
+              (check (format nil "embedding input_texts ~a limits cap length at 1024" label)
+                     (every (lambda (text) (<= (length text) 1024)) captured))
+              (check (format nil "embedding input_texts ~a limits mark truncation" label)
+                     (let ((first-text (first captured)))
+                       (and (= (length first-text) 1024)
+                            (string= "..." (subseq first-text 1021)))))
+              (check (format nil "embedding input_texts ~a limits keep the first entries" label)
+                     (equal (second captured) "text-1"))))))
+      (check "embedding input_texts cut hard when max length is 3"
+             (equal (input-texts (embedding-span :capture-input t :max-length 3
+                                                 :input-texts '("abcdef")))
+                    '("abc")))
+      (check "embedding input_texts truncate by character, not byte"
+             (equal (input-texts (embedding-span :capture-input t :max-length 4
+                                                 :input-texts '("ééééé")))
+                    '("é...")))
+      (check "embedding input_texts accept a vector and skip non-strings"
+             (equal (input-texts (embedding-span :capture-input t
+                                                 :input-texts (vector "alpha" nil 7 "beta")))
+                    '("alpha" "beta")))
+
+      ;; Request and response parity attributes
+      (check "embedding request.encoding_formats is a single-element array"
+             (equal (array-attr (embedding-span :encoding-format "base64")
+                                "gen_ai.request.encoding_formats")
+                    '("base64")))
+      (check "embedding request.encoding_formats omitted when blank"
+             (not (has-attr-p (embedding-span :encoding-format "   ")
+                              "gen_ai.request.encoding_formats")))
+      (check "embedding response.model emitted"
+             (equal (string-attr (embedding-span :response-model "text-embedding-3-small")
+                                 "gen_ai.response.model")
+                    "text-embedding-3-small"))
+      (check "embedding response.model omitted when blank"
+             (not (has-attr-p (embedding-span :response-model "  ")
+                              "gen_ai.response.model")))
+      (check "embedding dimension.count falls back to request dimensions"
+             (equal (int-attr (embedding-span :request-dimensions 1536)
+                              "gen_ai.embeddings.dimension.count")
+                    "1536"))
+      (check "embedding dimension.count uses result dimensions"
+             (equal (int-attr (embedding-span :dimensions 3072)
+                              "gen_ai.embeddings.dimension.count")
+                    "3072"))
+      (check "embedding result dimensions win over request dimensions"
+             (equal (int-attr (embedding-span :request-dimensions 1536 :dimensions 3072)
+                              "gen_ai.embeddings.dimension.count")
+                    "3072"))
+      (check "embedding source attribute preserved"
+             (equal (string-attr (embedding-span :source "openai")
+                                 "sigil.embeddings.source")
+                    "openai")))))
 
 (defun run-workflow-step-tests ()
   (with-test-suite ("WorkflowStep")
