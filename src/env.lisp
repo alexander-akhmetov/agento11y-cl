@@ -28,6 +28,21 @@ falsy strings to NIL. Unknown values return NIL."
         ((member lower '("1" "true" "yes" "on" "t") :test #'string=) t)
         (t nil)))))
 
+(defun parse-strict-bool (s config var-name)
+  "Strictly map a bool env value: 1/true/yes/on/t -> T, 0/false/no/off/nil -> NIL
+(case-insensitive). Any other value logs a warning via sigil-log and returns
+:invalid so a typo can't silently flip behavior. The warning never includes the
+value: these vars gate redaction, and a value pasted there by mistake could be a
+secret."
+  (let ((normalized (string-downcase (%trim s))))
+    (cond
+      ((member normalized '("1" "true" "yes" "on" "t") :test #'string=) t)
+      ((member normalized '("0" "false" "no" "off" "nil") :test #'string=) nil)
+      (t
+       (sigil-log config :warn "env"
+                  (format nil "ignoring ~a (unsupported value)" var-name))
+       :invalid))))
+
 (defun parse-csv-kv (s)
   "Parse \"k=v,k2=v2\" into an alist. Trims whitespace around keys/values.
 Skips empty entries and entries with no '='. Returns a fresh list in source order."
@@ -123,16 +138,20 @@ Recognized variables:
   SIGIL_EXPERIMENT_URL_TEMPLATE, SIGIL_HEADERS, SIGIL_AUTH_MODE,
   SIGIL_AUTH_TENANT_ID, SIGIL_AUTH_TOKEN, SIGIL_AGENT_NAME,
   SIGIL_AGENT_VERSION, SIGIL_USER_ID, SIGIL_TAGS,
-  SIGIL_CONTENT_CAPTURE_MODE, SIGIL_DEBUG.
+  SIGIL_CONTENT_CAPTURE_MODE, SIGIL_REDACT_SECRETS,
+  SIGIL_REDACT_INPUT_MESSAGES, SIGIL_DEBUG.
 
 SIGIL_PROTOCOL is not supported (sigil-cl is HTTP-only); a warning is logged
 when set to anything other than http/https. SIGIL_INSECURE is a no-op since
 TLS is controlled by the URL scheme.
 
-Note: an explicit caller value of :none for :auth-mode or :metadata-only for
-:content-capture-mode is indistinguishable from the slot's schema default and
-WILL be overridden by env. Callers that need to enforce these defaults
-against deployment env must either set the matching SIGIL_* var or unset it.
+Note: an explicit caller value that equals the slot's schema default is
+indistinguishable from \"unset\" and WILL be overridden by env. This applies to
+:none for :auth-mode, :metadata-only for :content-capture-mode, and nil for
+:redact-secrets / :redact-input-messages. For the redaction flags the asymmetry
+fails safe: env can only turn redaction on when the caller did not ask for it.
+Callers that need to enforce these defaults against deployment env must either
+set the matching SIGIL_* var or unset it.
 :eval-path-prefix and :ingest-actor do not have that problem: their slots hold
 NIL until a caller sets them, so an explicit value equal to the default still
 wins over env."
@@ -151,6 +170,8 @@ wins over env."
          (user      (env-trimmed env-fn "SIGIL_USER_ID"))
          (tags      (env-trimmed env-fn "SIGIL_TAGS"))
          (capture   (env-trimmed env-fn "SIGIL_CONTENT_CAPTURE_MODE"))
+         (redact-secrets (env-trimmed env-fn "SIGIL_REDACT_SECRETS"))
+         (redact-inputs  (env-trimmed env-fn "SIGIL_REDACT_INPUT_MESSAGES"))
          (debug     (env-trimmed env-fn "SIGIL_DEBUG"))
          (protocol  (env-trimmed env-fn "SIGIL_PROTOCOL")))
     ;; Warn when SIGIL_PROTOCOL is set to something we don't support.
@@ -195,6 +216,16 @@ wins over env."
           (let ((parsed (parse-content-capture-mode capture config)))
             (unless (eq parsed :invalid)
               (override :content-capture-mode parsed))))
+        ;; Secret redaction master enable (sigil-cl extension).
+        (when (and redact-secrets (null (config-redact-secrets config)))
+          (let ((parsed (parse-strict-bool redact-secrets config "SIGIL_REDACT_SECRETS")))
+            (unless (eq parsed :invalid)
+              (override :redact-secrets parsed))))
+        ;; Input-message redaction gating. Name kept aligned with the Python SDK env var.
+        (when (and redact-inputs (null (config-redact-input-messages config)))
+          (let ((parsed (parse-strict-bool redact-inputs config "SIGIL_REDACT_INPUT_MESSAGES")))
+            (unless (eq parsed :invalid)
+              (override :redact-input-messages parsed))))
         ;; Agent identity.
         (when (and agent (null (config-agent-name config)))
           (override :agent-name agent))

@@ -90,64 +90,100 @@ Only :full keeps tool span content; :no-tool-content, :metadata-with-system-prom
 and :metadata-only redact it."
   (eq mode :full))
 
+;;; --- Secret redaction strength per message ---
+
+(defun message-secret-mode (role input-p redact-inputs)
+  "Secret-redaction strength for a message: :full, :light, or :none.
+Output messages always redact (assistant=light, tool=full). Input messages
+redact only when REDACT-INPUTS is true (user=full, assistant=light, tool=full)."
+  (if input-p
+      (if redact-inputs
+          (case role (:user :full) (:assistant :light) (:tool :full) (t :none))
+          :none)
+      (case role (:assistant :light) (:tool :full) (t :none))))
+
+(defun data-url-p (url)
+  "True when URL is a data: URL."
+  (and (stringp url)
+       (>= (length url) 5)
+       (string-equal "data:" url :end2 5)))
+
 ;;; --- Message serialization ---
 
-(defun serialize-part (part capture-mode)
-  "Serialize a message part to JSON hash-table. Respects capture mode."
+(defun serialize-part (part capture-mode &key redactor secret-mode)
+  "Serialize a message part to JSON hash-table. Respects capture mode.
+When REDACTOR is non-nil, content that survives capture-mode blanking is
+scanned for secrets with strength SECRET-MODE (:full, :light, or :none)."
   (let ((redact (or (eq capture-mode :metadata-only)
-                    (eq capture-mode :metadata-with-system-prompt))))
-    (typecase part
-      (text-part
-       (jobj "text" (if redact "" (text-part-text part))))
-      (thinking-part
-       (unless redact
-         (jobj "thinking" (thinking-part-text part)
-               "metadata" (jobj "provider_type" "thinking"))))
-      (tool-call-part
-       (jobj "tool_call"
-             (jobj "id" (tool-call-part-id part)
-                   "name" (tool-call-part-name part)
-                   "input_json" (if redact ""
-                                    (cl-base64:string-to-base64-string
-                                     (or (tool-call-part-input-json part) ""))))
-             "metadata" (jobj "provider_type" "tool_use")))
-      (tool-result-part
-       (let ((tr (jobj "tool_call_id" (tool-result-part-tool-call-id part)
-                       "content" (if redact "" (tool-result-part-content part))
-                       "is_error" (if (tool-result-part-is-error part) t nil))))
-         (when (tool-result-part-name part)
-           (setf (gethash "name" tr) (tool-result-part-name part)))
-         (when (and (not redact) (tool-result-part-content part))
-           (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return)
-                                       (tool-result-part-content part))))
-             (when (and (plusp (length trimmed))
-                        (or (char= (char trimmed 0) #\{)
-                            (char= (char trimmed 0) #\[)))
-               (handler-case
-                   (let ((parsed (jzon:parse trimmed)))
-                     (when (or (hash-table-p parsed) (vectorp parsed))
-                       (setf (gethash "content_json" tr)
-                             (cl-base64:string-to-base64-string trimmed))))
-                 (error () nil)))))
-         (jobj "tool_result" tr
-               "metadata" (jobj "provider_type" "tool_result"))))
-      (media-part
-       ;; Redaction clears only the URL, which can carry the bytes inline as a
-       ;; data: URI. kind, mime_type, and name survive.
-       (let ((obj (jobj "media"
-                        (jobj "kind" (media-part-kind part)
-                              "url" (if redact "" (media-part-url part))
-                              "mime_type" (media-part-mime-type part)
-                              "name" (media-part-name part))))
-             (provider-type (media-part-provider-type part)))
-         (when (and (stringp provider-type) (plusp (length provider-type)))
-           (setf (gethash "metadata" obj) (jobj "provider_type" provider-type)))
-         obj))
-      (t nil))))
+                    (eq capture-mode :metadata-with-system-prompt)))
+        (smode (or secret-mode :none)))
+    ;; STRENGTH is a part's intrinsic redaction strength; a message-level :none
+    ;; clamps every part to :none regardless.
+    (flet ((scrub (text strength)
+             (apply-secret-redaction redactor (if (eq smode :none) :none strength) text)))
+      (typecase part
+        (text-part
+         (jobj "text" (if redact "" (scrub (text-part-text part) smode))))
+        (thinking-part
+         (unless redact
+           (jobj "thinking" (scrub (thinking-part-text part) :light)
+                 "metadata" (jobj "provider_type" "thinking"))))
+        (tool-call-part
+         (jobj "tool_call"
+               (jobj "id" (tool-call-part-id part)
+                     "name" (tool-call-part-name part)
+                     "input_json" (if redact ""
+                                      (cl-base64:string-to-base64-string
+                                       (scrub (or (tool-call-part-input-json part) "")
+                                              :full))))
+               "metadata" (jobj "provider_type" "tool_use")))
+        (tool-result-part
+         (let ((tr (jobj "tool_call_id" (tool-result-part-tool-call-id part)
+                         "content" (if redact ""
+                                       (scrub (tool-result-part-content part) :full))
+                         "is_error" (if (tool-result-part-is-error part) t nil))))
+           (when (tool-result-part-name part)
+             (setf (gethash "name" tr) (tool-result-part-name part)))
+           (when (and (not redact) (tool-result-part-content part))
+             (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                         (tool-result-part-content part))))
+               (when (and (plusp (length trimmed))
+                          (or (char= (char trimmed 0) #\{)
+                              (char= (char trimmed 0) #\[)))
+                 (handler-case
+                     (let ((parsed (jzon:parse trimmed)))
+                       (when (or (hash-table-p parsed) (vectorp parsed))
+                         (setf (gethash "content_json" tr)
+                               (cl-base64:string-to-base64-string
+                                (scrub trimmed :full)))))
+                   (error () nil)))))
+           (jobj "tool_result" tr
+                 "metadata" (jobj "provider_type" "tool_result"))))
+        (media-part
+         ;; Redaction clears only the URL, which can carry the bytes inline as a
+         ;; data: URI. kind, mime_type, and name survive.
+         ;; Secret scanning skips data: URIs: the payload is base64, so patterns
+         ;; cannot match it and scanning a large blob costs real time.
+         (let* ((url (media-part-url part))
+                (obj (jobj "media"
+                           (jobj "kind" (media-part-kind part)
+                                 "url" (cond (redact "")
+                                             ((data-url-p url) url)
+                                             (t (scrub url :full)))
+                                 "mime_type" (media-part-mime-type part)
+                                 "name" (media-part-name part))))
+                (provider-type (media-part-provider-type part)))
+           (when (and (stringp provider-type) (plusp (length provider-type)))
+             (setf (gethash "metadata" obj) (jobj "provider_type" provider-type)))
+           obj))
+        (t nil)))))
 
-(defun serialize-message (msg capture-mode)
+(defun serialize-message (msg capture-mode &key redactor secret-mode)
   "Serialize a message object to JSON hash-table."
-  (let ((parts (remove nil (mapcar (lambda (p) (serialize-part p capture-mode))
+  (let ((parts (remove nil (mapcar (lambda (p)
+                                     (serialize-part p capture-mode
+                                                     :redactor redactor
+                                                     :secret-mode secret-mode))
                                    (message-parts msg)))))
     (jobj "role" (role-string (message-role msg))
           "parts" (coerce parts 'vector))))
@@ -284,6 +320,10 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
   (let* ((capture (config-content-capture-mode config))
          (capture-content (capture-keeps-content-p capture))
          (capture-sys (or capture-content (eq capture :metadata-with-system-prompt)))
+         (redactor (when (config-redact-secrets config)
+                     (make-secret-redactor
+                      :include-emails (config-redact-email-addresses config))))
+         (redact-inputs (config-redact-input-messages config))
          (mode-str (if (eq (gen-rec-mode rec) :stream)
                        "GENERATION_MODE_STREAM" "GENERATION_MODE_SYNC"))
          (op-name (if (eq (gen-rec-mode rec) :stream) "streamText" "generateText"))
@@ -358,16 +398,27 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
             (setf (gethash "tags" gen) tags-obj)))))
     ;; System prompt
     (when (and capture-sys (gen-rec-system-prompt rec))
-      (setf (gethash "system_prompt" gen) (gen-rec-system-prompt rec)))
+      (setf (gethash "system_prompt" gen)
+            (if redactor
+                (apply-secret-redaction redactor :full (gen-rec-system-prompt rec))
+                (gen-rec-system-prompt rec))))
     ;; Messages — in metadata-only mode, preserve structure with redacted content
     (when (gen-rec-input-messages rec)
       (setf (gethash "input" gen)
-            (coerce (mapcar (lambda (m) (serialize-message m capture))
+            (coerce (mapcar (lambda (m)
+                              (serialize-message m capture
+                                                 :redactor redactor
+                                                 :secret-mode (message-secret-mode
+                                                               (message-role m) t redact-inputs)))
                             (gen-rec-input-messages rec))
                     'vector)))
     (when (gen-rec-output-messages rec)
       (setf (gethash "output" gen)
-            (coerce (mapcar (lambda (m) (serialize-message m capture))
+            (coerce (mapcar (lambda (m)
+                              (serialize-message m capture
+                                                 :redactor redactor
+                                                 :secret-mode (message-secret-mode
+                                                               (message-role m) nil redact-inputs)))
                             (gen-rec-output-messages rec))
                     'vector)))
     ;; Tools (names/descriptions are metadata, not gated)
@@ -534,6 +585,9 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
         (let ((td (tool-rec-tool-description rec)))
           (when (and td (stringp td) (plusp (length td)))
             (push (otel-string-attr "gen_ai.tool.description" td) attrs)))
+        ;; Secret redaction applies to generation payloads only; standalone
+        ;; tool-execution spans export arguments/results gated by capture mode
+        ;; but unscanned. Enabling redact-secrets does not scrub this path.
         (let ((args (tool-rec-arguments rec)))
           (when (and args (stringp args) (plusp (length args)))
             (push (otel-string-attr "gen_ai.tool.call.arguments"

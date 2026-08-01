@@ -9,6 +9,9 @@
                                embedding-capture-input
                                embedding-max-input-items
                                embedding-max-text-length
+                               (redact-secrets nil)
+                               (redact-input-messages nil)
+                               (redact-email-addresses t)
                                (generation-endpoint "http://test-sigil:4318/api/v1/generations:export")
                                eval-endpoint
                                (eval-path-prefix "/api/v1")
@@ -47,6 +50,9 @@
        :embedding-capture-input embedding-capture-input
        :embedding-max-input-items embedding-max-input-items
        :embedding-max-text-length embedding-max-text-length
+       :redact-secrets redact-secrets
+       :redact-input-messages redact-input-messages
+       :redact-email-addresses redact-email-addresses
        :service-name "test-service"
        :service-version "1.0.0"
        :auth-mode auth-mode
@@ -533,6 +539,43 @@ the cdr of CALLS-PLACE as (method url content), newest first."
         (check "SIGIL_DEBUG=1 -> t" (config-debug cfg)))
       (let ((cfg (resolve '(("SIGIL_DEBUG" . "false")))))
         (check "SIGIL_DEBUG=false -> nil" (null (config-debug cfg))))
+
+      ;; --- SIGIL_REDACT_SECRETS ---
+      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "true")))))
+        (check "SIGIL_REDACT_SECRETS=true -> t"
+               (sigil-cl::config-redact-secrets cfg)))
+      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "0")))))
+        (check "SIGIL_REDACT_SECRETS=0 -> nil"
+               (null (sigil-cl::config-redact-secrets cfg))))
+      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "t")))))
+        (check "SIGIL_REDACT_SECRETS=t -> t"
+               (sigil-cl::config-redact-secrets cfg)))
+      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "NIL")))))
+        (check "SIGIL_REDACT_SECRETS=NIL -> nil"
+               (null (sigil-cl::config-redact-secrets cfg))))
+
+      ;; --- SIGIL_REDACT_INPUT_MESSAGES ---
+      (let ((cfg (resolve '(("SIGIL_REDACT_INPUT_MESSAGES" . "yes")))))
+        (check "SIGIL_REDACT_INPUT_MESSAGES=yes -> t"
+               (sigil-cl::config-redact-input-messages cfg)))
+
+      ;; --- Invalid SIGIL_REDACT_INPUT_MESSAGES warns and stays disabled ---
+      (let* ((warns 0)
+             (messages nil)
+             (cfg (sigil-cl::resolve-config-from-env
+                   (make-config :log-fn (lambda (l c m &rest kvs)
+                                          (declare (ignore c kvs))
+                                          (when (eq l :warn)
+                                            (incf warns)
+                                            (push m messages))))
+                   :env-fn (env-from-alist
+                            '(("SIGIL_REDACT_INPUT_MESSAGES" . "glc_notabool"))))))
+        (check "bad SIGIL_REDACT_INPUT_MESSAGES stays disabled"
+               (null (sigil-cl::config-redact-input-messages cfg)))
+        (check "bad SIGIL_REDACT_INPUT_MESSAGES warns"
+               (>= warns 1))
+        (check "bad SIGIL_REDACT_INPUT_MESSAGES warning omits the value"
+               (notany (lambda (m) (search "glc_notabool" m)) messages)))
 
       ;; --- SIGIL_PROTOCOL warning when non-http ---
       (let* ((warns 0)
@@ -1304,6 +1347,229 @@ the cdr of CALLS-PLACE as (method url content), newest first."
              (equal (string-attr (embedding-span :source "openai")
                                  "sigil.embeddings.source")
                     "openai")))))
+
+(defun run-redaction-tests ()
+  (with-test-suite ("Redaction")
+    (let* ((anthropic-key (format nil "sk-ant-api03-~aAA"
+                                  (make-string 93 :initial-element #\a)))
+           (conn-string "postgres://user:pw@db.example.com:5432/app")
+           (redactor   (sigil-cl::make-secret-redactor))
+           (no-email   (sigil-cl::make-secret-redactor :include-emails nil)))
+
+      ;; --- Direct engine: redact-light ---
+      (let ((out (sigil-cl::redact-light redactor
+                                         (format nil "key is ~a done" anthropic-key))))
+        (check "redact-light: anthropic key redacted"
+               (search "[REDACTED:anthropic-api-key]" out))
+        (check "redact-light: secret removed" (not (search anthropic-key out)))
+        (check "redact-light: surrounding text preserved"
+               (and (search "key is " out) (search " done" out))))
+
+      ;; --- Direct engine: redact-light does NOT apply tier-2 env heuristic ---
+      (let ((out (sigil-cl::redact-light redactor "API_KEY=hunter2plaintextvalue")))
+        (check "redact-light: tier-2 env value left untouched"
+               (equal out "API_KEY=hunter2plaintextvalue")))
+
+      ;; --- Direct engine: redact-full applies tier-2 env heuristic ---
+      (let ((out (sigil-cl::redact-full redactor "API_KEY=hunter2plaintextvalue")))
+        (check "redact-full: env value redacted"
+               (search "[REDACTED:env-secret-value]" out))
+        (check "redact-full: env assignment prefix preserved"
+               (search "API_KEY=" out))
+        (check "redact-full: secret value removed"
+               (not (search "hunter2plaintextvalue" out))))
+
+      ;; --- Direct engine: email opt-out ---
+      (check "redact-light: email redacted by default"
+             (search "[REDACTED:email]"
+                     (sigil-cl::redact-light redactor "ping alice@example.com now")))
+      (check "redact-light: email preserved when opted out"
+             (search "alice@example.com"
+                     (sigil-cl::redact-light no-email "ping alice@example.com now")))
+
+      ;; --- apply-secret-redaction guards ---
+      (check "apply-secret-redaction: nil redactor is a no-op"
+             (equal (sigil-cl::apply-secret-redaction nil :full anthropic-key)
+                    anthropic-key))
+      (check "apply-secret-redaction: :none mode is a no-op"
+             (equal (sigil-cl::apply-secret-redaction redactor :none anthropic-key)
+                    anthropic-key))
+      (check "apply-secret-redaction: empty string is a no-op"
+             (equal (sigil-cl::apply-secret-redaction redactor :full "") ""))
+      (check "apply-secret-redaction: fails closed to a marker on engine error"
+             (equal (sigil-cl::apply-secret-redaction redactor :bogus-mode "leak me")
+                    "[REDACTED]"))
+
+      ;; --- Serialization: system prompt redacted under :full ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full :redact-secrets t)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :system-prompt
+                                            (format nil "Connect via ~a please" conn-string))))
+          (recorder-end rec)
+          (let ((gen (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-generation-queue client)))))
+            (check "full: system prompt connection string redacted"
+                   (search "[REDACTED:connection-string]" (jget gen "system_prompt")))
+            (check "full: system prompt non-secret text preserved"
+                   (and (search "Connect via " (jget gen "system_prompt"))
+                        (not (search conn-string (jget gen "system_prompt"))))))))
+
+      ;; --- Serialization: system prompt redacted under :metadata-with-system-prompt,
+      ;;     message text still blanked by capture mode ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :metadata-with-system-prompt :redact-secrets t)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :system-prompt
+                                            (format nil "db ~a" conn-string)
+                                            :input-messages
+                                            (list (make-message
+                                                   :role :user
+                                                   :parts (list (make-text-part anthropic-key)))))))
+          (recorder-end rec)
+          (let ((gen (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-generation-queue client)))))
+            (check "mws: system prompt redacted"
+                   (search "[REDACTED:connection-string]" (jget gen "system_prompt")))
+            (check "mws: message text still blanked by capture mode"
+                   (equal (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text")
+                          "")))))
+
+      ;; --- Serialization: assistant output light-redacted under :full ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full :redact-secrets t)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m")))
+          (set-result rec :output-messages
+                          (list (make-message
+                                 :role :assistant
+                                 :parts (list (make-text-part
+                                               (format nil "here: ~a" anthropic-key))))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (text (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")))
+            (check "full: assistant output secret redacted"
+                   (search "[REDACTED:anthropic-api-key]" text))
+            (check "full: assistant output surrounding text preserved"
+                   (and (search "here: " text) (not (search anthropic-key text)))))))
+
+      ;; --- Serialization: tool result full-redacted (env value) under :full ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full :redact-secrets t)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m")))
+          (set-result rec :output-messages
+                          (list (make-message
+                                 :role :tool
+                                 :parts (list (make-tool-result-part
+                                               :tool-call-id "tc1"
+                                               :name "env"
+                                               :content "API_KEY=hunter2plaintextvalue")))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (content (jget* (aref (jget (aref (jget gen "output") 0) "parts") 0)
+                                 "tool_result" "content")))
+            (check "full: tool result env value redacted"
+                   (search "[REDACTED:env-secret-value]" content))
+            (check "full: tool result prefix preserved"
+                   (and (search "API_KEY=" content)
+                        (not (search "hunter2plaintextvalue" content)))))))
+
+      ;; --- Input gating: input NOT redacted when redact-input-messages is nil,
+      ;;     output IS redacted ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full :redact-secrets t :redact-input-messages nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :input-messages
+                                            (list (make-message
+                                                   :role :user
+                                                   :parts (list (make-text-part anthropic-key)))))))
+          (set-result rec :output-messages
+                          (list (make-message
+                                 :role :assistant
+                                 :parts (list (make-text-part anthropic-key)))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (in-text (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text"))
+                 (out-text (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")))
+            (check "gating off: input secret NOT redacted"
+                   (search anthropic-key in-text))
+            (check "gating off: output secret still redacted"
+                   (search "[REDACTED:anthropic-api-key]" out-text)))))
+
+      ;; --- Input gating: input redacted when redact-input-messages is t ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full :redact-secrets t :redact-input-messages t)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :input-messages
+                                            (list (make-message
+                                                   :role :user
+                                                   :parts (list (make-text-part
+                                                                 (format nil "use ~a ok" anthropic-key))))))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (in-text (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text")))
+            (check "gating on: input secret redacted"
+                   (search "[REDACTED:anthropic-api-key]" in-text))
+            (check "gating on: non-secret input preserved"
+                   (and (search "use " in-text) (not (search anthropic-key in-text)))))))
+
+      ;; --- Disabled path: redact-secrets nil leaves content untouched ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full :redact-secrets nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :system-prompt (format nil "db ~a" conn-string))))
+          (set-result rec :output-messages
+                          (list (make-message
+                                 :role :assistant
+                                 :parts (list (make-text-part anthropic-key)))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (text (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")))
+            (check "disabled: system prompt untouched"
+                   (search conn-string (jget gen "system_prompt")))
+            (check "disabled: output secret untouched"
+                   (search anthropic-key text)))))
+
+      ;; --- Tool content only redacted when capture mode exports it ---
+      ;; Under :metadata-with-system-prompt the tool-result content is blanked by
+      ;; capture mode, so secret redaction must not run on it (stays "", not a marker).
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :metadata-with-system-prompt :redact-secrets t)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m")))
+          (set-result rec :output-messages
+                          (list (make-message
+                                 :role :tool
+                                 :parts (list (make-tool-result-part
+                                               :tool-call-id "tc1"
+                                               :name "env"
+                                               :content "API_KEY=hunter2plaintextvalue")))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (content (jget* (aref (jget (aref (jget gen "output") 0) "parts") 0)
+                                 "tool_result" "content")))
+            (check "blanked mode: tool result blanked, not redacted"
+                   (equal content ""))))))))
 
 (defun run-workflow-step-tests ()
   (with-test-suite ("WorkflowStep")
@@ -4297,6 +4563,7 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                            #'run-queue-tests
                            #'run-otel-tests
                            #'run-recorder-tests
+                           #'run-redaction-tests
                            #'run-workflow-step-tests
                            #'run-client-tests
                            #'run-macro-tests
