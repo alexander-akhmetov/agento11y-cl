@@ -535,6 +535,33 @@ the cdr of CALLS-PLACE as (method url content), newest first."
         (check "bad SIGIL_CONTENT_CAPTURE_MODE warns"
                (>= warns 1)))
 
+      ;; --- Unsupported caller :content-capture-mode falls back to :metadata-only ---
+      (let* ((messages nil)
+             (cfg (sigil-cl::resolve-config-from-env
+                   (make-config :content-capture-mode :metadata
+                                :log-fn (lambda (l c m &rest kvs)
+                                          (declare (ignore c kvs))
+                                          (when (eq l :warn) (push m messages))))
+                   :env-fn (env-from-alist nil))))
+        (check "unsupported caller capture mode falls back to :metadata-only"
+               (eq (sigil-cl::config-content-capture-mode cfg) :metadata-only))
+        (check "unsupported caller capture mode warns"
+               (= (length messages) 1))
+        (check "unsupported caller capture mode warning names the value"
+               (some (lambda (m) (search ":METADATA" (string-upcase m))) messages)))
+
+      ;; A supported caller mode neither warns nor gets rewritten.
+      (let* ((warns 0)
+             (cfg (sigil-cl::resolve-config-from-env
+                   (make-config :content-capture-mode :full
+                                :log-fn (lambda (l c m &rest kvs)
+                                          (declare (ignore c m kvs))
+                                          (when (eq l :warn) (incf warns))))
+                   :env-fn (env-from-alist nil))))
+        (check "supported caller capture mode kept"
+               (eq (sigil-cl::config-content-capture-mode cfg) :full))
+        (check "supported caller capture mode does not warn" (zerop warns)))
+
       ;; --- SIGIL_DEBUG ---
       (let ((cfg (resolve '(("SIGIL_DEBUG" . "1")))))
         (check "SIGIL_DEBUG=1 -> t" (config-debug cfg)))
@@ -688,7 +715,26 @@ the cdr of CALLS-PLACE as (method url content), newest first."
     (check "classify 429" (equal (sigil-cl::classify-error "status=429") "rate_limit"))
     (check "classify 500" (equal (sigil-cl::classify-error "status=500") "server_error"))
     (check "classify timeout" (equal (sigil-cl::classify-error "Connection timed out") "timeout"))
-    (check "classify nil" (null (sigil-cl::classify-error nil)))))
+    (check "classify nil" (null (sigil-cl::classify-error nil)))
+    ;; A caller passing a condition object instead of a string must not take the
+    ;; payload and span down with it.
+    (check "classify condition object"
+           (equal (sigil-cl::classify-error
+                   (make-condition 'simple-error
+                                   :format-control "provider returned status=429"))
+                  "rate_limit"))
+    (check "classify unclassifiable condition object"
+           (equal (sigil-cl::classify-error
+                   (make-condition 'simple-error :format-control "socket closed"))
+                  "sdk_error"))
+
+    ;; Withheld error text keeps the classification
+    (check "redacted-error-text 429"
+           (equal (sigil-cl::redacted-error-text "status=429") "rate_limit"))
+    (check "redacted-error-text unclassified"
+           (equal (sigil-cl::redacted-error-text "socket closed") "sdk_error"))
+    (check "redacted-error-text nil"
+           (equal (sigil-cl::redacted-error-text nil) "sdk_error"))))
 
 (defun run-recorder-tests ()
   (with-test-suite ("Recorder")
@@ -751,8 +797,8 @@ the cdr of CALLS-PLACE as (method url content), newest first."
         (recorder-end rec)
         (let ((gen (first (sigil-cl::queue-drain-all
                            (sigil-cl::client-generation-queue client)))))
-          (check "call error -> redacted (metadata-only)"
-                 (equal (jget gen "call_error") "<redacted>"))
+          (check "call error -> category (metadata-only)"
+                 (equal (jget gen "call_error") "sdk_error"))
           (check "stop_reason error" (equal (jget gen "stop_reason") "error")))))
 
     ;; Content capture full
@@ -872,6 +918,35 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                    (equal (jget input-msg "role") "MESSAGE_ROLE_USER"))
             (check "metadata-only: text redacted"
                    (equal (jget (aref (jget input-msg "parts") 0) "text") ""))))))
+
+    ;; An unsupported mode redacts even when the config skipped env resolution
+    (multiple-value-bind (client get-requests) (make-test-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :conversation-title "My Chat"
+                                          :system-prompt "Be helpful"
+                                          :input-messages
+                                          (list (make-message
+                                                 :role :assistant
+                                                 :parts (list (make-text-part "Secret")
+                                                              (make-thinking-part "Secret thought")))))))
+        ;; build-generation-payload directly, so the unsupported mode never
+        ;; passes through resolve-config-from-env.
+        (let* ((gen (sigil-cl::build-generation-payload
+                     rec (make-config :content-capture-mode :typo-mode)))
+               (parts (jget (aref (jget gen "input") 0) "parts")))
+          (check "unsupported mode: text redacted"
+                 (equal (jget (aref parts 0) "text") ""))
+          (check "unsupported mode: thinking redacted"
+                 (equal (jget (aref parts 1) "thinking") ""))
+          (check "unsupported mode: system prompt omitted"
+                 (null (jget gen "system_prompt")))
+          (check "unsupported mode: conversation title omitted"
+                 (null (jget* gen "metadata" "sigil.conversation.title")))
+          (check "unsupported mode: capture tag reports metadata_only"
+                 (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                        "metadata_only")))))
 
     ;; Metadata-with-system-prompt: redact message content but keep system prompt
     (multiple-value-bind (client get-requests)
@@ -1005,19 +1080,251 @@ the cdr of CALLS-PLACE as (method url content), newest first."
           (check "caller metadata: sdk.name still present"
                  (equal (jget* gen "metadata" "sigil.sdk.name") "sigil-cl")))))
 
-    ;; Conversation title in metadata
-    (multiple-value-bind (client get-requests) (make-test-client)
+    ;; Conversation title in metadata: kept by the content-keeping modes only
+    (dolist (mode '(:full :no-tool-content))
+      (multiple-value-bind (client get-requests) (make-test-client :capture mode)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :conversation-title "My Chat")))
+          (recorder-end rec)
+          (let ((gen (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-generation-queue client)))))
+            (check (format nil "~a: conversation title in metadata" mode)
+                   (equal (jget* gen "metadata" "sigil.conversation.title") "My Chat"))
+            (check (format nil "~a: no top-level conversation_title" mode)
+                   (null (jget gen "conversation_title")))))))
+
+    (dolist (mode '(:metadata-only :metadata-with-system-prompt))
+      (multiple-value-bind (client get-requests) (make-test-client :capture mode)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :conversation-title "My Chat")))
+          (recorder-end rec)
+          (let ((gen (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-generation-queue client)))))
+            (check (format nil "~a: conversation title withheld" mode)
+                   (null (nth-value 1 (gethash "sigil.conversation.title"
+                                               (jget gen "metadata")))))
+            (check (format nil "~a: sdk.name metadata still present" mode)
+                   (equal (jget* gen "metadata" "sigil.sdk.name") "sigil-cl"))))))
+
+    ;; A retained conversation title still goes through the secret redactor
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :full :redact-secrets t)
       (declare (ignore get-requests))
       (let ((rec (start-generation client :mode :sync
                                           :model-provider "test" :model-name "m"
-                                          :conversation-title "My Chat")))
+                                          :conversation-title
+                                          "chat about glc_abcdefghijklmnopqrstuvwxyz")))
+        (recorder-end rec)
+        (let ((title (jget* (first (sigil-cl::queue-drain-all
+                                    (sigil-cl::client-generation-queue client)))
+                            "metadata" "sigil.conversation.title")))
+          (check "conversation title secret redacted"
+                 (and (search "[REDACTED:grafana-cloud-token]" title)
+                      (not (search "glc_abcdefghijklmnopqrstuvwxyz" title)))))))
+
+    ;; Tool definitions: descriptions and schemas follow the capture mode
+    (dolist (mode '(:full :no-tool-content :metadata-only :metadata-with-system-prompt))
+      (multiple-value-bind (client get-requests) (make-test-client :capture mode)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m")))
+          (set-result rec :tools (list (list :name "search"
+                                             :description "Search the private wiki"
+                                             :parameters (jobj "type" "object")
+                                             :deferred t)))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (tool (aref (jget gen "tools") 0))
+                 (keep (member mode '(:full :no-tool-content))))
+            (check (format nil "~a: tool name kept" mode)
+                   (equal (jget tool "name") "search"))
+            (check (format nil "~a: tool type kept" mode)
+                   (equal (jget tool "type") "function"))
+            (check (format nil "~a: tool deferred kept" mode)
+                   (eq (jget tool "deferred") t))
+            (check (format nil "~a: tool description" mode)
+                   (equal (jget tool "description")
+                          (if keep "Search the private wiki" "")))
+            (check (format nil "~a: tool input_schema_json" mode)
+                   (equal (jget tool "input_schema_json")
+                          (if keep
+                              (cl-base64:string-to-base64-string
+                               (jzon:stringify (jobj "type" "object")))
+                              "")))))))
+
+    ;; Tool span description follows the capture mode, not the tool-span gate
+    (dolist (mode '(:full :no-tool-content :metadata-only :metadata-with-system-prompt))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture mode :generation-enabled nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-tool-execution client
+                     :tool-name "search"
+                     :tool-call-id "tc-1"
+                     :tool-description "Search the private wiki")))
+          (recorder-end rec)
+          (let* ((span (first (sigil-cl::queue-drain-all
+                               (sigil-cl::client-trace-queue client))))
+                 (desc (find "gen_ai.tool.description"
+                             (coerce (jget span "attributes") 'list)
+                             :key (lambda (a) (jget a "key")) :test #'equal)))
+            (if (member mode '(:full :no-tool-content))
+                (check (format nil "~a: tool span description present" mode)
+                       (equal (jget* desc "value" "stringValue")
+                              "Search the private wiki"))
+                (check (format nil "~a: tool span description withheld" mode)
+                       (null desc)))
+            (check (format nil "~a: tool span name still present" mode)
+                   (find "gen_ai.tool.name" (coerce (jget span "attributes") 'list)
+                         :key (lambda (a) (jget a "key")) :test #'equal))))))
+
+    ;; The capture-mode tag tells the backend what was stripped
+    (dolist (pair '((:full . "full")
+                    (:no-tool-content . "no_tool_content")
+                    (:metadata-with-system-prompt . "metadata_only")
+                    (:metadata-only . "metadata_only")))
+      (multiple-value-bind (client get-requests) (make-test-client :capture (car pair))
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m")))
+          (recorder-end rec)
+          (let ((gen (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-generation-queue client)))))
+            (check (format nil "~a: capture tag present with no caller tags" (car pair))
+                   (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                          (cdr pair)))))))
+
+    ;; Caller tags survive, and the SDK key wins over a caller tag of the same name
+    (multiple-value-bind (client get-requests) (make-test-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :tags '(("env" . "prod")
+                                                  ("agento11y.sdk.content_capture_mode"
+                                                   . "metadata_only")))))
+        (recorder-end rec)
+        (let ((tags (jget (first (sigil-cl::queue-drain-all
+                                  (sigil-cl::client-generation-queue client)))
+                          "tags")))
+          (check "caller tag preserved" (equal (jget tags "env") "prod"))
+          (check "caller cannot override the capture tag"
+                 (equal (jget tags "agento11y.sdk.content_capture_mode") "full"))
+          (check "capture tag published only under the agento11y key"
+                 (null (jget tags "sigil.sdk.content_capture_mode"))))))
+
+    ;; Thinking parts keep their shape when redacted
+    (dolist (mode '(:metadata-only :metadata-with-system-prompt))
+      (multiple-value-bind (client get-requests) (make-test-client :capture mode)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m")))
+          (set-result rec :output-messages
+                      (list (make-message
+                             :role :assistant
+                             :parts (list (make-thinking-part "Secret reasoning")))))
+          (recorder-end rec)
+          (let* ((gen (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-generation-queue client))))
+                 (parts (jget (aref (jget gen "output") 0) "parts")))
+            (check (format nil "~a: thinking part kept" mode) (= (length parts) 1))
+            (check (format nil "~a: thinking text emptied" mode)
+                   (equal (jget (aref parts 0) "thinking") ""))
+            (check (format nil "~a: thinking provider_type kept" mode)
+                   (equal (jget* (aref parts 0) "metadata" "provider_type")
+                          "thinking"))))))
+
+    (multiple-value-bind (client get-requests) (make-test-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m")))
+        (set-result rec :output-messages
+                    (list (make-message
+                           :role :assistant
+                           :parts (list (make-thinking-part "Visible reasoning")))))
+        (recorder-end rec)
+        (let* ((gen (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-generation-queue client))))
+               (parts (jget (aref (jget gen "output") 0) "parts")))
+          (check "full: thinking text kept"
+                 (equal (jget (aref parts 0) "thinking") "Visible reasoning")))))
+
+    ;; Withheld error text keeps its classification
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :metadata-only)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m")))
+        (set-call-error rec "provider returned status=429 too many requests")
+        (recorder-end rec)
+        (let ((gen (first (sigil-cl::queue-drain-all
+                           (sigil-cl::client-generation-queue client))))
+              (span (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-trace-queue client)))))
+          (check "metadata-only: call_error is the category"
+                 (equal (jget gen "call_error") "rate_limit"))
+          (check "metadata-only: generation span status is the category"
+                 (equal (jget* span "status" "message") "rate_limit")))))
+
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :metadata-only :generation-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (start-tool-execution client :tool-name "search")))
+        (set-result rec :error-message "provider returned status=429 too many requests")
+        (recorder-end rec)
+        (let ((span (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-trace-queue client)))))
+          (check "metadata-only: tool span status is the category"
+                 (equal (jget* span "status" "message") "rate_limit")))))
+
+    ;; The tool span status follows the content gate, so :no-tool-content keeps
+    ;; the provider text even though it drops tool arguments and results.
+    (dolist (mode '(:full :no-tool-content))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture mode :generation-enabled nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-tool-execution client :tool-name "search")))
+          (set-result rec :arguments "{\"q\":\"secret\"}"
+                          :error-message "provider returned status=429 too many requests")
+          (recorder-end rec)
+          (let* ((span (first (sigil-cl::queue-drain-all
+                               (sigil-cl::client-trace-queue client))))
+                 (args (find "gen_ai.tool.call.arguments"
+                             (coerce (jget span "attributes") 'list)
+                             :key (lambda (a) (jget a "key")) :test #'equal)))
+            (check (format nil "~a: tool span status keeps the provider text" mode)
+                   (equal (jget* span "status" "message")
+                          "provider returned status=429 too many requests"))
+            (check (format nil "~a: tool span arguments follow the tool-span gate" mode)
+                   (equal (jget* args "value" "stringValue")
+                          (if (eq mode :full) "{\"q\":\"secret\"}" "<redacted>")))))))
+
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :metadata-only :generation-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (start-embedding client :model-provider "openai" :model-name "e")))
+        (set-call-error rec "provider returned status=429 too many requests")
+        (recorder-end rec)
+        (let ((span (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-trace-queue client)))))
+          (check "metadata-only: embedding span status is the category"
+                 (equal (jget* span "status" "message") "rate_limit")))))
+
+    ;; An unclassified error falls back to sdk_error, never to the original text
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :metadata-only)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m")))
+        (set-call-error rec "socket closed by peer")
         (recorder-end rec)
         (let ((gen (first (sigil-cl::queue-drain-all
                            (sigil-cl::client-generation-queue client)))))
-          (check "conversation title in metadata"
-                 (equal (jget* gen "metadata" "sigil.conversation.title") "My Chat"))
-          (check "no top-level conversation_title"
-                 (null (jget gen "conversation_title"))))))
+          (check "metadata-only: unclassified error -> sdk_error"
+                 (equal (jget gen "call_error") "sdk_error")))))
 
     ;; Parent generation IDs
     (multiple-value-bind (client get-requests) (make-test-client)
@@ -1759,12 +2066,30 @@ the cdr of CALLS-PLACE as (method url content), newest first."
           (sigil-cl::recorder-end rec)
           (let ((wfs (first (sigil-cl::queue-drain-all
                               (sigil-cl::client-workflow-queue client)))))
-            (check (format nil "~a: error redacted" mode)
-                   (equal (jget wfs "error") "<redacted>"))
+            (check (format nil "~a: error reduced to its category" mode)
+                   (equal (jget wfs "error") "sdk_error"))
             (check (format nil "~a: input_state omitted" mode)
                    (null (nth-value 1 (gethash "input_state" wfs))))
             (check (format nil "~a: output_state omitted" mode)
                    (null (nth-value 1 (gethash "output_state" wfs))))))))
+
+    ;; A withheld workflow error keeps its classification in payload and span
+    (multiple-value-bind (client get-requests)
+        (make-test-client :workflow-steps-enabled t :capture :metadata-only)
+      (declare (ignore get-requests))
+      (let ((rec (sigil-cl::start-workflow-step client
+                   :conversation-id "c" :step-name "s")))
+        (sigil-cl::set-result rec
+                              :error-message "provider returned status=429 slow down")
+        (sigil-cl::recorder-end rec)
+        (let ((wfs (first (sigil-cl::queue-drain-all
+                            (sigil-cl::client-workflow-queue client))))
+              (span (first (sigil-cl::queue-drain-all
+                             (sigil-cl::client-trace-queue client)))))
+          (check "metadata-only: workflow error is the category"
+                 (equal (jget wfs "error") "rate_limit"))
+          (check "metadata-only: workflow span status is the category"
+                 (equal (jget* span "status" "message") "rate_limit")))))
 
     ;; Capture mode :full keeps state and error verbatim
     (multiple-value-bind (client get-requests)
@@ -1851,6 +2176,83 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                  (vectorp (jget parsed "workflow_steps")))
           (check "HTTP: workflow_steps non-empty"
                  (plusp (length (jget parsed "workflow_steps")))))))))
+
+(defun run-rating-tests ()
+  (with-test-suite ("Rating")
+    (flet ((submit (mode)
+             (multiple-value-bind (client get-requests) (make-test-client :capture mode)
+               (submit-conversation-rating client "conv-1" :good
+                                           :rating-id "rate-1"
+                                           :feedback "the answer named my customer"
+                                           :user-id "u-7")
+               (let ((req (first (funcall get-requests))))
+                 (values (jzon:parse (second req)) (first req))))))
+      ;; :full keeps the comment
+      (multiple-value-bind (payload url) (submit :full)
+        ;; The rating path is appended to :generation-endpoint as given, which is
+        ;; the full export URL. Asserted as-is; the URL shape is not this test's
+        ;; subject.
+        (check "rating URL ends with the conversation rating path"
+               (let ((suffix "/api/v1/conversations/conv-1/ratings"))
+                 (and (>= (length url) (length suffix))
+                      (string= suffix url :start2 (- (length url) (length suffix))))))
+        (check "full: comment sent"
+               (equal (jget payload "comment") "the answer named my customer"))
+        (check "full: rating value"
+               (equal (jget payload "rating") "CONVERSATION_RATING_VALUE_GOOD"))
+        (check "full: rating_id" (equal (jget payload "rating_id") "rate-1"))
+        (check "full: rater_id" (equal (jget payload "rater_id") "u-7")))
+
+      ;; Both redacting modes drop the comment and keep everything else
+      (dolist (mode '(:metadata-only :metadata-with-system-prompt))
+        (multiple-value-bind (payload url) (submit mode)
+          (declare (ignore url))
+          (check (format nil "~a: comment omitted" mode)
+                 (null (nth-value 1 (gethash "comment" payload))))
+          (check (format nil "~a: rating value unchanged" mode)
+                 (equal (jget payload "rating") "CONVERSATION_RATING_VALUE_GOOD"))
+          (check (format nil "~a: rating_id unchanged" mode)
+                 (equal (jget payload "rating_id") "rate-1"))
+          (check (format nil "~a: rater_id unchanged" mode)
+                 (equal (jget payload "rater_id") "u-7"))))
+
+      ;; :no-tool-content keeps generation content, so it keeps the comment
+      (multiple-value-bind (payload url) (submit :no-tool-content)
+        (declare (ignore url))
+        (check "no-tool-content: comment sent"
+               (equal (jget payload "comment") "the answer named my customer"))))
+
+    ;; Dropping the comment is not silent: the POST succeeds either way, and
+    ;; :metadata-only is the default mode.
+    (flet ((warnings (mode feedback)
+             (let* ((messages nil)
+                    (client (make-test-client
+                             :capture mode
+                             :log-fn (lambda (level component message &rest kvs)
+                                       (declare (ignore kvs))
+                                       (when (and (eq level :warn)
+                                                  (equal component "rating"))
+                                         (push message messages))))))
+               (submit-conversation-rating client "conv-1" :good
+                                           :rating-id "rate-1"
+                                           :feedback feedback)
+               messages)))
+      (let ((messages (warnings :metadata-only "the answer named my customer")))
+        (check "metadata-only: dropping the comment warns" (= (length messages) 1))
+        (check "metadata-only: the warning names the comment"
+               (search "comment" (first messages))))
+      (check "full: keeping the comment does not warn"
+             (null (warnings :full "the answer named my customer")))
+      (check "metadata-only: no feedback, no warning"
+             (null (warnings :metadata-only nil))))
+
+    ;; No endpoint: nothing is posted
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :full :generation-endpoint nil)
+      (check "no endpoint: rating not posted"
+             (and (null (submit-conversation-rating client "conv-1" :bad
+                                                    :rating-id "rate-2"))
+                  (null (funcall get-requests)))))))
 
 (defun run-client-tests ()
   (with-test-suite ("Client")
@@ -5571,6 +5973,7 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                            #'run-recorder-tests
                            #'run-redaction-tests
                            #'run-workflow-step-tests
+                           #'run-rating-tests
                            #'run-client-tests
                            #'run-macro-tests
                            #'run-normalize-tests

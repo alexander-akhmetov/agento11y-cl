@@ -216,6 +216,15 @@ wins over env."
           (let ((parsed (parse-content-capture-mode capture config)))
             (unless (eq parsed :invalid)
               (override :content-capture-mode parsed))))
+        ;; A caller mode outside the supported set falls back to :metadata-only.
+        ;; The env branch above cannot also have fired: it requires the caller
+        ;; mode to be :metadata-only, which is supported. Serialization redacts
+        ;; an unsupported mode on its own; this warning is the diagnostic.
+        (unless (valid-content-capture-mode-p (config-content-capture-mode config))
+          (sigil-log config :warn "config"
+                     (format nil "ignoring :content-capture-mode ~s (unsupported value), using :metadata-only"
+                             (config-content-capture-mode config)))
+          (override :content-capture-mode :metadata-only))
         ;; Secret redaction master enable (sigil-cl extension).
         (when (and redact-secrets (null (config-redact-secrets config)))
           (let ((parsed (parse-strict-bool redact-secrets config "SIGIL_REDACT_SECRETS")))

@@ -134,8 +134,13 @@ encoded as uint64 strings (OTLP JSON convention); sum stays a JSON number."
               (error () nil))))))))
 
 (defun classify-error (error-string)
-  "Classify an error string into a Sigil error category."
+  "Classify an error string into a Sigil error category.
+The contract is a string. A caller passing a condition object or any other
+value gets it printed rather than an error: callers include payload and span
+builders, where signalling here would drop the whole record."
   (when (null error-string) (return-from classify-error nil))
+  (unless (stringp error-string)
+    (setf error-string (princ-to-string error-string)))
   (let ((status (extract-http-status error-string))
         (lower (string-downcase error-string)))
     (cond
@@ -147,6 +152,11 @@ encoded as uint64 strings (OTLP JSON convention); sum stays a JSON number."
       ((or (search "timeout" lower) (search "timed out" lower)) "timeout")
       ((search "retry attempts exhausted" lower) "server_error")
       (t "sdk_error"))))
+
+(defun redacted-error-text (error-string)
+  "Error text to export when capture mode withholds the provider's message.
+Returns the classified category so consumers keep the classification."
+  (or (classify-error error-string) "sdk_error"))
 
 ;;; --- Common span attributes ---
 

@@ -20,8 +20,17 @@ Synchronous (not queued)."
                                      (t (princ-to-string rating)))
                           "rating_id" rid))
            (auth-headers (build-auth-headers config)))
+      ;; FEEDBACK is caller content, so a redacting capture mode drops it. The
+      ;; POST still succeeds, so warn: the default mode is :metadata-only, and a
+      ;; caller who never set a mode would otherwise see the text disappear
+      ;; without a signal.
       (when feedback
-        (setf (gethash "comment" payload) feedback))
+        (let ((capture (config-content-capture-mode config)))
+          (if (capture-keeps-content-p capture)
+              (setf (gethash "comment" payload) feedback)
+              (sigil-log config :warn "rating"
+                        (format nil "content capture mode ~a withholds the rating comment"
+                                capture)))))
       (when user-id
         (setf (gethash "rater_id" payload) (princ-to-string user-id)))
       (handler-case
