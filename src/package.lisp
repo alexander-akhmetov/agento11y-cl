@@ -109,6 +109,50 @@
    #:get-conversation
    #:initial-user-prompt
    #:dataset-from-collection
+   ;; Hooks (synchronous evaluation)
+   #:evaluate-hook
+   #:hook-context
+   #:hook-input
+   #:hook-evaluation
+   #:hook-evaluate-response
+   #:make-hook-context
+   #:make-hook-input
+   #:make-hooks-config
+   #:hooks-config
+   #:hooks-config-enabled
+   #:hooks-config-phases
+   #:hooks-config-timeout-sec
+   #:hooks-config-fail-open
+   #:hook-context-model-provider
+   #:hook-context-model-name
+   #:hook-context-agent-name
+   #:hook-context-agent-version
+   #:hook-context-tags
+   #:hook-context-conversation-id
+   #:hook-context-trace-id
+   #:hook-context-span-id
+   #:hook-input-messages
+   #:hook-input-tools
+   #:hook-input-system-prompt
+   #:hook-input-output
+   #:hook-input-conversation-preview
+   #:response-action
+   #:response-rule-id
+   #:response-reason
+   #:response-transformed-input
+   #:response-evaluations
+   #:evaluation-rule-id
+   #:evaluation-evaluator-id
+   #:evaluation-evaluator-kind
+   #:evaluation-passed
+   #:evaluation-latency-ms
+   #:evaluation-explanation
+   #:evaluation-reason
+   #:sigil-hook-denied-error
+   #:sigil-hook-denied-error-rule-id
+   #:sigil-hook-denied-error-reason
+   #:sigil-hook-denied-error-evaluations
+   #:sigil-hook-transport-error
    ;; Config
    #:sigil-config
    #:make-config
@@ -116,6 +160,8 @@
    #:config-agent-name
    #:config-agent-version
    #:config-extra-headers
+   #:config-api-endpoint
+   #:config-hooks-config
    #:config-debug
    #:config-metrics-endpoint
    #:config-metrics-enabled

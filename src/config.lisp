@@ -19,6 +19,11 @@
    (experiment-url-template :initarg :experiment-url-template
                             :reader config-experiment-url-template
                             :initform nil)
+   ;; Hook API root (host root used to derive /api/v1/...).
+   ;; When nil, the hook endpoint is derived from generation-endpoint.
+   (api-endpoint        :initarg :api-endpoint        :reader config-api-endpoint        :initform nil)
+   ;; Synchronous hook evaluation config (hooks-config struct or nil).
+   (hooks-config        :initarg :hooks-config        :reader config-hooks-config        :initform nil)
    ;; Trace export
    (traces-endpoint     :initarg :traces-endpoint     :reader config-traces-endpoint     :initform nil)
    (traces-enabled      :initarg :traces-enabled      :reader config-traces-enabled      :initform nil)

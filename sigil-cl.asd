@@ -3,7 +3,7 @@
   :version "0.1.0"
   :author "Alexander Akhmetov"
   :license "Apache-2.0"
-  :depends-on (:dexador :com.inuoe.jzon :bordeaux-threads :alexandria :cl-base64 :closer-mop :cl-ppcre)
+  :depends-on (:dexador :com.inuoe.jzon :bordeaux-threads :alexandria :cl-base64 :closer-mop :cl-ppcre :babel)
   :serial t
   :pathname "src/"
   :components ((:file "package")
@@ -21,6 +21,7 @@
                (:file "metrics")
                (:file "recorder")
                (:file "rating")
+               (:file "hooks")
                (:file "client")
                (:file "eval")
                (:file "suite")
