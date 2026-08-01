@@ -2801,7 +2801,116 @@ the cdr of CALLS-PLACE as (method url content), newest first."
         (check "body input.messages[0].role"
                (equal (jget* in-obj "messages" 0 "role") "user"))
         (check "body input.messages[0].parts[0].text"
-               (equal (jget* in-obj "messages" 0 "parts" 0 "text") "hi"))))
+               (equal (jget* in-obj "messages" 0 "parts" 0 "text") "hi"))
+        (check "body input.messages[0].parts[0].kind"
+               (equal (jget* in-obj "messages" 0 "parts" 0 "kind") "text"))))
+
+    ;; --- Correlation fields: explicit values and *trace-context* fallback ---
+    (let* ((captured-body nil)
+           (client (%make-hook-client
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url headers))
+                               (setf captured-body content)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client
+                     :phase :preflight
+                     :context (make-hook-context :conversation-id "conv-1"
+                                                 :trace-id "abc"
+                                                 :span-id "def"))
+      (let ((ctx-obj (jget (jzon:parse captured-body) "context")))
+        (check "body context.conversation_id"
+               (equal (jget ctx-obj "conversation_id") "conv-1"))
+        (check "body context.trace_id" (equal (jget ctx-obj "trace_id") "abc"))
+        (check "body context.span_id" (equal (jget ctx-obj "span_id") "def")))
+      (let ((*trace-context* (list :trace-id "t-amb" :span-id "s-amb")))
+        (evaluate-hook client :phase :preflight)
+        (let ((ctx-obj (jget (jzon:parse captured-body) "context")))
+          (check "trace_id falls back to *trace-context*"
+                 (equal (jget ctx-obj "trace_id") "t-amb"))
+          (check "span_id falls back to *trace-context*"
+                 (equal (jget ctx-obj "span_id") "s-amb"))))
+      (let ((*trace-context* (list :trace-id "t-amb" :span-id "s-amb")))
+        (evaluate-hook client
+                       :phase :preflight
+                       :context (make-hook-context :trace-id "explicit"))
+        (let ((ctx-obj (jget (jzon:parse captured-body) "context")))
+          (check "explicit trace_id wins over *trace-context*"
+                 (equal (jget ctx-obj "trace_id") "explicit")))))
+
+    ;; --- Tool parts carry kind; tool JSON is embedded, not base64 ---
+    (let* ((captured-body nil)
+           (client (%make-hook-client
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url headers))
+                               (setf captured-body content)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client
+                     :phase :preflight
+                     :input (make-hook-input
+                             :messages (list (make-message
+                                              :role :assistant
+                                              :parts (list (make-tool-call-part
+                                                            :id "t1"
+                                                            :name "search"
+                                                            :input-json "{\"q\":\"cats\"}")))
+                                             (make-message
+                                              :role :tool
+                                              :parts (list (make-tool-result-part
+                                                            :tool-call-id "t1"
+                                                            :name "search"
+                                                            :content "ok"
+                                                            :content-json "{\"hits\":2}"))))
+                             :tools (list (list :name "search"
+                                                :input-schema-json "{\"type\":\"object\"}"))))
+      (let* ((parsed (jzon:parse captured-body))
+             (in-obj (jget parsed "input"))
+             (call-part (jget* in-obj "messages" 0 "parts" 0))
+             (result-part (jget* in-obj "messages" 1 "parts" 0)))
+        (check "tool_call part carries kind"
+               (equal (jget call-part "kind") "tool_call"))
+        (check "tool_call input_json embedded as JSON, not base64"
+               (equal (jget* call-part "tool_call" "input_json" "q") "cats"))
+        (check "tool_result part carries kind"
+               (equal (jget result-part "kind") "tool_result"))
+        (check "tool_result content_json embedded as JSON, not base64"
+               (eql (jget* result-part "tool_result" "content_json" "hits") 2))
+        (check "tool input_schema_json stays base64"
+               (equal (jget* in-obj "tools" 0 "input_schema_json")
+                      (cl-base64:string-to-base64-string "{\"type\":\"object\"}")))))
+
+    ;; --- Unparseable tool JSON rides along as a string ---
+    (let* ((captured-body nil)
+           (client (%make-hook-client
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url headers))
+                               (setf captured-body content)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client
+                     :phase :preflight
+                     :input (make-hook-input
+                             :messages (list (make-message
+                                              :role :assistant
+                                              :parts (list (make-tool-call-part
+                                                            :id "t1"
+                                                            :name "search"
+                                                            :input-json "not json"))))))
+      (let* ((parsed (jzon:parse captured-body))
+             (in-obj (jget parsed "input")))
+        (check "unparseable input_json sent as a string"
+               (equal (jget* in-obj "messages" 0 "parts" 0 "tool_call" "input_json")
+                      "not json"))))
+
+    ;; --- String phase matches a keyword phase list ---
+    (let* ((called nil)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t
+                                                     :phases (list :preflight))
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url headers content))
+                               (setf called t)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase "preflight")
+      (check "string phase does not skip a keyword-configured hook" called))
 
     ;; --- :system role collapses to "user" on the wire (matches Python) ---
     (let* ((captured-body nil)

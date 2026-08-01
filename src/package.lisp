@@ -128,6 +128,9 @@
    #:hook-context-agent-name
    #:hook-context-agent-version
    #:hook-context-tags
+   #:hook-context-conversation-id
+   #:hook-context-trace-id
+   #:hook-context-span-id
    #:hook-input-messages
    #:hook-input-tools
    #:hook-input-system-prompt

@@ -211,6 +211,8 @@ Behaviour:
 - **Endpoint** → derived from `:api-endpoint` when set, otherwise from the host root of `:generation-endpoint`. Both `https://host` and `https://host/api/v1/...` forms are accepted; only the scheme + host are used.
 - **Timeout** → `(hooks-config-timeout-sec hooks)` (default `15.0`) is sent to the server via the `X-Sigil-Hook-Timeout-Ms` header. The `:timeout-sec` keyword on `evaluate-hook` overrides it for a single call.
 - **Response size** → bodies larger than 4 MiB are treated as transport failures.
+- **Correlation** → `trace-id` and `span-id` on the context fall back to the ambient `*trace-context*`, so a hook called inside `with-generation` reports the same trace as the generation it guards. Set them (or `conversation-id`) explicitly to override.
+- **Part encoding** → every message part carries its `kind`; the server dispatches on that field. Tool call arguments and tool result payloads go out as embedded JSON so rules can match on them, while a tool definition's `input_schema_json` stays base64, which is what the server's protobuf bytes field expects.
 
 ### Shutdown
 

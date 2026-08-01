@@ -20,25 +20,35 @@
 (defstruct hooks-config
   (enabled nil)
   (phases (list :preflight))
-  (timeout-sec 15.0)
+  (timeout-sec +default-hook-timeout-sec+)
   (fail-open t))
 
 ;;; --- Hook data types (CLOS classes for symmetry with the rest of the SDK) ---
 
 (defclass hook-context ()
-  ((model-provider :initarg :model-provider :accessor hook-context-model-provider :initform "")
-   (model-name     :initarg :model-name     :accessor hook-context-model-name     :initform "")
-   (agent-name     :initarg :agent-name     :accessor hook-context-agent-name     :initform "")
-   (agent-version  :initarg :agent-version  :accessor hook-context-agent-version  :initform "")
-   (tags           :initarg :tags           :accessor hook-context-tags           :initform nil)))
+  ((model-provider  :initarg :model-provider  :accessor hook-context-model-provider  :initform "")
+   (model-name      :initarg :model-name      :accessor hook-context-model-name      :initform "")
+   (agent-name      :initarg :agent-name      :accessor hook-context-agent-name      :initform "")
+   (agent-version   :initarg :agent-version   :accessor hook-context-agent-version   :initform "")
+   (tags            :initarg :tags            :accessor hook-context-tags            :initform nil)
+   ;; Correlation fields. trace-id and span-id fall back to *trace-context*
+   ;; when left empty, so a hook called inside with-generation lands on the
+   ;; same trace as the generation it guards.
+   (conversation-id :initarg :conversation-id :accessor hook-context-conversation-id :initform "")
+   (trace-id        :initarg :trace-id        :accessor hook-context-trace-id        :initform "")
+   (span-id         :initarg :span-id         :accessor hook-context-span-id         :initform "")))
 
-(defun make-hook-context (&key model-provider model-name agent-name agent-version tags)
+(defun make-hook-context (&key model-provider model-name agent-name agent-version tags
+                               conversation-id trace-id span-id)
   (make-instance 'hook-context
     :model-provider (or model-provider "")
     :model-name (or model-name "")
     :agent-name (or agent-name "")
     :agent-version (or agent-version "")
-    :tags tags))
+    :tags tags
+    :conversation-id (or conversation-id "")
+    :trace-id (or trace-id "")
+    :span-id (or span-id "")))
 
 (defclass hook-input ()
   ((messages             :initarg :messages             :accessor hook-input-messages             :initform nil)
@@ -132,19 +142,41 @@ get an https:// prefix to match the canonical Python SDK behaviour."
 (defun %b64 (s)
   (cl-base64:string-to-base64-string (or s "")))
 
+(defun %embedded-json (raw)
+  "Decode JSON text for embedding in the hook payload. Text that does not
+parse is sent as a JSON string, which keeps the body valid and leaves the
+content visible to rules instead of dropping it."
+  (handler-case (jzon:parse raw)
+    (error () raw)))
+
 (defun %serialize-message-part (part)
+  "Serialize one message part for the hooks API.
+
+Every part carries its KIND. The server dispatches on that field and only
+recovers a missing one for text, so a kind-less thinking, tool call, or
+tool result part reaches rule evaluation as an empty part: a tool-filter
+rule then sees no tool calls and allows the request.
+
+Tool arguments and tool result payloads go out as embedded JSON, not
+base64. The hooks API reads them as raw JSON, so a base64 blob is what
+argument-level rules would end up matching against. Generation export is
+the other way around, because that is protobuf JSON."
   (cond
     ((typep part 'text-part)
-     (jobj "text" (or (text-part-text part) "")))
+     (let ((text (text-part-text part)))
+       (when (and text (plusp (length text)))
+         (jobj "kind" "text" "text" text))))
     ((typep part 'thinking-part)
-     (jobj "thinking" (or (thinking-part-text part) "")))
+     (let ((text (thinking-part-text part)))
+       (when (and text (plusp (length text)))
+         (jobj "kind" "thinking" "thinking" text))))
     ((typep part 'tool-call-part)
      (let ((payload (jobj "id" (or (tool-call-part-id part) "")
                           "name" (or (tool-call-part-name part) ""))))
        (let ((input-json (tool-call-part-input-json part)))
          (when (and input-json (plusp (length input-json)))
-           (setf (gethash "input_json" payload) (%b64 input-json))))
-       (jobj "tool_call" payload)))
+           (setf (gethash "input_json" payload) (%embedded-json input-json))))
+       (jobj "kind" "tool_call" "tool_call" payload)))
     ((typep part 'tool-result-part)
      (let ((payload (jobj "is_error" (and (tool-result-part-is-error part) t)
                           "content" (or (tool-result-part-content part) ""))))
@@ -154,13 +186,14 @@ get an https:// prefix to match the canonical Python SDK behaviour."
        (when (tool-result-part-name part)
          (setf (gethash "name" payload) (tool-result-part-name part)))
        (let ((cj (tool-result-part-content-json part)))
-         (when cj
-           (setf (gethash "content_json" payload) (%b64 cj))))
-       (jobj "tool_result" payload)))
-    (t (jobj "text" ""))))
+         (when (and cj (plusp (length cj)))
+           (setf (gethash "content_json" payload) (%embedded-json cj))))
+       (jobj "kind" "tool_result" "tool_result" payload)))
+    (t nil)))
 
 (defun %serialize-message (message)
-  (let* ((parts (mapcar #'%serialize-message-part (or (message-parts message) nil)))
+  (let* ((parts (remove nil (mapcar #'%serialize-message-part
+                                    (or (message-parts message) nil))))
          (out (jobj "role" (%role-wire (message-role message))
                     "parts" (coerce parts 'vector))))
     (when (message-name message)
@@ -169,7 +202,11 @@ get an https:// prefix to match the canonical Python SDK behaviour."
 
 (defun %serialize-tool (tool)
   "Serialize a tool definition. Accepts hash-tables (already shaped) or
-property lists with :name/:description/:type/:input-schema-json/:deferred."
+property lists with :name/:description/:type/:input-schema-json/:deferred.
+
+INPUT_SCHEMA_JSON stays base64 even though tool call arguments do not: the
+server decodes the tools list straight into its protobuf type, which
+rejects embedded JSON for a bytes field."
   (cond
     ((hash-table-p tool) tool)
     ((listp tool)
@@ -185,6 +222,11 @@ property lists with :name/:description/:type/:input-schema-json/:deferred."
          (setf (gethash "deferred" out) t))
        out))
     (t tool)))
+
+(defun %non-empty-or (preferred fallback)
+  "First non-empty string of PREFERRED and FALLBACK, or NIL."
+  (find-if (lambda (s) (and (stringp s) (plusp (length s))))
+           (list preferred fallback)))
 
 (defun %serialize-context (ctx)
   (let ((out (make-hash-table :test 'equal)))
@@ -207,6 +249,17 @@ property lists with :name/:description/:type/:input-schema-json/:deferred."
           (dolist (kv tags)
             (setf (gethash (car kv) tag-obj) (cdr kv)))
           (setf (gethash "tags" out) tag-obj))))
+    (let ((conversation-id (hook-context-conversation-id ctx)))
+      (when (and conversation-id (plusp (length conversation-id)))
+        (setf (gethash "conversation_id" out) conversation-id)))
+    (let ((trace-id (%non-empty-or (hook-context-trace-id ctx)
+                                   (getf *trace-context* :trace-id)))
+          (span-id (%non-empty-or (hook-context-span-id ctx)
+                                  (getf *trace-context* :span-id))))
+      (when trace-id
+        (setf (gethash "trace_id" out) trace-id))
+      (when span-id
+        (setf (gethash "span_id" out) span-id)))
     out))
 
 (defun %serialize-input (input)
@@ -233,11 +286,18 @@ property lists with :name/:description/:type/:input-schema-json/:deferred."
         (setf (gethash "conversation_preview" out) cp)))
     out))
 
+(defun %phase-key (phase)
+  "Normalize PHASE to :preflight or :postflight. Keywords and the matching
+strings both resolve; anything else falls back to :preflight."
+  (let ((value (cond ((keywordp phase) (string-downcase (symbol-name phase)))
+                     ((stringp phase) (string-downcase phase))
+                     (t ""))))
+    (if (string= value "postflight") :postflight :preflight)))
+
 (defun %phase-wire (phase)
-  (case phase
+  (ecase (%phase-key phase)
     (:preflight "preflight")
-    (:postflight "postflight")
-    (t (if (stringp phase) phase "preflight"))))
+    (:postflight "postflight")))
 
 (defun %serialize-request (phase context input)
   (jobj "phase" (%phase-wire phase)
@@ -258,6 +318,9 @@ property lists with :name/:description/:type/:input-schema-json/:deferred."
     (t 0)))
 
 (defun %parse-wire-message (item)
+  "Parse one server-returned message. Only text and thinking parts are
+reconstructed, matching the canonical SDK: transformed_input carries
+rewritten prompt content, and the server does not send tool parts back."
   (when (hash-table-p item)
     (let* ((role-val (jget item "role"))
            (role (cond
@@ -411,7 +474,9 @@ synthetic allow response, when nil signals sigil-hook-transport-error."
     (unless (hooks-config-enabled hooks)
       (return-from evaluate-hook (%allow-response)))
     (let ((phases (or (hooks-config-phases hooks) (list :preflight))))
-      (unless (member phase phases)
+      ;; Normalize both sides: a caller passing "preflight" must not silently
+      ;; skip the hook because the configured phases hold keywords.
+      (unless (member (%phase-key phase) (mapcar #'%phase-key phases))
         (return-from evaluate-hook (%allow-response))))
     (let ((base-url (%resolve-hooks-base-url config)))
       (unless base-url
