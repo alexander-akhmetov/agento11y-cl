@@ -33,7 +33,7 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 
 - **Two independent queues**: `client-generation-queue` (generation payloads) and `client-trace-queue` (OTel spans). Both are bounded and drop-oldest on overflow.
 - **`*trace-context*`** (dynamic variable): `with-generation` binds this with the generation's trace-id/span-id. Child `with-tool-execution` and `with-embedding` calls read it to set their `parentSpanId`, creating the span tree.
-- **Content capture modes** (`:full`, `:no-tool-content`, `:metadata-with-system-prompt`, `:metadata-only`): control what message content is serialized. In `:metadata-only` and `:metadata-with-system-prompt`, message structure is preserved but text fields are empty strings and tool inputs/results are redacted; the difference between them is whether `system_prompt` is exported.
+- **Content capture modes** (`:full`, `:no-tool-content`, `:metadata-with-system-prompt`, `:metadata-only`): control which content-bearing fields are serialized. In `:metadata-only` and `:metadata-with-system-prompt`, message structure is preserved but text and thinking fields are empty strings, tool inputs/results and media URLs are cleared, and the conversation title, tool descriptions, tool input schemas, and rating comments are withheld; the difference between them is whether `system_prompt` is exported. `config.lisp` owns the vocabulary (`+content-capture-modes+` and the `capture-*` predicates), so any mode outside the four keywords redacts. Withheld error text is exported as the classified error category, not a placeholder. Every generation carries the `agento11y.sdk.content_capture_mode` tag so the backend can identify stripped content.
 - **`recorder-end :around`**: shared lifecycle logic (idempotency guard, timestamp, wake worker, metrics callback) lives in the `:around` method on the base `recorder` class. Type-specific serialization is in the primary methods.
 - **`http-fn` config slot**: tests inject a lambda to capture HTTP requests instead of hitting the network.
 
@@ -41,7 +41,7 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 
 | File | Role |
 |------|------|
-| `config.lisp` | `sigil-config` class, all tunables |
+| `config.lisp` | `sigil-config` class, all tunables, the content-capture-mode vocabulary and predicates |
 | `client.lisp` | `sigil-client`, background flush loop, lifecycle, recorder factory functions |
 | `recorder.lisp` | Base `recorder` class, `generation-recorder`, `tool-execution-recorder`, `embedding-recorder`, serialization |
 | `macros.lisp` | `with-generation`, `with-tool-execution`, `with-embedding`, `with-span`; the telemetry context capture/replay helpers |

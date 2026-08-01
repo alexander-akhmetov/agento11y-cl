@@ -91,6 +91,60 @@
    ;; Testing
    (http-fn :initarg :http-fn :reader config-http-fn :initform nil)))
 
+;;; --- Content capture mode vocabulary ---
+;;;
+;;; The mode decides which content-bearing fields leave the process. env.lisp,
+;;; recorder.lisp, and rating.lisp all read it, so the vocabulary lives here
+;;; beside the slot it describes rather than in any one of them.
+
+(defparameter +content-capture-modes+
+  '(:full :no-tool-content :metadata-with-system-prompt :metadata-only)
+  "The supported :content-capture-mode values.")
+
+(defun valid-content-capture-mode-p (mode)
+  "True when MODE is one of +content-capture-modes+."
+  (and (member mode +content-capture-modes+) t))
+
+(defun capture-keeps-content-p (mode)
+  "True when MODE keeps caller content: message text, thinking text, tool call
+inputs, tool result content, media URLs, the conversation title, a tool's
+description and input_schema_json, the rating comment, and error text on
+payloads and span status messages. A tool's name, type, and deferred flag are
+structure, not content, and export in every mode. The system prompt has its own
+gate, capture-keeps-system-prompt-p, and tool span arguments and results have
+capture-keeps-tool-span-content-p.
+:full and :no-tool-content keep content. Every other value redacts it, so an
+unsupported mode fails closed."
+  (or (eq mode :full) (eq mode :no-tool-content)))
+
+(defun capture-redacts-content-p (mode)
+  "True when MODE withholds caller content. The inverse of
+capture-keeps-content-p, so an unsupported mode redacts."
+  (not (capture-keeps-content-p mode)))
+
+(defun capture-keeps-system-prompt-p (mode)
+  "True when MODE exports the system prompt. :metadata-with-system-prompt keeps
+it while withholding every other content field; an unsupported mode drops it."
+  (or (capture-keeps-content-p mode) (eq mode :metadata-with-system-prompt)))
+
+(defun capture-keeps-tool-span-content-p (mode)
+  "True when MODE keeps tool execution span arguments and results.
+Only :full keeps tool span content; :no-tool-content, :metadata-with-system-prompt,
+and :metadata-only redact it."
+  (eq mode :full))
+
+(defun content-capture-mode-string (mode)
+  "Wire value for the agento11y.sdk.content_capture_mode generation tag.
+:full maps to \"full\", :no-tool-content to \"no_tool_content\", and everything
+else to \"metadata_only\". The CL-only :metadata-with-system-prompt reports
+metadata_only because it strips all message content, and metadata_only is the
+only stripped marker the backend acts on. An unsupported mode also reports
+metadata_only, matching how serialization treats it."
+  (cond
+    ((eq mode :full) "full")
+    ((eq mode :no-tool-content) "no_tool_content")
+    (t "metadata_only")))
+
 (defparameter +default-eval-path-prefix+ "/api/v1")
 (defparameter +default-scores-export-path+ "/api/v1/scores:export")
 (defparameter +default-ingest-actor+ "ingest:sdk/lisp")

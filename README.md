@@ -289,7 +289,7 @@ schema defaults. This matches the canonical sigil-sdk schema (Go, Python, JS).
 | `SIGIL_AGENT_VERSION` | `:agent-version` | |
 | `SIGIL_USER_ID` | `:user-id` | |
 | `SIGIL_TAGS` | `:tags` | `k=v,k2=v2`; env is the base layer, caller-supplied tags win on key collision |
-| `SIGIL_CONTENT_CAPTURE_MODE` | `:content-capture-mode` | Accepts `full` / `no_tool_content` / `metadata_only`; unknown values warn and are ignored. `:metadata-with-system-prompt` is a code-only extension |
+| `SIGIL_CONTENT_CAPTURE_MODE` | `:content-capture-mode` | Accepts `full` / `no_tool_content` / `metadata_only`; unknown values warn and are ignored. `:metadata-with-system-prompt` is a code-only extension. An unsupported caller keyword warns and falls back to `:metadata-only` |
 | `SIGIL_DEBUG` | `:debug` | `1` / `true` / `yes` / `on` → t, otherwise nil |
 | `SIGIL_ENABLE_EXPERIMENTAL_FEATURES` | `:experimental-features` | Same truthy values as `SIGIL_DEBUG`. Also read from `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES`; the `SIGIL_` spelling wins when both are set |
 
@@ -330,14 +330,52 @@ agent fields and finally to the service fields, so applications that only set
 
 ### Content capture modes
 
-| Mode | Generation messages | System prompt | call_error | Tool span args/results |
-|------|---------------------|---------------|-----------|------------------------|
-| `:full` | full | full | full | full |
-| `:no-tool-content` | full | full | full | redacted |
-| `:metadata-with-system-prompt` | structure only, text empty | full | redacted | redacted |
-| `:metadata-only` | structure only, text empty | omitted | redacted | redacted |
+| Field | `:full` | `:no-tool-content` | `:metadata-with-system-prompt` | `:metadata-only` |
+|-------|---------|--------------------|--------------------------------|------------------|
+| Message text | full | full | empty string | empty string |
+| Thinking text | full | full | empty string, part kept | empty string, part kept |
+| Tool call input, tool result content | full | full | empty string | empty string |
+| Media URL | full | full | empty string (kind, MIME type, name kept) | empty string (kind, MIME type, name kept) |
+| System prompt | full | full | full | omitted |
+| Conversation title | full | full | omitted | omitted |
+| Tool `description`, `input_schema_json` | full | full | empty string (`name`, `type`, `deferred` kept) | empty string (`name`, `type`, `deferred` kept) |
+| Rating comment | sent | sent | omitted | omitted |
+| `call_error`, workflow `error`, span status | full | full | error category | error category |
+| Tool span `gen_ai.tool.description` | full | full | omitted | omitted |
+| Tool span args/results | full | `<redacted>` | `<redacted>` | `<redacted>` |
+| Embedding input texts | when `:embedding-capture-input` | when `:embedding-capture-input` | omitted | omitted |
+
+Message and part structure survives every mode: a redacted part is exported with
+empty content rather than dropped, so part counts and roles stay comparable
+across modes.
 
 `:no-tool-content` matches the Go SDK's `ContentCaptureModeNoToolContent` semantics: keep generation content for evaluation, but redact tool execution span attributes (where untrusted tool I/O accumulates).
+
+When a mode withholds error text, the SDK exports the classified error category
+(`rate_limit`, `auth_error`, `server_error`, `timeout`, `client_error`, or
+`sdk_error`) instead of the provider's message, so consumers keep the
+classification. Error text follows the content gate on every span type,
+including the tool execution span: `:no-tool-content` drops tool arguments and
+results but keeps the error message.
+
+`submit-conversation-rating` logs a warning when the capture mode drops the
+comment. The POST still succeeds, and the default mode is `:metadata-only`, so a
+caller who never set a mode would otherwise see the feedback text disappear
+without a signal.
+
+Every exported generation carries the tag
+`agento11y.sdk.content_capture_mode`, holding `full`, `no_tool_content`, or
+`metadata_only`. The Sigil backend reads it to tell a stripped generation from a
+full one: it collapses stripped generations in conversation transcripts, skips
+them as per-generation judge variables, and warns on test-case promotion. The
+SDK sets the tag last, so a caller tag using the same key cannot override it.
+`:metadata-with-system-prompt` reports `metadata_only` because it strips all
+message content and `metadata_only` is the value the backend acts on.
+
+A `:content-capture-mode` outside the four supported keywords is treated as
+`:metadata-only`. `resolve-config-from-env` also logs a warning naming the
+rejected value, and serialization redacts independently of that warning, so a
+config built directly with `make-config` still fails closed.
 
 ### Metrics
 
