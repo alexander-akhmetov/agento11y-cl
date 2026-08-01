@@ -57,6 +57,21 @@
     :content-json content-json
     :is-error is-error))
 
+(defclass media-part ()
+  ((kind          :initarg :kind          :accessor media-part-kind          :initform "")
+   (url           :initarg :url           :accessor media-part-url           :initform "")
+   (mime-type     :initarg :mime-type     :accessor media-part-mime-type     :initform "")
+   (name          :initarg :name          :accessor media-part-name          :initform "")
+   (provider-type :initarg :provider-type :accessor media-part-provider-type :initform nil)))
+
+(defun make-media-part (&key kind url mime-type name provider-type)
+  (make-instance 'media-part
+    :kind (or kind "")
+    :url (or url "")
+    :mime-type (or mime-type "")
+    :name (or name "")
+    :provider-type provider-type))
+
 ;;; --- Message ---
 
 (defclass message ()

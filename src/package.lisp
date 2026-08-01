@@ -135,12 +135,14 @@
    #:thinking-part
    #:tool-call-part
    #:tool-result-part
+   #:media-part
    #:token-usage
    #:make-message
    #:make-text-part
    #:make-thinking-part
    #:make-tool-call-part
    #:make-tool-result-part
+   #:make-media-part
    #:make-token-usage
    ;; Accessors
    #:message-role
@@ -154,6 +156,11 @@
    #:tool-result-part-name
    #:tool-result-part-content
    #:tool-result-part-is-error
+   #:media-part-kind
+   #:media-part-url
+   #:media-part-mime-type
+   #:media-part-name
+   #:media-part-provider-type
    ;; Normalization
    #:normalize-input-messages
    #:normalize-message
