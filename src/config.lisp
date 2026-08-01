@@ -4,12 +4,18 @@
   (;; Generation export
    (generation-endpoint :initarg :generation-endpoint :reader config-generation-endpoint :initform nil)
    (generation-enabled  :initarg :generation-enabled  :reader config-generation-enabled  :initform nil)
-   ;; Eval control plane and score export
+   ;; Eval control plane and score export.
+   ;;
+   ;; eval-path-prefix, scores-export-path, and ingest-actor hold NIL until a
+   ;; caller sets them; the readers below apply the non-NIL defaults. NIL is
+   ;; what env resolution treats as "unset", so an explicit caller value that
+   ;; happens to equal the default still wins over the environment.
    (eval-endpoint :initarg :eval-endpoint :reader config-eval-endpoint :initform nil)
-   (eval-path-prefix :initarg :eval-path-prefix :reader config-eval-path-prefix :initform "/api/v1")
+   (eval-path-prefix :initarg :eval-path-prefix :initform nil)
    (eval-auth-token :initarg :eval-auth-token :reader config-eval-auth-token :initform nil)
-   (scores-export-path :initarg :scores-export-path :reader config-scores-export-path
-                       :initform "/api/v1/scores:export")
+   (scores-export-path :initarg :scores-export-path :initform nil)
+   ;; Identity claiming the runs and trials this SDK writes.
+   (ingest-actor :initarg :ingest-actor :initform nil)
    (experiment-url-template :initarg :experiment-url-template
                             :reader config-experiment-url-template
                             :initform nil)
@@ -60,6 +66,28 @@
    (metrics-fn :initarg :metrics-fn :reader config-metrics-fn :initform nil)
    ;; Testing
    (http-fn :initarg :http-fn :reader config-http-fn :initform nil)))
+
+(defparameter +default-eval-path-prefix+ "/api/v1")
+(defparameter +default-scores-export-path+ "/api/v1/scores:export")
+(defparameter +default-ingest-actor+ "ingest:sdk/lisp")
+
+(defmacro %define-defaulted-reader (name slot default)
+  "Define reader NAME returning SLOT, or DEFAULT when SLOT is NIL, plus a
+NAME-SUPPLIED-P predicate reporting whether a caller set it. NIL means unset,
+so env resolution can still fill the slot and an explicit NIL cannot produce a
+NIL path or actor."
+  `(progn
+     (defun ,name (config)
+       (or (slot-value config ',slot) ,default))
+     (defun ,(intern (concatenate 'string (symbol-name name) "-SUPPLIED-P")) (config)
+       (and (slot-value config ',slot) t))))
+
+(%define-defaulted-reader config-eval-path-prefix eval-path-prefix
+                          +default-eval-path-prefix+)
+(%define-defaulted-reader config-scores-export-path scores-export-path
+                          +default-scores-export-path+)
+(%define-defaulted-reader config-ingest-actor ingest-actor
+                          +default-ingest-actor+)
 
 (defun effective-trace-queue-max (config)
   "Return trace queue max, falling back to queue-max."

@@ -175,6 +175,28 @@ codepoint (true on SBCL, CCL, ECL)."
                        h4 (logand #xFFFFFFFF (+ h4 e))))))
     (format nil "~(~8,'0x~8,'0x~8,'0x~8,'0x~8,'0x~)" h0 h1 h2 h3 h4)))
 
+;;; --- Deterministic ids ---
+
+(defun %join-stable-id-parts (parts)
+  (with-output-to-string (out)
+    (loop for part in parts
+          for first-p = t then nil
+          do (unless first-p
+               (write-char (code-char #x1f) out))
+             (when part
+               (write-string (princ-to-string part) out)))))
+
+(defun stable-id (prefix &rest parts)
+  "Return a deterministic id from PARTS for idempotent retries.
+Matches StableID in the Go and Python SDKs (first 16 hex chars of SHA-1
+over the parts joined with #\\Us), so reruns from another SDK dedupe to the
+same score and conversation ids. Cross-SDK parity holds for string parts;
+non-string parts are printed with PRINC-TO-STRING, whose output (e.g. for
+booleans and floats) differs from Go fmt.Sprint and Python str."
+  (let ((joined (%join-stable-id-parts parts)))
+    (format nil "~a-~a" prefix
+            (subseq (sha1-hex (string-to-utf8-octets joined)) 0 16))))
+
 ;;; --- Backoff ---
 
 (defun backoff-seconds (attempt initial-sec max-sec)

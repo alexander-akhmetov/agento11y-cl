@@ -15,7 +15,7 @@
 (defun %eval-api-url (config path)
   (format nil "~a~a~a"
           (%strip-trailing-slash (eval-base-url config))
-          (%ensure-leading-slash (or (config-eval-path-prefix config) "/api/v1"))
+          (%ensure-leading-slash (config-eval-path-prefix config))
           path))
 
 (defun %json-array-p (value)

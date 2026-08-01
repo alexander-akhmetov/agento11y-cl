@@ -22,6 +22,8 @@
                (:file "rating")
                (:file "client")
                (:file "eval")
+               (:file "suite")
+               (:file "trial")
                (:file "macros")
                (:file "experiment")
                (:file "conversations")

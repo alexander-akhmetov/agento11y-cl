@@ -119,7 +119,8 @@ Resolution precedence per slot: caller value (explicit) > env > schema default.
 
 Recognized variables:
   SIGIL_ENDPOINT, SIGIL_EVAL_ENDPOINT, SIGIL_EVAL_PATH_PREFIX,
-  SIGIL_EVAL_AUTH_TOKEN, SIGIL_EXPERIMENT_URL_TEMPLATE, SIGIL_HEADERS, SIGIL_AUTH_MODE,
+  SIGIL_EVAL_AUTH_TOKEN, SIGIL_INGEST_ACTOR,
+  SIGIL_EXPERIMENT_URL_TEMPLATE, SIGIL_HEADERS, SIGIL_AUTH_MODE,
   SIGIL_AUTH_TENANT_ID, SIGIL_AUTH_TOKEN, SIGIL_AGENT_NAME,
   SIGIL_AGENT_VERSION, SIGIL_USER_ID, SIGIL_TAGS,
   SIGIL_CONTENT_CAPTURE_MODE, SIGIL_DEBUG.
@@ -131,11 +132,15 @@ TLS is controlled by the URL scheme.
 Note: an explicit caller value of :none for :auth-mode or :metadata-only for
 :content-capture-mode is indistinguishable from the slot's schema default and
 WILL be overridden by env. Callers that need to enforce these defaults
-against deployment env must either set the matching SIGIL_* var or unset it."
+against deployment env must either set the matching SIGIL_* var or unset it.
+:eval-path-prefix and :ingest-actor do not have that problem: their slots hold
+NIL until a caller sets them, so an explicit value equal to the default still
+wins over env."
   (let* ((endpoint  (env-trimmed env-fn "SIGIL_ENDPOINT"))
          (eval-endpoint (env-trimmed env-fn "SIGIL_EVAL_ENDPOINT"))
          (eval-path-prefix (env-trimmed env-fn "SIGIL_EVAL_PATH_PREFIX"))
          (eval-auth-token (env-trimmed env-fn "SIGIL_EVAL_AUTH_TOKEN"))
+         (ingest-actor (env-trimmed env-fn "SIGIL_INGEST_ACTOR"))
          (experiment-url-template (env-trimmed env-fn "SIGIL_EXPERIMENT_URL_TEMPLATE"))
          (headers   (env-trimmed env-fn "SIGIL_HEADERS"))
          (auth-mode (env-trimmed env-fn "SIGIL_AUTH_MODE"))
@@ -161,9 +166,14 @@ against deployment env must either set the matching SIGIL_* var or unset it."
         ;; Eval endpoint and links.
         (when (and eval-endpoint (null (config-eval-endpoint config)))
           (override :eval-endpoint eval-endpoint))
+        ;; These two ask the slot itself rather than comparing against the
+        ;; default, so a caller who explicitly passes the default value keeps it.
         (when (and eval-path-prefix
-                   (equal (config-eval-path-prefix config) "/api/v1"))
+                   (not (config-eval-path-prefix-supplied-p config)))
           (override :eval-path-prefix eval-path-prefix))
+        (when (and ingest-actor
+                   (not (config-ingest-actor-supplied-p config)))
+          (override :ingest-actor ingest-actor))
         (when (and eval-auth-token (null (config-eval-auth-token config)))
           (override :eval-auth-token eval-auth-token))
         (when (and experiment-url-template

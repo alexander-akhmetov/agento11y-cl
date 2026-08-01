@@ -11,11 +11,15 @@
                                (eval-path-prefix "/api/v1")
                                (scores-export-path "/api/v1/scores:export")
                                eval-auth-token
+                               (ingest-actor "ingest:sdk/lisp")
                                experiment-url-template
                                (traces-endpoint "http://test-sigil:4318/v1/traces")
                                (workflow-steps-endpoint
                                 "http://test-sigil:4318/api/v1/workflow-steps:export")
                                (metrics-endpoint "http://test-sigil:4318/v1/metrics")
+                               (auth-mode :bearer)
+                               (auth-password "test-token")
+                               (max-retries 5)
                                http-fn)
   "Create a client with mock HTTP that captures requests."
   (let ((requests nil))
@@ -28,6 +32,7 @@
        :eval-path-prefix eval-path-prefix
        :scores-export-path scores-export-path
        :eval-auth-token eval-auth-token
+       :ingest-actor ingest-actor
        :experiment-url-template experiment-url-template
        :traces-endpoint traces-endpoint
        :traces-enabled traces-enabled
@@ -38,8 +43,9 @@
        :content-capture-mode capture
        :service-name "test-service"
        :service-version "1.0.0"
-       :auth-mode :bearer
-       :auth-password "test-token"
+       :auth-mode auth-mode
+       :auth-password auth-password
+       :max-retries max-retries
        :http-fn (or http-fn
                     (lambda (url &key method headers content &allow-other-keys)
                       (declare (ignore method headers))
@@ -47,6 +53,52 @@
                       (values "{}" 200))))
       :env-fn (constantly nil))
      (lambda () (reverse requests)))))
+
+;;; --- Helpers shared by the experiment, trial, and suite suites ---
+;;;
+;;; One definition each. Two copies of ROUTED-HTTP had already drifted into
+;;; disagreeing about what the backend returns.
+
+(defun signals-condition-p (thunk expected-type)
+  (handler-case
+      (progn (funcall thunk) nil)
+    (sigil-error (e) (typep e expected-type))))
+
+(defun payload (call)
+  (jzon:parse (third call)))
+
+(defun score-call-p (call)
+  (and (search "scores:export" (second call)) t))
+
+(defun make-score-response (content)
+  (let* ((parsed (jzon:parse content))
+         (scores (jget parsed "scores"))
+         (results nil))
+    (loop for score across scores
+          do (push (jobj "score_id" (jget score "score_id") "accepted" t)
+                   results))
+    (jzon:stringify (jobj "results" (coerce (nreverse results) 'vector)))))
+
+(defun run-http-response (experiment-id status)
+  (jzon:stringify (jobj "experiment_id" experiment-id
+                        "name" "prompt A"
+                        "status" status)))
+
+(defun routed-http (calls-place experiment-id &key (score-status 202) score-body)
+  "One stub covering every route an experiment touches. Calls are pushed onto
+the cdr of CALLS-PLACE as (method url content), newest first."
+  (lambda (url &key method headers content &allow-other-keys)
+    (declare (ignore headers))
+    (push (list method url content) (cdr calls-place))
+    (cond
+      ((search "scores:export" url)
+       (values (or score-body (make-score-response content)) score-status))
+      ((search "generations:export" url) (values "{}" 200))
+      ((and (eq method :get) (search "/report" url))
+       (values (jzon:stringify (jobj "experiment_id" experiment-id)) 200))
+      ((search "experiment-runs" url)
+       (values (run-http-response experiment-id "running") 200))
+      (t (values "{}" 200)))))
 
 ;;; ================================================================
 ;;; Test suites
@@ -332,6 +384,36 @@
                (equal (config-eval-path-prefix cfg) "/env"))
         (check "env still fills unset experiment-url-template"
                (equal (config-experiment-url-template cfg) "https://env/{run_id}")))
+      ;; An explicit value equal to the default must survive env. The slot has
+      ;; no initform, so "supplied" is distinguishable from "left at default".
+      (let ((cfg (resolve '(("SIGIL_EVAL_PATH_PREFIX" . "/env"))
+                          :eval-path-prefix "/api/v1")))
+        (check "explicit default-valued eval-path-prefix beats env"
+               (equal (config-eval-path-prefix cfg) "/api/v1")))
+      (let ((cfg (resolve nil)))
+        (check "scores-export-path defaults when neither caller nor env set it"
+               (equal (config-scores-export-path cfg) "/api/v1/scores:export")))
+      ;; An explicit NIL means "unset", so the default still applies and the
+      ;; export URL cannot degrade to the host root.
+      (let ((cfg (resolve nil :scores-export-path nil :eval-path-prefix nil
+                              :ingest-actor nil)))
+        (check "explicit nil scores-export-path falls back to the default"
+               (equal (config-scores-export-path cfg) "/api/v1/scores:export"))
+        (check "explicit nil eval-path-prefix falls back to the default"
+               (equal (config-eval-path-prefix cfg) "/api/v1"))
+        (check "explicit nil ingest-actor falls back to the default"
+               (equal (config-ingest-actor cfg) "ingest:sdk/lisp")))
+      (let ((cfg (resolve '(("SIGIL_EVAL_PATH_PREFIX" . "/env/v1"))
+                          :eval-path-prefix nil)))
+        (check "env still fills an explicitly nil eval-path-prefix"
+               (equal (config-eval-path-prefix cfg) "/env/v1")))
+      (let ((cfg (resolve '(("SIGIL_INGEST_ACTOR" . "ingest:runner/harbor")))))
+        (check "SIGIL_INGEST_ACTOR -> ingest-actor"
+               (equal (config-ingest-actor cfg) "ingest:runner/harbor")))
+      (let ((cfg (resolve '(("SIGIL_INGEST_ACTOR" . "ingest:env"))
+                          :ingest-actor "ingest:sdk/lisp")))
+        (check "explicit default-valued ingest-actor beats env"
+               (equal (config-ingest-actor cfg) "ingest:sdk/lisp")))
 
       ;; --- SIGIL_AUTH_* (env layered when caller does not set) ---
       (let ((cfg (resolve '(("SIGIL_AUTH_MODE" . "basic")
@@ -1507,36 +1589,25 @@
 
 (defun run-experiment-tests ()
   (with-test-suite ("Experiments")
-    (labels ((signals-condition-p (thunk expected-type)
-               (handler-case
-                   (progn (funcall thunk) nil)
-                 (sigil-error (e) (typep e expected-type))))
-             (empty-jobj-p (obj)
+    (labels ((empty-jobj-p (obj)
                (and (hash-table-p obj) (zerop (hash-table-count obj))))
              (ends-with-p (suffix text)
                (let ((pos (search suffix text :from-end t)))
                  (and pos (= (+ pos (length suffix)) (length text)))))
-             (payload (call)
-               (jzon:parse (third call)))
-             (patch-statuses (calls)
+             (finalize-call-p (call)
+               (and (eq (first call) :post)
+                    (ends-with-p ":finalize" (second call))))
+             (trial-create-call-p (call)
+               (and (eq (first call) :post)
+                    (ends-with-p "/trials" (second call))))
+             (trial-patch-call-p (call)
+               (eq (first call) :patch))
+             (finalize-statuses (calls)
                (loop for call in calls
-                     when (eq (first call) :patch)
-                       collect (jget (payload call) "status")))
-             (experiment-http-response (run-id status)
-               (jzon:stringify (jobj "run_id" run-id
-                                     "name" "prompt A"
-                                     "source" "external"
-                                     "status" status)))
-             (make-score-response (content)
-               (let* ((parsed (jzon:parse content))
-                      (scores (jget parsed "scores"))
-                      (results nil))
-                 (loop for score across scores
-                       do (push (jobj "score_id" (jget score "score_id")
-                                      "accepted" t)
-                                results))
-                 (jzon:stringify (jobj "results" (coerce (nreverse results) 'vector))))))
-      ;; Eval base derivation and URL generation.
+                     when (finalize-call-p call)
+                       collect (jget (payload call) "status"))))
+
+      ;; --- Eval base derivation and URL generation ---
       (let ((cfg (make-config
                   :generation-endpoint "https://sigil.example.test/api/v1/generations:export")))
         (check "eval-base-url derives scheme and host from generation-endpoint"
@@ -1574,6 +1645,15 @@
                  (and (vectorp tags)
                       (equal (aref tags 0) "good")
                       (equal (aref tags 1) "bad")))))
+      (let ((plist (sigil-cl::%jsonify '(:question "what?" :n 2))))
+        (check "%jsonify turns a plist into an object"
+               (and (hash-table-p plist)
+                    (equal (jget plist "question") "what?")
+                    (eql (jget plist "n") 2))))
+      (check "%jsonify keeps an odd-length keyword list an array"
+             (vectorp (sigil-cl::%jsonify '(:a :b :c))))
+      (check "%jsonify keeps a keyword-free list an array"
+             (vectorp (sigil-cl::%jsonify '("a" "b"))))
 
       ;; stable-id matches the SHA-1-based StableID in the Go/Python SDKs.
       (check "stable-id matches reference SDKs"
@@ -1585,37 +1665,81 @@
       (check "stable-id multibyte parts match reference"
              (equal (stable-id "u" "héllo") "u-35b5ea45c5e41f78"))
 
-      ;; Eval auth token replaces generation auth for eval requests.
+      ;; --- Auth headers and ingest actor ---
       (let ((cfg (make-config :auth-mode :bearer :auth-password "gen-token"
                               :eval-auth-token "eval-token")))
         (check "eval auth token becomes bearer header"
-               (equal (sigil-cl::build-eval-auth-headers cfg)
-                      '(("Authorization" . "Bearer eval-token")))))
+               (equal (cdr (assoc "Authorization" (sigil-cl::build-eval-auth-headers cfg)
+                                  :test #'equal))
+                      "Bearer eval-token")))
       (let ((cfg (make-config :eval-auth-token "Bearer already")))
         (check "eval auth token keeps existing bearer prefix"
-               (equal (sigil-cl::build-eval-auth-headers cfg)
-                      '(("Authorization" . "Bearer already")))))
+               (equal (cdr (assoc "Authorization" (sigil-cl::build-eval-auth-headers cfg)
+                                  :test #'equal))
+                      "Bearer already")))
       (let ((cfg (make-config :auth-mode :bearer :auth-password "gen-token")))
         (check "eval auth falls back to generation auth"
-               (equal (sigil-cl::build-eval-auth-headers cfg)
-                      '(("Authorization" . "Bearer gen-token")))))
-      (let ((captured-headers nil))
-        (let ((cfg (make-config :auth-mode :bearer :auth-password "gen-token"
-                                :eval-auth-token "tok"
-                                :max-retries 1
-                                :http-fn (lambda (url &key method headers content &allow-other-keys)
-                                           (declare (ignore url method content))
-                                           (setf captured-headers headers)
-                                           (values "{}" 200)))))
-          (sigil-cl::request-eval-json cfg :get "https://x" nil "auth")
-          (check "request-eval-json sends eval bearer token"
-                 (equal (cdr (assoc "Authorization" captured-headers :test #'equal))
-                        "Bearer tok"))))
+               (equal (cdr (assoc "Authorization" (sigil-cl::build-eval-auth-headers cfg)
+                                  :test #'equal))
+                      "Bearer gen-token")))
+      (let ((cfg (make-config :auth-mode :none)))
+        (check "default ingest actor is the lisp sdk"
+               (equal (config-ingest-actor cfg) "ingest:sdk/lisp"))
+        (check "eval auth headers carry the ingest actor"
+               (equal (cdr (assoc "X-Agento11y-Ingest-Actor"
+                                  (sigil-cl::build-eval-auth-headers cfg) :test #'equal))
+                      "ingest:sdk/lisp"))
+        (check "score export headers carry the ingest actor"
+               (equal (cdr (assoc "X-Agento11y-Ingest-Actor"
+                                  (sigil-cl::build-score-export-headers cfg) :test #'equal))
+                      "ingest:sdk/lisp"))
+        (check "no request uses the alternate actor header spelling"
+               (and (null (assoc "X-Sigil-Ingest-Actor"
+                                 (sigil-cl::build-eval-auth-headers cfg) :test #'string-equal))
+                    (null (assoc "X-Sigil-Ingest-Actor"
+                                 (sigil-cl::build-score-export-headers cfg)
+                                 :test #'string-equal)))))
+      (let ((cfg (make-config :auth-mode :none :ingest-actor "")))
+        (check "blank ingest actor sends no actor header"
+               (null (assoc "X-Agento11y-Ingest-Actor"
+                            (sigil-cl::build-eval-auth-headers cfg) :test #'equal))))
+      ;; Every lifecycle request carries the configured actor value.
+      (let ((actor-headers nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test"
+             :generation-enabled nil
+             :traces-enabled nil
+             :ingest-actor "ingest:sdk/custom"
+             :http-fn (lambda (url &key method headers content &allow-other-keys)
+                        (declare (ignore method))
+                        (push (cons url (cdr (assoc "X-Agento11y-Ingest-Actor" headers
+                                                    :test #'equal)))
+                              actor-headers)
+                        (cond
+                          ((search "scores:export" url)
+                           (values (make-score-response content) 202))
+                          (t (values (run-http-response "exp-actor" "running") 200)))))
+          (declare (ignore get-requests))
+          (upsert-experiment-run client :experiment-id "exp-actor" :name "actor")
+          (create-trial client "exp-actor" :trial-id "trial-1" :test-case-id "case-1")
+          (finalize-trial client "exp-actor" "trial-1" :status "completed")
+          (export-scores client (list (jobj "score_id" "s1"
+                                            "trial_id" "trial-1"
+                                            "evaluator_id" "judge"
+                                            "evaluator_version" "1"
+                                            "score_key" "quality"
+                                            "value" 1)))
+          (finalize-experiment-run client "exp-actor" :status "completed")
+          (check "all five lifecycle requests send the configured actor"
+                 (and (= (length actor-headers) 5)
+                      (every (lambda (pair) (equal (cdr pair) "ingest:sdk/custom"))
+                             actor-headers)))))
 
-      ;; Score export is a tenant ingest write: generation host and
-      ;; generation auth, never the eval token or eval endpoint.
+      ;; Score export is a tenant ingest write: generation host and generation
+      ;; auth, never the eval token or eval endpoint.
       (let ((score-call nil)
-            (create-call nil))
+            (upsert-call nil))
         (multiple-value-bind (client get-requests)
             (make-test-client
              :eval-endpoint "https://eval.example.test"
@@ -1628,25 +1752,25 @@
                           ((search "scores:export" url)
                            (setf score-call (list url headers))
                            (values (make-score-response content) 202))
-                          ((search "/eval/experiments" url)
-                           (setf create-call (list url headers))
-                           (values (experiment-http-response "exp-auth" "running") 200))
+                          ((search "experiment-runs" url)
+                           (setf upsert-call (list url headers))
+                           (values (run-http-response "exp-auth" "running") 200))
                           (t (values "{}" 200)))))
           (declare (ignore get-requests))
-          (create-experiment client :run-id "exp-auth" :name "auth")
+          (upsert-experiment-run client :experiment-id "exp-auth" :name "auth")
           (let ((run (sigil-cl::%make-experiment-run :client client
-                                                     :run-id "exp-auth"
-                                                     :name "auth")))
+                                                    :run-id "exp-auth"
+                                                    :name "auth")))
             (experiment-run-add-scores
              run
              (list (make-score :evaluator-id "judge" :evaluator-version "1"
                                :score-key "quality" :value 1))
              :generation-ids '("gen-auth")))
           (check "control-plane request uses eval token"
-                 (equal (cdr (assoc "Authorization" (second create-call) :test #'equal))
+                 (equal (cdr (assoc "Authorization" (second upsert-call) :test #'equal))
                         "Bearer eval-tok"))
           (check "control-plane request uses eval host"
-                 (eql 0 (search "https://eval.example.test/" (first create-call))))
+                 (eql 0 (search "https://eval.example.test/" (first upsert-call))))
           (check "score export uses generation auth"
                  (equal (cdr (assoc "Authorization" (second score-call) :test #'equal))
                         "Bearer test-token"))
@@ -1654,7 +1778,7 @@
                  (eql 0 (search "http://test-sigil:4318/api/v1/scores:export"
                                 (first score-call))))))
 
-      ;; Transport parsing, typed errors, and retry.
+      ;; --- Transport parsing, typed errors, and retry ---
       (let ((cfg (make-config :auth-mode :none
                               :max-retries 1
                               :http-fn (lambda (url &key method headers content &allow-other-keys)
@@ -1721,48 +1845,231 @@
                         t)
                     (= attempts 2))))
 
-      ;; Control plane create payload.
-      (let ((calls nil))
+      ;; A 401 naming actor ownership is a caller error, not a transient one.
+      (let ((attempts 0)
+            (cfg nil))
+        (setf cfg (make-config :auth-mode :none
+                               :max-retries 3
+                               :initial-backoff-sec 0
+                               :max-backoff-sec 0
+                               :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                          (declare (ignore url method headers content))
+                                          (incf attempts)
+                                          (values "experiment is owned by another actor" 401))))
+        (check "401 actor ownership signals a mismatch condition"
+               (signals-condition-p
+                (lambda () (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "trial create"))
+                'sigil-actor-mismatch-error))
+        (check "401 actor ownership is not retried" (= attempts 1)))
+      (let ((cfg (make-config :auth-mode :none
+                              :max-retries 1
+                              :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                         (declare (ignore url method headers content))
+                                         (values "experiment is owned by another actor" 401)))))
+        (check "actor mismatch message names the mismatch"
+               (handler-case
+                   (progn (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "trial create")
+                          nil)
+                 (sigil-actor-mismatch-error (e)
+                   (and (search "owned by another ingest actor" (sigil-error-message e)) t)))))
+      (let ((cfg (make-config :auth-mode :none
+                              :max-retries 1
+                              :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                         (declare (ignore url method headers content))
+                                         (values "token expired" 401)))))
+        (check "an unrelated 401 stays an export error"
+               (signals-condition-p
+                (lambda () (sigil-cl::request-eval-json cfg :get "https://x" nil "get"))
+                'sigil-export-error)))
+
+      ;; --- 409 conflict classification (ported from errors.py) ---
+      (dolist (case '(("expected 12 scores, found 11" :score-count-mismatch)
+                      ("score_count mismatch" :score-count-mismatch)
+                      ("cannot complete experiment with 2 pending evaluation(s)"
+                       :pending-evaluations)
+                      ("cannot complete experiment with 2 running trial(s)" :running-trials)
+                      ("experiment \"run_1\" is already finalized as completed" :terminal)
+                      ("suite draft is already published" :terminal)
+                      ("planned_trial_count conflicts with the existing experiment"
+                       :immutable-field)
+                      ("suite version is not a draft" :immutable-field)
+                      ("suite has an open draft" :open-draft)
+                      ("something else entirely" :unknown)))
+        (destructuring-bind (message kind) case
+          (check (format nil "classify-conflict ~a -> ~a" message kind)
+                 (eq (classify-conflict message) kind))))
+      (check "score-count mismatch is not classified as terminal"
+             (and (eq (classify-conflict "expected 12 scores, found 11") :score-count-mismatch)
+                  (not (eq (classify-conflict "expected 12 scores, found 11") :terminal))))
+      (check "conflict-recoverable-p marks score-count mismatch recoverable"
+             (and (conflict-recoverable-p :score-count-mismatch)
+                  (conflict-recoverable-p :running-trials)
+                  (not (conflict-recoverable-p :terminal))))
+      (let ((cfg (make-config :auth-mode :none
+                              :max-retries 1
+                              :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                         (declare (ignore url method headers content))
+                                         (values "expected 12 scores, found 11" 409)))))
+        (check "409 score-count conflict carries kind and backend text"
+               (handler-case
+                   (progn (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "finalize")
+                          nil)
+                 (sigil-conflict-error (e)
+                   (and (eq (sigil-conflict-error-kind e) :score-count-mismatch)
+                        (search "expected 12 scores, found 11" (sigil-error-message e))
+                        t)))))
+      (let ((cfg (make-config :auth-mode :none
+                              :max-retries 1
+                              :http-fn (lambda (url &key method headers content &allow-other-keys)
+                                         (declare (ignore url method headers content))
+                                         (values "experiment \"run_1\" is already finalized as completed" 409)))))
+        (check "409 terminal-run conflict carries the terminal kind"
+               (handler-case
+                   (progn (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "finalize")
+                          nil)
+                 (sigil-conflict-error (e)
+                   (eq (sigil-conflict-error-kind e) :terminal)))))
+
+      ;; --- Run upsert ---
+      (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
              :eval-endpoint "https://sigil.example.test/ignored/path"
              :generation-enabled nil
              :traces-enabled nil
-             :http-fn (lambda (url &key method headers content &allow-other-keys)
-                        (declare (ignore headers))
-                        (push (list method url content) calls)
-                        (values (experiment-http-response "exp-prompt-a" "running") 200)))
+             :http-fn (routed-http calls "exp-prompt-a"))
           (declare (ignore get-requests))
-          (let ((created (create-experiment client
-                                            :run-id "exp-prompt-a"
-                                            :name "prompt A"
-                                            :source "external")))
-            (check "create-experiment returns parsed run"
-                   (equal (jget created "run_id") "exp-prompt-a"))
-            (let* ((call (first (reverse calls)))
+          (let ((created (upsert-experiment-run client
+                                                :experiment-id "exp-prompt-a"
+                                                :name "prompt A"
+                                                :tags '("smoke")
+                                                :suite-id "suite-1"
+                                                :suite-version "v2"
+                                                :candidate '(("agent_name" . "agent-a"))
+                                                :planned-trial-count 30
+                                                :metadata '(("git_sha" . "abc")))))
+            (check "upsert-experiment-run returns the parsed run"
+                   (equal (jget created "experiment_id") "exp-prompt-a"))
+            (let* ((call (first (reverse (cdr calls))))
                    (posted (payload call)))
-              (check "create-experiment POSTs to eval experiments"
+              (check "run create POSTs to experiment-runs:upsert"
                      (and (eq (first call) :post)
                           (equal (second call)
-                                 "https://sigil.example.test/api/v1/eval/experiments")))
-              (check "create-experiment payload has run_id"
-                     (equal (jget posted "run_id") "exp-prompt-a"))
-              (check "create-experiment payload has name"
+                                 "https://sigil.example.test/api/v1/experiment-runs:upsert")))
+              (check "run payload has experiment_id"
+                     (equal (jget posted "experiment_id") "exp-prompt-a"))
+              (check "run payload has no run_id"
+                     (null (nth-value 1 (gethash "run_id" posted))))
+              (check "run payload source is an sdk object"
+                     (and (hash-table-p (jget posted "source"))
+                          (equal (jget* posted "source" "kind") "sdk")
+                          (equal (jget* posted "source" "id") "lisp")))
+              (check "run payload keeps name"
                      (equal (jget posted "name") "prompt A"))
-              (check "create-experiment payload has source"
-                     (equal (jget posted "source") "external"))))))
+              (check "run payload carries suite id and version"
+                     (and (equal (jget posted "suite_id") "suite-1")
+                          (equal (jget posted "suite_version") "v2")))
+              (check "run payload carries candidate and planned_trial_count"
+                     (and (equal (jget* posted "candidate" "agent_name") "agent-a")
+                          (eql (jget posted "planned_trial_count") 30)))
+              (check "run payload omits collection_id and evaluators"
+                     (and (null (nth-value 1 (gethash "collection_id" posted)))
+                          (null (nth-value 1 (gethash "evaluators" posted)))))))))
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-x"))
+          (declare (ignore get-requests))
+          (check "upsert rejects a blank name before any request"
+                 (and (signals-condition-p
+                       (lambda () (upsert-experiment-run client :experiment-id "x" :name "  "))
+                       'sigil-validation-error)
+                      (null (cdr calls))))
+          (check "upsert rejects a negative planned_trial_count before any request"
+                 (and (signals-condition-p
+                       (lambda () (upsert-experiment-run client :name "x"
+                                                         :planned-trial-count -1))
+                       'sigil-validation-error)
+                      (null (cdr calls))))))
 
-      ;; Direct score export, value serialization, and rejected scores.
-      (let ((calls nil))
+      ;; --- Run finalization ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-fin"))
+          (declare (ignore get-requests))
+          (finalize-experiment-run client "exp-fin" :status "succeeded" :score-count 3)
+          (let* ((call (first (reverse (cdr calls))))
+                 (posted (payload call)))
+            (check "finalize POSTs the finalize route"
+                   (and (eq (first call) :post)
+                        (equal (second call)
+                               "https://sigil.example.test/api/v1/experiment-runs/exp-fin:finalize")))
+            (check "finalize normalizes succeeded to completed"
+                   (equal (jget posted "status") "completed"))
+            (check "finalize payload carries source and score_count"
+                   (and (equal (jget* posted "source" "kind") "sdk")
+                        (eql (jget posted "score_count") 3))))))
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-fin"))
+          (declare (ignore get-requests))
+          (finalize-experiment-run client "exp-fin" :status "failed" :error "boom")
+          (let ((posted (payload (first (reverse (cdr calls))))))
+            (check "finalize accepts failed" (equal (jget posted "status") "failed"))
+            (check "finalize carries the error text" (equal (jget posted "error") "boom")))
+          (setf (cdr calls) nil)
+          (check "finalize rejects an unknown status before any request"
+                 (and (signals-condition-p
+                       (lambda () (finalize-experiment-run client "exp-fin" :status "canceled"))
+                       'sigil-validation-error)
+                      (null (cdr calls))))
+          (check "finalize rejects running before any request"
+                 (and (signals-condition-p
+                       (lambda () (finalize-experiment-run client "exp-fin" :status "running"))
+                       'sigil-validation-error)
+                      (null (cdr calls))))))
+
+      ;; --- Read plane stays on /eval/experiments ---
+      (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
              :eval-endpoint "https://sigil.example.test"
-             :generation-enabled nil
-             :traces-enabled nil
+             :generation-enabled nil :traces-enabled nil
              :http-fn (lambda (url &key method headers content &allow-other-keys)
                         (declare (ignore headers))
-                        (push (list method url content) calls)
-                        (values (make-score-response content) 202)))
+                        (push (list method url content) (cdr calls))
+                        (values "{\"experiment_id\":\"exp-read\"}" 200)))
+          (declare (ignore get-requests))
+          (get-experiment client "exp-read")
+          (get-experiment-report client "exp-read")
+          (list-experiment-scores client "exp-read" :limit 10)
+          (let ((urls (mapcar #'second (reverse (cdr calls))))
+                (methods (mapcar #'first (reverse (cdr calls)))))
+            (check "get-experiment reads /eval/experiments/{id}"
+                   (equal (first urls)
+                          "https://sigil.example.test/api/v1/eval/experiments/exp-read"))
+            (check "report reads /eval/experiments/{id}/report"
+                   (equal (second urls)
+                          "https://sigil.example.test/api/v1/eval/experiments/exp-read/report"))
+            (check "scores list reads /eval/experiments/{id}/scores"
+                   (eql 0 (search "https://sigil.example.test/api/v1/eval/experiments/exp-read/scores"
+                                  (third urls))))
+            (check "all three readers use GET" (every (lambda (m) (eq m :get)) methods))
+            (check "reads are not redirected to experiment-runs"
+                   (notany (lambda (u) (search "experiment-runs" u)) urls)))))
+
+      ;; --- Score serialization ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test"
+             :generation-enabled nil :traces-enabled nil
+             :http-fn (routed-http calls "exp-score"))
           (declare (ignore get-requests))
           (let ((accepted (export-scores
                            client
@@ -1771,10 +2078,10 @@
                                        "evaluator_id" "judge"
                                        "evaluator_version" "1"
                                        "score_key" "quality"
-                                       "run_id" "exp-prompt-a"
+                                       "experiment_id" "exp-prompt-a"
                                        "value" 0.9)))))
             (check "export-scores returns accepted count" (= accepted 1))
-            (let* ((call (first (reverse calls)))
+            (let* ((call (first (reverse (cdr calls))))
                    (posted (payload call))
                    (score (aref (jget posted "scores") 0)))
               (check "export-scores POSTs scores path on the generation host"
@@ -1782,17 +2089,76 @@
               (check "numeric score value serializes as number"
                      (let ((value (jget* score "value" "number")))
                        (and (numberp value)
-                            (< (abs (- value 0.9)) 0.001))))))))
-      (let ((cfg-calls nil))
+                            (< (abs (- value 0.9)) 0.001))))
+              (check "serialized score sends experiment_id"
+                     (equal (jget score "experiment_id") "exp-prompt-a"))
+              (check "serialized score sends no run_id"
+                     (null (nth-value 1 (gethash "run_id" score))))))))
+      ;; A trial-anchored score needs no generation.
+      (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
              :eval-endpoint "https://sigil.example.test"
-             :generation-enabled nil
-             :traces-enabled nil
-             :http-fn (lambda (url &key method headers content &allow-other-keys)
-                        (declare (ignore headers content))
-                        (push (list method url content) cfg-calls)
-                        (values "{\"results\":[{\"score_id\":\"score-bad\",\"accepted\":false,\"error\":\"bad\"}]}" 202)))
+             :generation-enabled nil :traces-enabled nil
+             :http-fn (routed-http calls "exp-score"))
+          (declare (ignore get-requests))
+          (let ((accepted (export-scores
+                           client
+                           (list (jobj "score_id" "score-t"
+                                       "trial_id" "trial-abc"
+                                       "test_case_id" "case-1"
+                                       "evaluator_id" "judge"
+                                       "evaluator_version" "1"
+                                       "score_key" "final"
+                                       "experiment_id" "exp-prompt-a"
+                                       "grader_conversation_id" "gconv"
+                                       "grader_generation_id" "ggen"
+                                       "grader_trace_id" "gtrace"
+                                       "value" 1)))))
+            (check "trial-anchored score exports without a generation" (= accepted 1))
+            (let ((score (aref (jget (payload (first (reverse (cdr calls)))) "scores") 0)))
+              (check "trial-anchored score sends top-level trial_id"
+                     (equal (jget score "trial_id") "trial-abc"))
+              (check "trial-anchored score sends no generation_id"
+                     (null (nth-value 1 (gethash "generation_id" score))))
+              (check "trial-anchored score sends test_case_id"
+                     (equal (jget score "test_case_id") "case-1"))
+              (check "trial-anchored score sends grader ids"
+                     (and (equal (jget score "grader_conversation_id") "gconv"
+                                 )
+                          (equal (jget score "grader_generation_id") "ggen")
+                          (equal (jget score "grader_trace_id") "gtrace")))))))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil)
+        (declare (ignore get-requests))
+        (check "score without a generation or trial signals validation"
+               (signals-condition-p
+                (lambda ()
+                  (export-scores client
+                                 (list (jobj "score_id" "score-anchorless"
+                                             "evaluator_id" "judge"
+                                             "evaluator_version" "1"
+                                             "score_key" "quality"
+                                             "value" 1))))
+                'sigil-validation-error))
+        (check "export-scores without value signals validation"
+               (signals-condition-p
+                (lambda ()
+                  (export-scores client
+                                 (list (jobj "score_id" "score-missing"
+                                             "generation_id" "gen-1"
+                                             "evaluator_id" "judge"
+                                             "evaluator_version" "1"
+                                             "score_key" "quality"))))
+                'sigil-validation-error)))
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test"
+             :generation-enabled nil :traces-enabled nil
+             :http-fn (routed-http calls "exp-rej"
+                                   :score-body "{\"results\":[{\"score_id\":\"score-bad\",\"accepted\":false,\"error\":\"bad\"}]}"))
           (declare (ignore get-requests))
           (check "export-scores signals rejected score ids"
                  (signals-condition-p
@@ -1805,48 +2171,17 @@
                                                "score_key" "quality"
                                                "value" 0.9))))
                   'sigil-export-error))))
-      (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
-                            :generation-enabled nil
-                            :traces-enabled nil)
-        (declare (ignore get-requests))
-        (let ((run (sigil-cl::%make-experiment-run :client client
-                                                   :run-id "exp-prompt-a"
-                                                   :name "prompt A")))
-          (check "make-score without value signals validation"
-                 (signals-condition-p
-                  (lambda ()
-                    (experiment-run-add-scores
-                     run
-                     (list (make-score :evaluator-id "judge"
-                                       :evaluator-version "1"
-                                       :score-key "quality"))
-                     :generation-ids '("gen-1")))
-                  'sigil-validation-error))
-          (check "export-scores without value signals validation"
-                 (signals-condition-p
-                  (lambda ()
-                    (export-scores client
-                                   (list (jobj "score_id" "score-missing"
-                                               "generation_id" "gen-1"
-                                               "evaluator_id" "judge"
-                                               "evaluator_version" "1"
-                                               "score_key" "quality"))))
-                  'sigil-validation-error))))
-      (let ((calls nil))
+
+      ;; --- Score metadata and identity on a run ---
+      (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client
-             :eval-endpoint "https://sigil.example.test"
-             :generation-enabled nil
-             :traces-enabled nil
-             :http-fn (lambda (url &key method headers content &allow-other-keys)
-                        (declare (ignore url method headers))
-                        (push content calls)
-                        (values (make-score-response content) 202)))
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-meta"))
           (declare (ignore get-requests))
           (let ((run (sigil-cl::%make-experiment-run :client client
-                                                     :run-id "exp-prompt-a"
-                                                     :name "prompt A")))
+                                                    :run-id "exp-prompt-a"
+                                                    :name "prompt A")))
             (experiment-run-add-scores
              run
              (list (make-score :evaluator-id "judge"
@@ -1857,7 +2192,7 @@
                          "input" "what is the capital of France?"
                          "expected" "Paris")
              :generation-ids '("gen-1"))
-            (let* ((posted (jzon:parse (first (reverse calls))))
+            (let* ((posted (payload (first (reverse (cdr calls)))))
                    (score (aref (jget posted "scores") 0))
                    (metadata (jget score "metadata")))
               (check "score metadata keeps item_id"
@@ -1865,7 +2200,28 @@
               (check "score metadata does not copy item input"
                      (null (jget metadata "input")))
               (check "score metadata does not copy item expected"
-                     (null (jget metadata "expected")))))))
+                     (null (jget metadata "expected")))
+              (check "score metadata omits trial_id, which is top level now"
+                     (null (jget metadata "trial_id")))))))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil)
+        (declare (ignore get-requests))
+        (let ((run (sigil-cl::%make-experiment-run :client client
+                                                  :run-id "exp-prompt-a"
+                                                  :name "prompt A")))
+          (check "make-score without value signals validation"
+                 (signals-condition-p
+                  (lambda ()
+                    (experiment-run-add-scores
+                     run
+                     (list (make-score :evaluator-id "judge"
+                                       :evaluator-version "1"
+                                       :score-key "quality"))
+                     :generation-ids '("gen-1")))
+                  'sigil-validation-error))))
+
+      ;; --- Upload mode validation ---
       (let ((create-count 0))
         (flet ((http (url &key method headers content &allow-other-keys)
                  (declare (ignore url method headers content))
@@ -1888,391 +2244,1193 @@
               (check "with-experiment rejects unknown upload mode before create"
                      (and signaled (zerop create-count)))))))
 
-      ;; :bulk upload buffers scores during the body and publishes on exit.
-      (let ((calls nil))
-        (flet ((http (url &key method headers content &allow-other-keys)
-                 (declare (ignore headers))
-                 (push (list method url content) calls)
-                 (cond
-                   ((search "/api/v1/scores:export" url)
-                    (values (make-score-response content) 202))
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (values (experiment-http-response "exp-bulk" "running") 200))
-                   ((eq method :patch)
-                    (values (experiment-http-response "exp-bulk" (jget (jzon:parse content) "status")) 200))
-                   (t (values "{}" 200)))))
-          (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :generation-enabled nil
-                                :traces-enabled nil
-                                :http-fn #'http)
-            (declare (ignore get-requests))
-            (let ((buffered nil)
-                  (buffered-count nil)
-                  (exports-during-body nil)
-                  (run-object nil))
-              (with-experiment (run client :run-id "exp-bulk" :name "prompt A"
-                                    :upload :bulk)
-                (setf run-object run)
-                (setf buffered
-                      (experiment-run-add-scores
-                       run
-                       (list (make-score :evaluator-id "judge" :evaluator-version "1"
-                                         :score-key "quality" :value 0.5)
-                             (make-score :evaluator-id "judge" :evaluator-version "1"
-                                         :score-key "other" :value 0.7))
-                       :generation-ids '("gen-bulk")))
-                (setf buffered-count (experiment-run-buffered-score-count run)
-                      exports-during-body
-                      (count-if (lambda (call) (search "scores:export" (second call)))
-                                calls)))
-              (check "bulk add-scores returns buffered count" (eql buffered 2))
-              (check "bulk scores buffered during body" (eql buffered-count 2))
-              (check "bulk no export during body" (zerop exports-during-body))
-              (check "bulk publishes once on exit"
-                     (= 1 (count-if (lambda (call) (search "scores:export" (second call)))
-                                    calls)))
-              (check "bulk buffer cleared after publish"
-                     (zerop (experiment-run-buffered-score-count run-object)))
-              (check "bulk accepted count after publish"
-                     (= (experiment-run-accepted-count run-object) 2))
-              (check "bulk finalizes succeeded"
-                     (member "succeeded" (patch-statuses (reverse calls)) :test #'equal))))))
+      ;; --- :bulk buffers during the body and publishes on exit ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-bulk"))
+          (declare (ignore get-requests))
+          (let ((buffered nil)
+                (buffered-count nil)
+                (exports-during-body nil)
+                (run-object nil))
+            (with-experiment (run client :run-id "exp-bulk" :name "prompt A"
+                                  :upload :bulk)
+              (setf run-object run)
+              (setf buffered
+                    (experiment-run-add-scores
+                     run
+                     (list (make-score :evaluator-id "judge" :evaluator-version "1"
+                                       :score-key "quality" :value 0.5)
+                           (make-score :evaluator-id "judge" :evaluator-version "1"
+                                       :score-key "other" :value 0.7))
+                     :generation-ids '("gen-bulk")))
+              (setf buffered-count (experiment-run-buffered-score-count run)
+                    exports-during-body (count-if #'score-call-p (cdr calls))))
+            (check "bulk add-scores returns buffered count" (eql buffered 2))
+            (check "bulk scores buffered during body" (eql buffered-count 2))
+            (check "bulk no export during body" (zerop exports-during-body))
+            (check "bulk publishes once on exit"
+                   (= 1 (count-if #'score-call-p (cdr calls))))
+            (check "bulk buffer cleared after publish"
+                   (zerop (experiment-run-buffered-score-count run-object)))
+            (check "bulk accepted count after publish"
+                   (= (experiment-run-accepted-count run-object) 2))
+            (check "bulk finalizes completed"
+                   (member "completed" (finalize-statuses (reverse (cdr calls)))
+                           :test #'equal)))))
 
-      ;; A failing publish on exit finalizes the run failed, keeps the
-      ;; buffer, and propagates the error.
-      (let ((calls nil)
+      ;; A failing publish on exit finalizes the run failed, keeps the buffer,
+      ;; and propagates the error.
+      (let ((calls (cons :calls nil))
             (run-object nil)
             (signaled nil))
-        (flet ((http (url &key method headers content &allow-other-keys)
-                 (declare (ignore headers))
-                 (push (list method url content) calls)
-                 (cond
-                   ((search "/api/v1/scores:export" url)
-                    (values (jzon:stringify
-                             (jobj "results"
-                                   (jarr (jobj "score_id" "sc1"
-                                               "accepted" nil
-                                               "error" "bad score"))))
-                            202))
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (values (experiment-http-response "exp-pubfail" "running") 200))
-                   ((eq method :patch)
-                    (values (experiment-http-response "exp-pubfail" (jget (jzon:parse content) "status")) 200))
-                   (t (values "{}" 200)))))
-          (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :generation-enabled nil
-                                :traces-enabled nil
-                                :http-fn #'http)
-            (declare (ignore get-requests))
-            (handler-case
-                (with-experiment (run client :run-id "exp-pubfail" :name "prompt A"
-                                      :upload :bulk)
-                  (setf run-object run)
-                  (experiment-run-add-scores
-                   run
-                   (list (make-score :evaluator-id "judge" :evaluator-version "1"
-                                     :score-key "quality" :value 1))
-                   :generation-ids '("gen-pubfail")))
-              (sigil-error () (setf signaled t)))
-            (check "publish failure propagates from with-experiment" signaled)
-            (check "publish failure finalizes failed"
-                   (member "failed" (patch-statuses (reverse calls)) :test #'equal))
-            (check "publish failure does not finalize succeeded"
-                   (not (member "succeeded" (patch-statuses (reverse calls)) :test #'equal)))
-            (check "publish failure keeps the buffer"
-                   (= (experiment-run-buffered-score-count run-object) 1)))))
-
-      ;; :manual upload leaves the run open; the caller publishes and finalizes.
-      (let ((calls nil))
-        (flet ((http (url &key method headers content &allow-other-keys)
-                 (declare (ignore headers))
-                 (push (list method url content) calls)
-                 (cond
-                   ((search "/api/v1/scores:export" url)
-                    (values (make-score-response content) 202))
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (values (experiment-http-response "exp-manual" "running") 200))
-                   ((eq method :patch)
-                    (values (experiment-http-response "exp-manual" (jget (jzon:parse content) "status")) 200))
-                   (t (values "{}" 200)))))
-          (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :generation-enabled nil
-                                :traces-enabled nil
-                                :http-fn #'http)
-            (declare (ignore get-requests))
-            (let ((run-object nil))
-              (with-experiment (run client :run-id "exp-manual" :name "prompt A"
-                                    :upload :manual)
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://sigil.example.test"
+             :generation-enabled nil :traces-enabled nil
+             :http-fn (routed-http calls "exp-pubfail"
+                                   :score-body "{\"results\":[{\"score_id\":\"sc1\",\"accepted\":false,\"error\":\"bad score\"}]}"))
+          (declare (ignore get-requests))
+          (handler-case
+              (with-experiment (run client :run-id "exp-pubfail" :name "prompt A"
+                                    :upload :bulk)
                 (setf run-object run)
                 (experiment-run-add-scores
                  run
                  (list (make-score :evaluator-id "judge" :evaluator-version "1"
                                    :score-key "quality" :value 1))
-                 :generation-ids '("gen-manual")))
-              (check "manual run left open on exit"
-                     (null (patch-statuses (reverse calls))))
-              (check "manual no export on exit"
-                     (notany (lambda (call) (search "scores:export" (second call))) calls))
-              (check "manual buffer persists after exit"
-                     (= (experiment-run-buffered-score-count run-object) 1))
-              (check "manual publish exports buffered scores"
-                     (= (experiment-run-publish run-object) 1))
-              (experiment-run-finalize run-object)
-              (check "manual finalize succeeds after publish"
-                     (member "succeeded" (patch-statuses (reverse calls)) :test #'equal))))))
+                 :generation-ids '("gen-pubfail")))
+            (sigil-error () (setf signaled t)))
+          (check "publish failure propagates from with-experiment" signaled)
+          (check "publish failure finalizes failed"
+                 (member "failed" (finalize-statuses (reverse (cdr calls))) :test #'equal))
+          (check "publish failure does not finalize completed"
+                 (not (member "completed" (finalize-statuses (reverse (cdr calls)))
+                              :test #'equal)))
+          (check "publish failure keeps the buffer"
+                 (= (experiment-run-buffered-score-count run-object) 1))))
 
-      ;; run-experiment loops items, scores them, and returns a summary.
-      (let ((calls nil)
+      ;; --- :manual leaves the run open ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-manual"))
+          (declare (ignore get-requests))
+          (let ((run-object nil))
+            (with-experiment (run client :run-id "exp-manual" :name "prompt A"
+                                  :upload :manual)
+              (setf run-object run)
+              (experiment-run-add-scores
+               run
+               (list (make-score :evaluator-id "judge" :evaluator-version "1"
+                                 :score-key "quality" :value 1))
+               :generation-ids '("gen-manual")))
+            (check "manual run left open on exit"
+                   (null (finalize-statuses (reverse (cdr calls)))))
+            (check "manual no export on exit"
+                   (notany #'score-call-p (cdr calls)))
+            (check "manual buffer persists after exit"
+                   (= (experiment-run-buffered-score-count run-object) 1))
+            (check "manual publish exports buffered scores"
+                   (= (experiment-run-publish run-object) 1))
+            (experiment-run-finalize run-object)
+            (check "manual finalize completes after publish"
+                   (member "completed" (finalize-statuses (reverse (cdr calls)))
+                           :test #'equal)))))
+
+      ;; --- run-experiment creates one trial per dataset item ---
+      (let ((calls (cons :calls nil))
             (conversation-ids nil))
-        (flet ((http (url &key method headers content &allow-other-keys)
-                 (declare (ignore headers))
-                 (push (list method url content) calls)
-                 (cond
-                   ((search "/api/v1/scores:export" url)
-                    (values (make-score-response content) 202))
-                   ((search "generations:export" url)
-                    (values "{}" 200))
-                   ((and (eq method :get) (ends-with-p "/report" url))
-                    (values (jzon:stringify (jobj "run_id" "exp-runner" "score_count" 2)) 200))
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (values (experiment-http-response "exp-runner" "running") 200))
-                   ((eq method :patch)
-                    (values (experiment-http-response "exp-runner" (jget (jzon:parse content) "status")) 200))
-                   (t (values "{}" 200)))))
-          (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :traces-enabled nil
-                                :http-fn #'http)
-            (declare (ignore get-requests))
-            (let* ((items (list (make-dataset-item :id "it1" :input "2+2?")
-                                (make-dataset-item :id "it2" :input "3+3?")))
-                   (result
-                     (run-experiment
-                      client items
-                      (lambda (item run)
-                        (declare (ignore item))
-                        (push (experiment-run-active-conversation-id run)
-                              conversation-ids)
-                        (let ((rec (start-generation client :mode :sync
-                                                     :model-provider "openai"
-                                                     :model-name "gpt-4")))
-                          (recorder-end rec))
-                        nil)
-                      (list (lambda (item target-result)
-                              (declare (ignore target-result))
-                              (list (make-score :evaluator-id "judge"
-                                                :evaluator-version "1"
-                                                :score-key "quality"
-                                                :value 1.0
-                                                :metadata (jobj "item" (jget item "id"))))))
-                      :run-id "exp-runner" :name "runner A")))
-              (check "run-experiment returns run id"
-                     (equal (getf result :run-id) "exp-runner"))
-              (check "run-experiment accepted both scores"
-                     (= (getf result :accepted-scores) 2))
-              (check "run-experiment fetches report"
-                     (equal (jget (getf result :report) "run_id") "exp-runner"))
-              (check "run-experiment assigns stable per-item conversations"
-                     (equal (reverse conversation-ids)
-                            (list (stable-id "conv" "exp-runner" "it1")
-                                  (stable-id "conv" "exp-runner" "it2"))))
-              (let ((score-calls (remove-if-not
-                                  (lambda (call) (search "scores:export" (second call)))
-                                  (reverse calls))))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :traces-enabled nil
+                              :http-fn (routed-http calls "exp-runner"))
+          (declare (ignore get-requests))
+          (let* ((items (list (make-dataset-item :id "it1" :input "2+2?")
+                              (make-dataset-item :id "it2" :input "3+3?")))
+                 (result
+                   (run-experiment
+                    client items
+                    (lambda (item run)
+                      (declare (ignore item))
+                      (push (experiment-run-active-conversation-id run)
+                            conversation-ids)
+                      (let ((rec (start-generation client :mode :sync
+                                                   :model-provider "openai"
+                                                   :model-name "gpt-4")))
+                        (recorder-end rec))
+                      nil)
+                    (list (lambda (item target-result)
+                            (declare (ignore target-result))
+                            (list (make-score :evaluator-id "judge"
+                                              :evaluator-version "1"
+                                              :score-key "quality"
+                                              :value 1.0
+                                              :metadata (jobj "item" (jget item "id"))))))
+                    :run-id "exp-runner" :name "runner A")))
+            (check "run-experiment returns run id"
+                   (equal (getf result :run-id) "exp-runner"))
+            (check "run-experiment accepted both scores"
+                   (= (getf result :accepted-scores) 2))
+            (check "run-experiment fetches report"
+                   (equal (jget (getf result :report) "experiment_id") "exp-runner"))
+            (check "run-experiment assigns stable per-item conversations"
+                   (equal (reverse conversation-ids)
+                          (list (stable-id "conv" "exp-runner" "it1")
+                                (stable-id "conv" "exp-runner" "it2"))))
+            (let* ((ordered (reverse (cdr calls)))
+                   (trial-creates (remove-if-not #'trial-create-call-p ordered))
+                   (trial-patches (remove-if-not #'trial-patch-call-p ordered)))
+              (check "run-experiment creates exactly two trials"
+                     (= (length trial-creates) 2))
+              (check "run-experiment closes both trials"
+                     (= (length trial-patches) 2))
+              (check "each trial snapshots its own dataset item"
+                     (let ((snapshots (mapcar (lambda (c)
+                                                (jget* (payload c) "test_case" "test_case_id"))
+                                              trial-creates)))
+                       (equal snapshots '("it1" "it2"))))
+              (check "trial snapshot wraps a scalar item input"
+                     (equal (jget* (payload (first trial-creates))
+                                   "test_case" "input" "value")
+                            "2+2?"))
+              (check "trial ids are deterministic"
+                     (equal (jget (payload (first trial-creates)) "trial_id")
+                            (stable-id "trial" "exp-runner" "it1" 1)))
+              (check "run finalizes only after both trials close"
+                     (let ((last-patch (position-if #'trial-patch-call-p ordered :from-end t))
+                           (finalize (position-if #'finalize-call-p ordered)))
+                       (and last-patch finalize (< last-patch finalize))))
+              (let ((score-calls (remove-if-not #'score-call-p ordered)))
                 (check "run-experiment exports per item"
                        (= (length score-calls) 2))
                 (let* ((first-payload (payload (first score-calls)))
                        (score (aref (jget first-payload "scores") 0)))
                   (check "run-experiment score has item metadata"
                          (equal (jget* score "metadata" "item_id") "it1"))
+                  (check "run-experiment score anchors to its trial"
+                         (equal (jget score "trial_id")
+                                (stable-id "trial" "exp-runner" "it1" 1)))
+                  (check "run-experiment score carries test_case_id"
+                         (equal (jget score "test_case_id") "it1"))
                   (check "run-experiment score uses stable conversation id"
                          (equal (jget score "conversation_id")
                                 (stable-id "conv" "exp-runner" "it1")))
                   (check "run-experiment score uses captured generation id"
                          (let ((gid (jget score "generation_id")))
-                           (and (stringp gid) (eql 0 (search "gen_" gid)))))))))))
+                           (and (stringp gid) (eql 0 (search "gen_" gid)))))
+                  (check "run-experiment score id matches reference parity"
+                         (equal (jget score "score_id")
+                                (stable-id "score" "exp-runner"
+                                           (stable-id "trial" "exp-runner" "it1" 1)
+                                           "quality" "judge")))))))))
 
-      ;; with-experiment tags generations, captures generation ids for scores,
-      ;; serializes bool/string scores, and finalizes succeeded.
-      (let ((calls nil)
+      ;; Two items sharing an id would mint the same trial id.
+      (let ((calls (cons :calls nil))
+            (signaled nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-dup"))
+          (declare (ignore get-requests))
+          (handler-case
+              (run-experiment client
+                              (list (make-dataset-item :id "same" :input "a")
+                                    (make-dataset-item :id "same" :input "b"))
+                              (lambda (item run) (declare (ignore item run)) nil)
+                              nil
+                              :run-id "exp-dup" :name "dupes" :fetch-report nil)
+            (sigil-validation-error () (setf signaled t)))
+          (check "run-experiment rejects duplicate item ids" signaled)
+          (check "run-experiment creates only the first trial"
+                 (= 1 (count-if #'trial-create-call-p (cdr calls))))
+          (check "a rejected duplicate still finalizes the run failed"
+                 (member "failed" (finalize-statuses (reverse (cdr calls)))
+                         :test #'equal))))
+
+      ;; --- with-experiment: generation tagging, value shapes, completion ---
+      (let ((calls (cons :calls nil))
             (accepted nil)
             (recorded-id nil)
             (run-object nil))
-        (flet ((http (url &key method headers content &allow-other-keys)
-                 (declare (ignore headers))
-                 (push (list method url content) calls)
-                 (cond
-                   ((search "/api/v1/scores:export" url)
-                    (values (make-score-response content) 202))
-                   ((search "generations:export" url)
-                    (values "{}" 200))
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (values (experiment-http-response "exp-prompt-a" "running") 200))
-                   ((eq method :patch)
-                    (values (experiment-http-response "exp-prompt-a" (jget (jzon:parse content) "status")) 200))
-                   (t (values "{}" 200)))))
-          (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :traces-enabled nil
-                                :http-fn #'http)
-            (declare (ignore get-requests))
-            (with-experiment (run client :run-id "exp-prompt-a" :name "prompt A"
-                                  :agent-name "judge-agent"
-                                  :agent-version "1.0"
-                                  :extra-tags '(("candidate" . "a"))
-                                  :extra-metadata '(("run.note" . "yes")))
-              (setf run-object run)
-              (let ((rec (start-generation client
-                             :mode :sync
-                             :model-provider "openai"
-                             :model-name "gpt-4"
-                             :tags '(("caller" . "tag"))
-                             :metadata '(("caller.meta" . "yes")))))
-                (setf recorded-id (gen-rec-generation-id rec))
-                (recorder-end rec)
-                (setf accepted
-                      (experiment-run-add-scores
-                       run
-                       (list (make-score :evaluator-id "judge"
-                                         :evaluator-version "1"
-                                         :score-key "passed"
-                                         :value t
-                                         :passed t)
-                             (make-score :evaluator-id "judge"
-                                         :evaluator-version "1"
-                                         :score-key "label"
-                                         :value "pass")
-                             (make-score :evaluator-id "judge"
-                                         :evaluator-version "1"
-                                         :score-key "failed"
-                                         :value nil)))))))
-          (check "experiment-run-add-scores accepted all scores" (= accepted 3))
-          (check "run captured generation id"
-                 (equal (experiment-run-produced-generation-ids run-object)
-                        (list recorded-id)))
-          (let* ((ordered (reverse calls))
-                 (gen-call (find-if (lambda (call) (search "generations:export" (second call)))
-                                    ordered))
-                 (gen-payload (payload gen-call))
-                 (generation (aref (jget gen-payload "generations") 0))
-                 (score-call (find-if (lambda (call) (search "/api/v1/scores:export" (second call)))
-                                      ordered))
-                 (score-payload (payload score-call))
-                 (first-score (aref (jget score-payload "scores") 0))
-                 (second-score (aref (jget score-payload "scores") 1))
-                 (third-score (aref (jget score-payload "scores") 2)))
-            (check "generation has experiment.run_id tag"
-                   (equal (jget* generation "tags" "experiment.run_id") "exp-prompt-a"))
-            (check "generation has experiment_run_id metadata"
-                   (equal (jget* generation "metadata" "experiment_run_id") "exp-prompt-a"))
-            (check "generation keeps caller tag"
-                   (equal (jget* generation "tags" "caller") "tag"))
-            (check "generation uses experiment agent identity"
-                   (and (equal (jget generation "agent_name") "judge-agent")
-                        (equal (jget generation "agent_version") "1.0")))
-            (check "score uses captured generation id"
-                   (equal (jget first-score "generation_id") recorded-id))
-            (check "score includes run_id"
-                   (equal (jget first-score "run_id") "exp-prompt-a"))
-            (check "score includes experiment source"
-                   (and (equal (jget* first-score "source" "kind") "experiment")
-                        (equal (jget* first-score "source" "id") "exp-prompt-a")))
-            (check "boolean score value serializes as bool"
-                   (eq (jget* first-score "value" "bool") t))
-            (check "string score value serializes as string"
-                   (equal (jget* second-score "value" "string") "pass"))
-            (check "explicit nil score value serializes as false bool"
-                   (multiple-value-bind (value found-p)
-                       (gethash "bool" (jget third-score "value"))
-                     (and found-p (null value))))
-            (check "score conversation_id matches generation"
-                   (equal (jget first-score "conversation_id")
-                          (jget generation "conversation_id")))
-            (check "with-experiment finalizes succeeded"
-                   (member "succeeded" (patch-statuses ordered) :test #'equal)))))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :traces-enabled nil
+                              :http-fn (routed-http calls "exp-prompt-a"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-prompt-a" :name "prompt A"
+                                :agent-name "judge-agent"
+                                :agent-version "1.0"
+                                :extra-tags '(("candidate" . "a"))
+                                :extra-metadata '(("run.note" . "yes")))
+            (setf run-object run)
+            (let ((rec (start-generation client
+                           :mode :sync
+                           :model-provider "openai"
+                           :model-name "gpt-4"
+                           :tags '(("caller" . "tag"))
+                           :metadata '(("caller.meta" . "yes")))))
+              (setf recorded-id (gen-rec-generation-id rec))
+              (recorder-end rec)
+              (setf accepted
+                    (experiment-run-add-scores
+                     run
+                     (list (make-score :evaluator-id "judge"
+                                       :evaluator-version "1"
+                                       :score-key "passed"
+                                       :value t
+                                       :passed t)
+                           (make-score :evaluator-id "judge"
+                                       :evaluator-version "1"
+                                       :score-key "label"
+                                       :value "pass")
+                           (make-score :evaluator-id "judge"
+                                       :evaluator-version "1"
+                                       :score-key "failed"
+                                       :value nil)))))))
+        (check "experiment-run-add-scores accepted all scores" (= accepted 3))
+        (check "run captured generation id"
+               (equal (experiment-run-produced-generation-ids run-object)
+                      (list recorded-id)))
+        (let* ((ordered (reverse (cdr calls)))
+               (gen-call (find-if (lambda (call) (search "generations:export" (second call)))
+                                  ordered))
+               (gen-payload (payload gen-call))
+               (generation (aref (jget gen-payload "generations") 0))
+               (score-call (find-if #'score-call-p ordered))
+               (score-payload (payload score-call))
+               (first-score (aref (jget score-payload "scores") 0))
+               (second-score (aref (jget score-payload "scores") 1))
+               (third-score (aref (jget score-payload "scores") 2)))
+          (check "generation has experiment.run_id tag"
+                 (equal (jget* generation "tags" "experiment.run_id") "exp-prompt-a"))
+          (check "generation has experiment_run_id metadata"
+                 (equal (jget* generation "metadata" "experiment_run_id") "exp-prompt-a"))
+          (check "generation keeps caller tag"
+                 (equal (jget* generation "tags" "caller") "tag"))
+          (check "generation uses experiment agent identity"
+                 (and (equal (jget generation "agent_name") "judge-agent")
+                      (equal (jget generation "agent_version") "1.0")))
+          (check "score uses captured generation id"
+                 (equal (jget first-score "generation_id") recorded-id))
+          (check "score includes experiment_id"
+                 (equal (jget first-score "experiment_id") "exp-prompt-a"))
+          (check "score omits run_id"
+                 (null (nth-value 1 (gethash "run_id" first-score))))
+          (check "score includes experiment source"
+                 (and (equal (jget* first-score "source" "kind") "experiment")
+                      (equal (jget* first-score "source" "id") "exp-prompt-a")))
+          (check "boolean score value serializes as bool"
+                 (eq (jget* first-score "value" "bool") t))
+          (check "string score value serializes as string"
+                 (equal (jget* second-score "value" "string") "pass"))
+          (check "explicit nil score value serializes as false bool"
+                 (multiple-value-bind (value found-p)
+                     (gethash "bool" (jget third-score "value"))
+                   (and found-p (null value))))
+          (check "score conversation_id matches generation"
+                 (equal (jget first-score "conversation_id")
+                        (jget generation "conversation_id")))
+          (check "with-experiment finalizes completed"
+                 (member "completed" (finalize-statuses ordered) :test #'equal))))
 
-      ;; Conflict creates are reopened by PATCHing status=running before the body.
-      (let ((calls nil)
-            (create-count 0)
+      ;; --- Conflict on upsert ---
+      ;;
+      ;; :reopen continues only for a conflict the caller can still work
+      ;; through. A run the backend calls terminal would take trials and a
+      ;; finalize it has already refused, so that one propagates.
+      (let ((calls (cons :calls nil))
             (body-ran nil))
         (flet ((http (url &key method headers content &allow-other-keys)
                  (declare (ignore headers))
-                 (push (list method url content) calls)
+                 (push (list method url content) (cdr calls))
                  (cond
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (incf create-count)
-                    (if (= create-count 1)
-                        (values "exists" 409)
-                        (values (experiment-http-response "exp-prompt-a" "running") 200)))
-                   ((eq method :patch)
-                    (values (experiment-http-response "exp-prompt-a" (jget (jzon:parse content) "status")) 200))
+                   ((and (eq method :post) (search "experiment-runs:upsert" url))
+                    (values "an open draft already exists for this experiment" 409))
                    (t (values "{}" 200)))))
           (multiple-value-bind (client get-requests)
               (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :generation-enabled nil
-                                :traces-enabled nil
+                                :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
-            (with-experiment (run client :run-id "exp-prompt-a" :name "prompt A")
+            (with-experiment (run client :run-id "exp-conflict" :name "prompt A")
               (declare (ignore run))
-              (setf body-ran t)))
-          (let ((statuses (patch-statuses (reverse calls))))
-            (check "with-experiment body runs after conflict reopen" body-ran)
-            (check "conflict reopen PATCHes running"
-                   (member "running" statuses :test #'equal))
-            (check "conflict run still finalizes succeeded"
-                   (member "succeeded" statuses :test #'equal)))))
-
-      ;; Error and non-local exits map to failed/canceled finalization.
-      (let ((calls nil))
+              (setf body-ran t))
+            (check "with-experiment body runs after a recoverable upsert conflict"
+                   body-ran)
+            (check "conflict reopen issues no PATCH to /eval/experiments"
+                   (notany (lambda (call)
+                             (and (search "/eval/experiments" (second call))
+                                  (member (first call) '(:post :patch))))
+                           (cdr calls))))))
+      (let ((calls (cons :calls nil))
+            (signaled nil))
         (flet ((http (url &key method headers content &allow-other-keys)
                  (declare (ignore headers))
-                 (push (list method url content) calls)
+                 (push (list method url content) (cdr calls))
                  (cond
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (values (experiment-http-response "exp-fail" "running") 200))
-                   ((eq method :patch)
-                    (values (experiment-http-response "exp-fail" (jget (jzon:parse content) "status")) 200))
+                   ((and (eq method :post) (search "experiment-runs:upsert" url))
+                    (values "experiment \"exp-terminal\" is already finalized as completed" 409))
                    (t (values "{}" 200)))))
           (multiple-value-bind (client get-requests)
               (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :generation-enabled nil
-                                :traces-enabled nil
+                                :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
             (handler-case
-                (with-experiment (run client :run-id "exp-fail" :name "prompt A")
-                  (declare (ignore run))
-                  (error "boom"))
-              (error () nil)))
-          (check "with-experiment finalizes failed on error"
-                 (member "failed" (patch-statuses (reverse calls)) :test #'equal))))
-      (let ((calls nil))
+                (with-experiment (run client :run-id "exp-terminal" :name "prompt A")
+                  (declare (ignore run)))
+              (sigil-conflict-error (e)
+                (setf signaled (sigil-conflict-error-kind e))))
+            (check "a terminal conflict propagates even under :reopen"
+                   (eq signaled :terminal))
+            (check "a terminal conflict writes nothing into the refused run"
+                   (notany (lambda (call)
+                             (or (search "/trials" (second call))
+                                 (search ":finalize" (second call))))
+                           (cdr calls))))))
+      (let ((calls (cons :calls nil))
+            (signaled nil))
         (flet ((http (url &key method headers content &allow-other-keys)
-                 (declare (ignore headers content))
-                 (push (list method url content) calls)
-                 (cond
-                   ((and (eq method :post) (ends-with-p "/api/v1/eval/experiments" url))
-                    (values (experiment-http-response "exp-cancel" "running") 200))
-                   ((and (eq method :post) (search ":cancel" url))
-                    (values (experiment-http-response "exp-cancel" "canceled") 200))
-                   (t (values "{}" 200)))))
+                 (declare (ignore headers))
+                 (push (list method url content) (cdr calls))
+                 (if (search "experiment-runs:upsert" url)
+                     (values "conflict" 409)
+                     (values "{}" 200))))
           (multiple-value-bind (client get-requests)
               (make-test-client :eval-endpoint "https://sigil.example.test"
-                                :generation-enabled nil
-                                :traces-enabled nil
+                                :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
-            (catch 'abort
-              (with-experiment (run client :run-id "exp-cancel" :name "prompt A")
+            (handler-case
+                (with-experiment (run client :run-id "exp-conflict2" :name "prompt A"
+                                      :on-conflict :error)
+                  (declare (ignore run)))
+              (sigil-conflict-error () (setf signaled t)))
+            (check "on-conflict :error propagates the conflict" signaled))))
+
+      ;; --- Error and non-local exits both finalize failed ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-fail"))
+          (declare (ignore get-requests))
+          (handler-case
+              (with-experiment (run client :run-id "exp-fail" :name "prompt A")
                 (declare (ignore run))
-                (throw 'abort :done))))
-          (check "with-experiment cancels on non-local exit"
-                 (some (lambda (call) (search ":cancel" (second call)))
-                       (reverse calls))))))))
+                (error "boom"))
+            (error () nil))
+          (check "with-experiment finalizes failed on error"
+                 (member "failed" (finalize-statuses (reverse (cdr calls))) :test #'equal))))
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-abort"))
+          (declare (ignore get-requests))
+          (catch 'abort
+            (with-experiment (run client :run-id "exp-abort" :name "prompt A")
+              (declare (ignore run))
+              (throw 'abort :done)))
+          (check "non-local exit finalizes failed instead of cancelling"
+                 (member "failed" (finalize-statuses (reverse (cdr calls))) :test #'equal))
+          (check "non-local exit issues no cancel request"
+                 (notany (lambda (call) (search ":cancel" (second call))) (cdr calls)))))
+
+      ;; --- A trial that will not close blocks the score count ---
+      (let ((calls (cons :calls nil)))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore headers))
+                 (push (list method url content) (cdr calls))
+                 (cond
+                   ;; Every score is rejected, so each trial's flush raises.
+                   ((search "scores:export" url)
+                    (values "{\"results\":[{\"score_id\":\"x\",\"accepted\":false,\"error\":\"bad\"}]}"
+                            202))
+                   (t (values (jzon:stringify (jobj "experiment_id" "exp-partial")) 200)))))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :generation-enabled nil :traces-enabled nil
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (with-experiment (run client :run-id "exp-partial" :name "partial")
+              ;; Two trials are left open; both must be attempted at exit.
+              (dolist (case-id '("case-1" "case-2"))
+                (let ((trial (experiment-run-open-trial run case-id)))
+                  (trial-add-scores trial
+                                    (list (make-score :evaluator-id "judge"
+                                                      :evaluator-version "1"
+                                                      :score-key "final"
+                                                      :value 1))))))
+            (let* ((ordered (reverse (cdr calls)))
+                   (finalize (find-if #'finalize-call-p ordered)))
+              (check "both open trials are attempted before finalization"
+                     (= 2 (count-if #'score-call-p ordered)))
+              (check "a run with a failed trial close finalizes failed"
+                     (equal (jget (payload finalize) "status") "failed"))
+              (check "a run with a failed trial close omits score_count"
+                     (null (nth-value 1 (gethash "score_count" (payload finalize)))))
+              (check "the finalize error names the trial close failure"
+                     (search "trial close failed" (jget (payload finalize) "error")))))))
+
+      ;; A close failure in manual mode is still a failure: the trials that
+      ;; would not close took their scores with them, so the run cannot be
+      ;; left open reporting a buffered count.
+      (let ((calls (cons :calls nil)))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore headers))
+                 (push (list method url content) (cdr calls))
+                 (if (eq method :patch)
+                     (values "trial gone" 404)
+                     (values (jzon:stringify (jobj "experiment_id" "exp-manual")) 200))))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :generation-enabled nil :traces-enabled nil
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (with-experiment (run client :run-id "exp-manual" :name "manual"
+                                  :upload :manual)
+              (experiment-run-open-trial run "case-1"))
+            (let ((finalize (find-if #'finalize-call-p (reverse (cdr calls)))))
+              (check "manual mode still finalizes failed when a trial will not close"
+                     (and finalize (equal (jget (payload finalize) "status") "failed")))))))
+
+      ;; --- Score export never falls back to the eval auth headers ---
+      (let ((score-headers :none))
+        (multiple-value-bind (client get-requests)
+            (make-test-client
+             :eval-endpoint "https://eval.test"
+             :generation-endpoint "http://gen.test/api/v1/generations:export"
+             :generation-enabled nil :traces-enabled nil
+             :eval-auth-token "SECRET-EVAL-TOKEN"
+             :auth-mode :none :auth-password nil :ingest-actor ""
+             :http-fn (lambda (url &key method headers content &allow-other-keys)
+                        (declare (ignore method content))
+                        (when (search "scores:export" url)
+                          (setf score-headers headers))
+                        (values (jzon:stringify (jobj "experiment_id" "exp-auth")) 200)))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-auth" :name "auth")
+            (experiment-run-add-scores
+             run
+             (list (make-score :evaluator-id "judge" :evaluator-version "1"
+                               :score-key "final" :value 1
+                               :generation-id "gen-1"))))
+          (check "score export reached the generation host"
+                 (not (eq score-headers :none)))
+          (check "score export sends no eval Authorization header"
+                 (null (assoc "Authorization" score-headers :test #'equal)))))
+
+      ;; --- Trial-anchored scores do not need a generation ---
+      ;;
+      ;; The trial is the anchor, so an item that produced several generations
+      ;; does not have to name one, and a trial does not inherit the previous
+      ;; trial's captured generations.
+      (let ((calls (cons :calls nil))
+            (buffered nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-multi"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-multi" :name "multi")
+            (let ((trial (experiment-run-open-trial run "case-multi")))
+              (experiment-run-track-generation-id run "gen-a")
+              (experiment-run-track-generation-id run "gen-b")
+              (setf buffered
+                    (trial-add-scores trial
+                                      (list (make-score :evaluator-id "judge"
+                                                        :evaluator-version "1"
+                                                        :score-key "final"
+                                                        :value 1))))
+              (trial-close trial)))
+          (check "a trial-anchored score survives several captured generations"
+                 (eql buffered 1))
+          (let ((score (aref (jget (payload (find-if #'score-call-p (reverse (cdr calls))))
+                                   "scores")
+                             0)))
+            (check "a score with no chosen generation omits generation_id"
+                   (null (nth-value 1 (gethash "generation_id" score)))))))
+      (let ((calls (cons :calls nil))
+            (second-score nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-carry"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-carry" :name "carry")
+            (let ((first-trial (experiment-run-open-trial run "case-1")))
+              (experiment-run-track-generation-id run "gen-first")
+              (trial-close first-trial))
+            (let ((second-trial (experiment-run-open-trial run "case-2")))
+              (trial-add-scores second-trial
+                                (list (make-score :evaluator-id "judge"
+                                                  :evaluator-version "1"
+                                                  :score-key "final" :value 1)))
+              (trial-close second-trial)
+              (setf second-score
+                    (aref (jget (payload (find-if #'score-call-p (reverse (cdr calls))))
+                                "scores")
+                          0))))
+          (check "a new trial does not inherit the previous trial's generation"
+                 (null (nth-value 1 (gethash "generation_id" second-score))))))
+
+      ;; --- Whitespace around an item id does not collapse two trials ---
+      (let ((calls (cons :calls nil))
+            (first-id nil)
+            (second-id nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-ws"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-ws" :name "whitespace")
+            (setf first-id (trial-id (experiment-run-open-trial
+                                      run (make-dataset-item :id "a"))))
+            (check "a whitespace-only variant of a used id is rejected"
+                   (signals-condition-p
+                    (lambda () (experiment-run-open-trial run (make-dataset-item :id " a ")))
+                    'sigil-validation-error))
+            (setf second-id (trial-id (experiment-run-open-trial
+                                       run (make-dataset-item :id " b ")))))
+          (check "a trimmed id mints the trimmed trial"
+                 (equal second-id (stable-id "trial" "exp-ws" "b" 1)))
+          (check "trials with distinct ids do not collide"
+                 (not (equal first-id second-id)))
+          (check "every opened trial closed"
+                 (= 2 (count-if #'trial-patch-call-p (cdr calls))))))
+
+      ;; --- A failed trial create releases its claim ---
+      (let ((calls (cons :calls nil))
+            (fail-create t)
+            (retried nil))
+        (flet ((http (url &key method headers content &allow-other-keys)
+                 (declare (ignore headers))
+                 (push (list method url content) (cdr calls))
+                 (if (and fail-create (search "/trials" url) (eq method :post))
+                     (values "boom" 500)
+                     (values (jzon:stringify (jobj "experiment_id" "exp-retry")) 200))))
+          (multiple-value-bind (client get-requests)
+              (make-test-client :eval-endpoint "https://sigil.example.test"
+                                :generation-enabled nil :traces-enabled nil
+                                :max-retries 1
+                                :http-fn #'http)
+            (declare (ignore get-requests))
+            (with-experiment (run client :run-id "exp-retry" :name "retry")
+              (handler-case
+                  (experiment-run-open-trial run "case-1")
+                (sigil-error () nil))
+              (setf fail-create nil)
+              (setf retried (experiment-run-open-trial run "case-1")))
+            (check "a trial create that failed can be retried at the same attempt"
+                   (equal (trial-id retried) (stable-id "trial" "exp-retry" "case-1" 1))))))
+
+      ;; --- A closed trial refuses further scores ---
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-closed"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-closed" :name "closed")
+            (let ((trial (experiment-run-open-trial run "case-1")))
+              (trial-close trial)
+              (check "adding scores to a closed trial signals"
+                     (signals-condition-p
+                      (lambda ()
+                        (trial-add-scores trial
+                                          (list (make-score :evaluator-id "judge"
+                                                            :evaluator-version "1"
+                                                            :score-key "final"
+                                                            :value 1))))
+                      'sigil-validation-error))))))
+
+      ;; --- A rejected batch does not consume score ids ---
+      (let ((calls (cons :calls nil))
+            (trial-id nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-ids"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-ids" :name "ids")
+            (let ((trial (experiment-run-open-trial run "case-1")))
+              (setf trial-id (trial-id trial))
+              ;; The second score has no value, so the whole batch is rejected.
+              (check "a malformed score rejects the batch"
+                     (signals-condition-p
+                      (lambda ()
+                        (trial-add-scores trial
+                                          (list (make-score :evaluator-id "judge"
+                                                            :evaluator-version "1"
+                                                            :score-key "final"
+                                                            :value 1)
+                                                (list :evaluator-id "judge"
+                                                      :evaluator-version "1"
+                                                      :score-key "final"))))
+                      'sigil-validation-error))
+              (trial-add-scores trial
+                                (list (make-score :evaluator-id "judge"
+                                                  :evaluator-version "1"
+                                                  :score-key "final" :value 1)))
+              (trial-close trial)))
+          (let ((score (aref (jget (payload (find-if #'score-call-p (reverse (cdr calls))))
+                                   "scores")
+                             0)))
+            (check "the corrected retry mints the canonical first score id"
+                   (equal (jget score "score_id")
+                          (stable-id "score" "exp-ids" trial-id "final" "judge")))))))))
+
+;;; ================================================================
+;;; Trial tests
+;;; ================================================================
+
+(defun run-trial-tests ()
+  (with-test-suite ("Trials")
+
+    ;; --- Deterministic identity ---
+    (check "trial id matches stable-id inputs"
+           (equal (trial-mint-id "exp-1" "case-1" 1)
+                  (stable-id "trial" "exp-1" "case-1" 1)))
+    (check "trial id varies by attempt"
+           (not (equal (trial-mint-id "exp-1" "case-1" 1)
+                       (trial-mint-id "exp-1" "case-1" 2))))
+    (check "trial id varies by test case"
+           (not (equal (trial-mint-id "exp-1" "case-1" 1)
+                       (trial-mint-id "exp-1" "case-2" 1))))
+
+    ;; --- Trial create request body ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((trial (trial-open client "exp-1" "case-1"
+                                 :attempt 1
+                                 :test-case (make-test-case :id "case-1"
+                                                            :name "capital"
+                                                            :tags '("smoke")
+                                                            :category "qa"
+                                                            :input "hello"
+                                                            :expected "world")
+                                 :suite-id "suite-1"
+                                 :suite-version "v2")))
+          (let* ((call (first (reverse (cdr calls))))
+                 (posted (payload call)))
+            (check "trial create POSTs the trials route"
+                   (and (eq (first call) :post)
+                        (equal (second call)
+                               "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials")))
+            (check "trial create sends status running"
+                   (equal (jget posted "status") "running"))
+            (check "trial create sends the deterministic trial id"
+                   (equal (jget posted "trial_id")
+                          (stable-id "trial" "exp-1" "case-1" 1)))
+            (check "trial create sends test_case_id and attempt"
+                   (and (equal (jget posted "test_case_id") "case-1")
+                        (eql (jget posted "attempt") 1)))
+            (check "trial create sends a test_case snapshot"
+                   (hash-table-p (jget posted "test_case")))
+            (check "snapshot input is an object wrapping the scalar"
+                   (equal (jget* posted "test_case" "input" "value") "hello"))
+            (check "snapshot expected is an object wrapping the scalar"
+                   (equal (jget* posted "test_case" "expected" "value") "world"))
+            (check "snapshot carries suite id and version"
+                   (and (equal (jget* posted "test_case" "suite_id") "suite-1")
+                        (equal (jget* posted "test_case" "suite_version") "v2")))
+            (check "snapshot carries name, tags, and category"
+                   (and (equal (jget* posted "test_case" "name") "capital")
+                        (equal (aref (jget* posted "test_case" "tags") 0) "smoke")
+                        (equal (jget* posted "test_case" "category") "qa")))
+            (check "trial-created-p is set after create" (trial-created-p trial)))
+          ;; --- Sparse close ---
+          (setf (cdr calls) nil)
+          (trial-close trial)
+          (let* ((call (first (reverse (cdr calls))))
+                 (posted (payload call)))
+            (check "trial close PATCHes the trial route"
+                   (and (eq (first call) :patch)
+                        (equal (second call)
+                               (format nil "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials/~a"
+                                       (trial-id trial)))))
+            (check "clean close sends status completed"
+                   (equal (jget posted "status") "completed"))
+            (check "clean close body is sparse"
+                   (= (hash-table-count posted) 1))
+            (check "trial-closed-p is set after close" (trial-closed-p trial)))
+          (setf (cdr calls) nil)
+          (trial-close trial)
+          (check "closing twice issues no second request" (null (cdr calls))))))
+
+    ;; --- Error close ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((trial (trial-open client "exp-1" "case-err")))
+          (setf (cdr calls) nil)
+          (trial-close trial :error "boom")
+          (let ((posted (payload (first (reverse (cdr calls))))))
+            (check "error close sends status failed"
+                   (equal (jget posted "status") "failed"))
+            (check "error close sends the error text"
+                   (equal (jget posted "error") "boom"))))))
+
+    ;; A locally failed assertion still closes the trial as completed; the
+    ;; verdict rides on the final score's `passed`, not the trial status.
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((trial (trial-open client "exp-1" "case-verdict")))
+          (setf (cdr calls) nil)
+          (trial-close trial :status "passed")
+          (check "a passed trial closes as completed"
+                 (equal (jget (payload (first (reverse (cdr calls)))) "status")
+                        "completed")))))
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((trial (trial-open client "exp-1" "case-errored")))
+          (setf (cdr calls) nil)
+          (trial-close trial :status "errored")
+          (check "an errored trial closes as failed"
+                 (equal (jget (payload (first (reverse (cdr calls)))) "status")
+                        "failed")))))
+    ;; Only an errored trial is failed. A trial that ran fine and failed its
+    ;; assertion is completed, so it counts as executed in the report.
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((trial (trial-open client "exp-1" "case-assert")))
+          (setf (cdr calls) nil)
+          (trial-close trial :status "failed")
+          (check "a locally failed assertion closes as completed"
+                 (equal (jget (payload (first (reverse (cdr calls)))) "status")
+                        "completed")))))
+
+    ;; --- Bind helpers are local only ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (let ((trial (trial-open client "exp-1" "case-bind")))
+          (setf (cdr calls) nil)
+          (trial-bind-generation trial "gen-9")
+          (trial-bind-conversation trial "conv-9" :trace-id "tr-9" :span-id "sp-9")
+          (check "bind helpers issue no request" (null (cdr calls)))
+          (check "bind-generation sets the generation id"
+                 (equal (trial-generation-id trial) "gen-9"))
+          (check "bind-conversation sets conversation, trace, and span"
+                 (and (equal (trial-conversation-id trial) "conv-9")
+                      (equal (trial-trace-id trial) "tr-9")
+                      (equal (trial-span-id trial) "sp-9")))
+          (trial-close trial)
+          (let ((posted (payload (first (reverse (cdr calls))))))
+            (check "close forwards bound correlation ids"
+                   (and (equal (jget posted "conversation_id") "conv-9")
+                        (equal (jget posted "trace_id") "tr-9")
+                        (equal (jget posted "span_id") "sp-9")))))))
+
+    ;; --- Scores flush before the closing PATCH ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-1" :name "flush order")
+          (let ((trial (experiment-run-open-trial run "case-flush")))
+            (setf (cdr calls) nil)
+            (trial-add-scores trial
+                              (list (make-score :evaluator-id "judge"
+                                                :evaluator-version "1"
+                                                :score-key "final"
+                                                :value 1
+                                                :passed t)))
+            (check "add-scores alone exports nothing"
+                   (notany #'score-call-p (cdr calls)))
+            (check "add-scores alone does not close the trial"
+                   (and (not (trial-closed-p trial))
+                        (notany (lambda (c) (eq (first c) :patch)) (cdr calls))))
+            (trial-close trial)
+            (let* ((ordered (reverse (cdr calls)))
+                   (score-index (position-if #'score-call-p ordered))
+                   (patch-index (position-if (lambda (c) (eq (first c) :patch)) ordered)))
+              (check "continuous mode exports the trial's scores at close"
+                     (and score-index t))
+              (check "scores are exported before the closing PATCH"
+                     (and score-index patch-index (< score-index patch-index)))
+              (let ((score (aref (jget (payload (nth score-index ordered)) "scores") 0)))
+                (check "flushed score anchors to the trial"
+                       (equal (jget score "trial_id") (trial-id trial)))
+                (check "flushed score needs no generation"
+                       (null (nth-value 1 (gethash "generation_id" score))))))))))
+
+    ;; In :bulk and :manual, closing a trial moves its scores to the run
+    ;; buffer instead of exporting them; the run publishes at exit.
+    (let ((calls (cons :calls nil))
+          (buffered-after-close nil))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-1" :name "bulk trial"
+                              :upload :bulk)
+          (let ((trial (experiment-run-open-trial run "case-bulk")))
+            (trial-add-scores trial
+                              (list (make-score :evaluator-id "judge"
+                                                :evaluator-version "1"
+                                                :score-key "final" :value 1)))
+            (setf (cdr calls) nil)
+            (trial-close trial)
+            (setf buffered-after-close (experiment-run-buffered-score-count run))
+            (check "bulk trial close exports nothing"
+                   (notany #'score-call-p (cdr calls)))
+            (check "bulk trial close still PATCHes the trial"
+                   (some (lambda (c) (eq (first c) :patch)) (cdr calls)))))
+        (check "bulk trial scores land in the run buffer"
+               (eql buffered-after-close 1))
+        (check "bulk publishes the trial's scores at run exit"
+               (= 1 (count-if #'score-call-p (cdr calls))))))
+
+    ;; --- Deterministic score ids and occurrence counters ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-1" :name "score ids")
+          (let ((trial (experiment-run-open-trial run "case-ids")))
+            (setf (cdr calls) nil)
+            (trial-add-scores trial
+                              (list (make-score :evaluator-id "judge"
+                                                :evaluator-version "1"
+                                                :score-key "final" :value 1)
+                                    (make-score :evaluator-id "judge"
+                                                :evaluator-version "1"
+                                                :score-key "final" :value 0)
+                                    (make-score :evaluator-id "judge"
+                                                :evaluator-version "1"
+                                                :score-key "final" :value 1)))
+            (trial-close trial)
+            (let* ((score-call (find-if #'score-call-p (reverse (cdr calls))))
+                   (scores (jget (payload score-call) "scores"))
+                   (first-id (jget (aref scores 0) "score_id"))
+                   (second-id (jget (aref scores 1) "score_id"))
+                   (third-id (jget (aref scores 2) "score_id")))
+              (check "first score id matches reference parity"
+                     (equal first-id
+                            (stable-id "score" "exp-1" (trial-id trial) "final" "judge")))
+              (check "a repeated pair appends an occurrence counter"
+                     (equal second-id
+                            (stable-id "score" "exp-1" (trial-id trial) "final" "judge" 2)))
+              (check "the third occurrence gets its own counter"
+                     (equal third-id
+                            (stable-id "score" "exp-1" (trial-id trial) "final" "judge" 3)))
+              (check "repeated scores get distinct ids"
+                     (and (not (equal first-id second-id))
+                          (not (equal second-id third-id)))))))))
+
+    ;; --- Duplicate (test-case-id, attempt) is rejected locally ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-1" :name "dupes")
+          (experiment-run-open-trial run "case-dup")
+          (setf (cdr calls) nil)
+          (check "a duplicate attempt signals a validation error"
+                 (signals-condition-p
+                  (lambda () (experiment-run-open-trial run "case-dup"))
+                  'sigil-validation-error))
+          (check "a duplicate attempt records no second trial-create request"
+                 (null (cdr calls)))
+          (check "the collision error names the test case and attempt"
+                 (handler-case
+                     (progn (experiment-run-open-trial run "case-dup") nil)
+                   (sigil-validation-error (e)
+                     (and (search "case-dup" (sigil-error-message e))
+                          (search "already exists" (sigil-error-message e))
+                          t))))
+          (check "a second attempt of the same case is allowed"
+                 (let ((trial (experiment-run-open-trial run "case-dup" :attempt 2)))
+                   (equal (trial-id trial)
+                          (stable-id "trial" "exp-1" "case-dup" 2)))))))
+
+    ;; --- with-trial ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-1" :name "with-trial")
+          (setf (cdr calls) nil)
+          (with-trial (trial run "case-macro")
+            (check "with-trial binds an open trial"
+                   (and (typep trial 'experiment-trial)
+                        (not (trial-closed-p trial)))))
+          (check "with-trial closes the trial on normal exit"
+                 (some (lambda (c) (eq (first c) :patch)) (cdr calls)))
+          (check "with-trial closes completed on normal exit"
+                 (equal (jget (payload (find-if (lambda (c) (eq (first c) :patch))
+                                                (reverse (cdr calls))))
+                              "status")
+                        "completed")))))
+    (let ((calls (cons :calls nil))
+          (signaled nil))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-1" :name "with-trial error")
+          (setf (cdr calls) nil)
+          (handler-case
+              (with-trial (trial run "case-macro-err")
+                (declare (ignore trial))
+                (error "trial boom"))
+            (error () (setf signaled t)))
+          (check "with-trial propagates the body error" signaled)
+          (let ((posted (payload (find-if (lambda (c) (eq (first c) :patch))
+                                          (reverse (cdr calls))))))
+            (check "with-trial closes failed on error"
+                   (equal (jget posted "status") "failed"))
+            (check "with-trial sends the error text"
+                   (search "trial boom" (jget posted "error")))))))
+    ;; A close that signals must not swallow the body's own error, and must
+    ;; leave the trial closable again so run teardown can report it.
+    (let ((calls (cons :calls nil))
+          (seen nil))
+      (flet ((http (url &key method headers content &allow-other-keys)
+               (declare (ignore headers))
+               (push (list method url content) (cdr calls))
+               (if (search "scores:export" url)
+                   (values "{\"results\":[{\"score_id\":\"x\",\"accepted\":false,\"error\":\"bad\"}]}"
+                           202)
+                   (values (jzon:stringify (jobj "experiment_id" "exp-1")) 200))))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn #'http)
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-1" :name "close failure")
+            (handler-case
+                (with-trial (trial run "case-close-fail")
+                  (trial-add-scores trial
+                                    (list (make-score :evaluator-id "judge"
+                                                      :evaluator-version "1"
+                                                      :score-key "final" :value 1)))
+                  (error "body boom"))
+              (error (e) (setf seen (princ-to-string e))))
+            (check "a failing close keeps the body's error"
+                   (and seen (search "body boom" seen)))
+            (check "a trial whose close failed is still open"
+                   (= 1 (length (experiment-run-open-trials-list run))))))))
+
+    ;; A throw out of the body never verified the case, so the trial is failed
+    ;; rather than completed.
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-1"))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-1" :name "with-trial throw")
+          (setf (cdr calls) nil)
+          (catch 'skip
+            (with-trial (trial run "case-macro-throw")
+              (declare (ignore trial))
+              (throw 'skip :done)))
+          (let ((posted (payload (find-if (lambda (c) (eq (first c) :patch))
+                                          (reverse (cdr calls))))))
+            (check "a non-local exit closes the trial failed"
+                   (equal (jget posted "status") "failed"))
+            (check "a non-local exit names itself in the trial error"
+                   (search "non-local exit" (jget posted "error")))))))
+
+    ;; --- Transport validation ---
+    (multiple-value-bind (client get-requests)
+        (make-test-client :eval-endpoint "https://sigil.example.test"
+                          :generation-enabled nil :traces-enabled nil)
+      (declare (ignore get-requests))
+      (check "create-trial requires a trial id"
+             (signals-condition-p
+              (lambda () (create-trial client "exp-1" :test-case-id "c"))
+              'sigil-validation-error))
+      (check "create-trial requires a test case id"
+             (signals-condition-p
+              (lambda () (create-trial client "exp-1" :trial-id "t"))
+              'sigil-validation-error))
+      (check "finalize-trial requires a trial id"
+             (signals-condition-p
+              (lambda () (finalize-trial client "exp-1" "" :status "completed"))
+              'sigil-validation-error))
+      (check "trial routes require an experiment id"
+             (signals-condition-p
+              (lambda () (create-trial client "" :trial-id "t" :test-case-id "c"))
+              'sigil-validation-error)))))
+
+;;; ================================================================
+;;; Local suite tests
+;;; ================================================================
+
+(defun run-suite-tests ()
+  (with-test-suite ("Suites")
+
+    ;; --- Test cases ---
+    (let ((tc (make-test-case :id "case-1" :name "capital"
+                              :description "a description"
+                              :tags '("smoke" "fast")
+                              :category "qa"
+                              :input "hello" :expected "world"
+                              :metadata (jobj "owner" "me"))))
+      (check "test case keeps its id" (equal (test-case-test-case-id tc) "case-1"))
+      (check "test case keeps name, description, and category"
+             (and (equal (test-case-name tc) "capital")
+                  (equal (test-case-description tc) "a description")
+                  (equal (test-case-category tc) "qa")))
+      (check "test case keeps tags" (equal (test-case-tags tc) '("smoke" "fast")))
+      (check "test case keeps input and expected"
+             (and (equal (test-case-input tc) "hello")
+                  (equal (test-case-expected tc) "world"))))
+    (check "test-case-id is an accepted spelling for id"
+           (equal (test-case-test-case-id (make-test-case :test-case-id "c2")) "c2"))
+    (check "a test case requires an id"
+           (signals-condition-p (lambda () (make-test-case :id "")) 'sigil-validation-error))
+
+    ;; --- Snapshots ---
+    (let ((snapshot (test-case-snapshot
+                     (make-test-case :id "case-1" :input "hello" :expected "world")
+                     :suite-id "suite-1" :suite-version "v2")))
+      (check "scalar input serializes as {\"value\": ...}"
+             (and (hash-table-p (jget snapshot "input"))
+                  (equal (jget* snapshot "input" "value") "hello")))
+      (check "scalar expected serializes as {\"value\": ...}"
+             (and (hash-table-p (jget snapshot "expected"))
+                  (equal (jget* snapshot "expected" "value") "world")))
+      (check "snapshot carries suite id and version"
+             (and (equal (jget snapshot "suite_id") "suite-1")
+                  (equal (jget snapshot "suite_version") "v2"))))
+    (let ((snapshot (test-case-snapshot
+                     (make-test-case :id "case-2"
+                                     :input (jobj "question" "2+2?")
+                                     :expected (jobj "answer" "4")))))
+      (check "object input stays an object without wrapping"
+             (and (equal (jget* snapshot "input" "question") "2+2?")
+                  (null (jget* snapshot "input" "value"))))
+      (check "object expected stays an object without wrapping"
+             (equal (jget* snapshot "expected" "answer") "4")))
+    (let ((snapshot (test-case-snapshot (make-test-case :id "case-3"))))
+      (check "absent input serializes as an empty object"
+             (and (hash-table-p (jget snapshot "input"))
+                  (zerop (hash-table-count (jget snapshot "input")))))
+      (check "absent expected serializes as an empty object"
+             (and (hash-table-p (jget snapshot "expected"))
+                  (zerop (hash-table-count (jget snapshot "expected"))))))
+    (let ((snapshot (test-case-snapshot
+                     (make-test-case :id "case-4" :input '("a" "b")))))
+      (check "a plain list input is wrapped as a value array"
+             (let ((value (jget* snapshot "input" "value")))
+               (and (vectorp value) (equal (aref value 0) "a")))))
+    (let ((snapshot (test-case-snapshot
+                     (make-test-case :id "case-5" :input '(("q" . "2+2?"))))))
+      (check "an alist input is treated as a mapping"
+             (and (equal (jget* snapshot "input" "q") "2+2?")
+                  (null (jget* snapshot "input" "value")))))
+    (let ((snapshot (test-case-snapshot
+                     (make-test-case :id "case-6"
+                                     :input (list :question "what?" :n 2)
+                                     :expected (list :answer "42")
+                                     :metadata (list :owner "me")))))
+      (check "a plist input is treated as a mapping"
+             (and (equal (jget* snapshot "input" "question") "what?")
+                  (eql (jget* snapshot "input" "n") 2)
+                  (null (jget* snapshot "input" "value"))))
+      (check "a plist expected is treated as a mapping"
+             (equal (jget* snapshot "expected" "answer") "42"))
+      (check "plist metadata survives the snapshot"
+             (equal (jget* snapshot "metadata" "owner") "me")))
+    (check "snapshot of nil is nil" (null (test-case-snapshot nil)))
+
+    ;; --- Suites ---
+    (let ((suite (make-test-suite :suite-id "suite-1" :version "v2" :name "smoke"
+                                  :cases (list (make-test-case :id "case-1")
+                                               (jobj "id" "case-2" "input" "hi")
+                                               (list :id "case-3")))))
+      (check "suite keeps id and version"
+             (and (equal (test-suite-suite-id suite) "suite-1")
+                  (equal (test-suite-version suite) "v2")))
+      (check "suite builds cases from a test-case value, JSON, and a plist"
+             (equal (mapcar #'test-case-test-case-id (test-suite-cases suite))
+                    '("case-1" "case-2" "case-3")))
+      (check "suite case built from JSON keeps its input"
+             (equal (test-case-input (test-suite-case suite "case-2")) "hi"))
+      (check "test-suite-case finds a case by id"
+             (equal (test-case-test-case-id (test-suite-case suite "case-3")) "case-3"))
+      (check "test-suite-case returns nil for an unknown id"
+             (null (test-suite-case suite "nope"))))
+    (check "a suite requires an id"
+           (signals-condition-p (lambda () (make-test-suite :suite-id " "))
+                                'sigil-validation-error))
+
+    ;; --- A run carries its suite's id and version, and trials snapshot cases ---
+    (let ((calls (cons :calls nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client
+           :eval-endpoint "https://sigil.example.test"
+           :generation-enabled nil :traces-enabled nil
+           :http-fn (lambda (url &key method headers content &allow-other-keys)
+                      (declare (ignore headers))
+                      (push (list method url content) (cdr calls))
+                      (values (jzon:stringify (jobj "experiment_id" "exp-suite")) 200)))
+        (declare (ignore get-requests))
+        (let ((suite (make-test-suite
+                      :suite-id "suite-1" :version "v2"
+                      :cases (list (make-test-case :id "case-1"
+                                                   :input "hello"
+                                                   :expected "world")))))
+          (with-experiment (run client :run-id "exp-suite" :name "suite run"
+                                :suite suite)
+            (experiment-run-open-trial run "case-1"))
+          (let* ((ordered (reverse (cdr calls)))
+                 (upsert (find-if (lambda (c) (search "experiment-runs:upsert" (second c)))
+                                  ordered))
+                 (trial (find-if (lambda (c) (search "/trials" (second c))) ordered)))
+            (check "run payload includes the local suite id and version"
+                   (and (equal (jget (jzon:parse (third upsert)) "suite_id") "suite-1")
+                        (equal (jget (jzon:parse (third upsert)) "suite_version") "v2")))
+            (check "a trial resolves its case from the run's suite"
+                   (equal (jget* (jzon:parse (third trial)) "test_case" "input" "value")
+                          "hello"))
+            (check "the trial snapshot carries the suite reference"
+                   (and (equal (jget* (jzon:parse (third trial)) "test_case" "suite_id")
+                               "suite-1")
+                        (equal (jget* (jzon:parse (third trial)) "test_case" "suite_version")
+                               "v2")))))))))
+
 
 ;;; ================================================================
 ;;; Conversations tests
@@ -2745,6 +3903,8 @@
                            #'run-macro-tests
                            #'run-normalize-tests
                            #'run-experiment-tests
+                           #'run-trial-tests
+                           #'run-suite-tests
                            #'run-conversations-tests
                            #'run-metrics-tests))
       (multiple-value-bind (ok pass fail) (funcall test-fn)

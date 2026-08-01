@@ -102,9 +102,10 @@ Convert raw LLM API hash-tables into SDK types:
 | `:generation-endpoint` | `nil` | Full URL for generation export |
 | `:generation-enabled` | `nil` | Enable generation recording |
 | `:eval-endpoint` | `nil` | Base URL for experiment control-plane requests; falls back to the generation endpoint host |
-| `:eval-path-prefix` | `"/api/v1"` | Path prefix for experiment routes |
+| `:eval-path-prefix` | `"/api/v1"` | Path prefix for the experiment read routes. The `experiment-runs` write routes are absolute and ignore it |
 | `:eval-auth-token` | `nil` | Bearer token for control-plane requests; replaces the generation auth headers when set. Score export always uses generation auth |
 | `:scores-export-path` | `"/api/v1/scores:export"` | Score export route on the generation endpoint host |
+| `:ingest-actor` | `"ingest:sdk/lisp"` | Value of the `X-Agento11y-Ingest-Actor` header. It is appended to both the eval auth and score-export auth headers, so it rides every eval request, reads included; `""` sends no header |
 | `:experiment-url-template` | `nil` | Optional UI URL template with `{base}` and `{run_id}` placeholders |
 | `:traces-endpoint` | `nil` | Full URL for OTLP trace export |
 | `:traces-enabled` | `nil` | Enable trace/span export |
@@ -143,6 +144,7 @@ schema defaults. This matches the canonical sigil-sdk schema (Go, Python, JS).
 | `SIGIL_EVAL_ENDPOINT` | `:eval-endpoint` | Base URL for experiment control-plane requests |
 | `SIGIL_EVAL_PATH_PREFIX` | `:eval-path-prefix` | Defaults to `/api/v1` |
 | `SIGIL_EVAL_AUTH_TOKEN` | `:eval-auth-token` | Sent as `Bearer` on control-plane requests, replacing generation auth; not used for score export |
+| `SIGIL_INGEST_ACTOR` | `:ingest-actor` | Defaults to `ingest:sdk/lisp` |
 | `SIGIL_EXPERIMENT_URL_TEMPLATE` | `:experiment-url-template` | Supports `{base}` and `{run_id}` |
 | `SIGIL_HEADERS` | `:extra-headers` | `k=v,k2=v2`; merged into auth headers (user header wins on case-insensitive collision) |
 | `SIGIL_AUTH_MODE` | `:auth-mode` | `none` / `tenant` / `bearer` / `basic`; unknown values warn and are ignored |
@@ -174,6 +176,10 @@ because TLS is controlled by the URL scheme.
 > either set the matching `SIGIL_*` var to the desired value or unset it
 > before constructing the client. `make-client` accepts `:env-fn` for callers
 > that want to ignore the host environment entirely (e.g. tests).
+>
+> `:eval-path-prefix` and `:ingest-actor` are not affected: their slots hold
+> NIL until a caller sets them, so an explicit value equal to the default
+> still wins over env.
 
 ### Service vs agent identity
 
@@ -228,54 +234,136 @@ from the OTel `Meter`.
 
 ## Experiments
 
-Use `with-experiment` to create or reopen an offline-evaluation run. Generations
-recorded inside the dynamic extent are tagged with `experiment.run_id`, include
-`experiment_run_id` metadata, and are captured so scores can attach to them.
+An offline evaluation publishes an **experiment run**, one **trial** per test
+case attempt, and **scores** attached to those trials.
+
+Writes and reads use two different route families:
+
+| | Route |
+|---|---|
+| Create or claim a run | `POST /api/v1/experiment-runs:upsert` |
+| Finalize a run | `POST /api/v1/experiment-runs/{id}:finalize` |
+| Open a trial | `POST /api/v1/experiment-runs/{id}/trials` |
+| Close a trial | `PATCH /api/v1/experiment-runs/{id}/trials/{trial_id}` |
+| Publish scores | `POST /api/v1/scores:export` |
+| Read a run, its report, its scores | `GET /api/v1/eval/experiments/{id}[/report\|/scores]` |
+
+Use `with-experiment` to open a run. Generations recorded inside the dynamic
+extent are tagged with `experiment.run_id`, include `experiment_run_id`
+metadata, and are captured so scores can attach to them.
 
 ```lisp
 (sigil-cl:with-experiment (run client :run-id "exp-prompt-a" :name "prompt A")
-  (let ((rec (sigil-cl:start-generation client
-               :model-provider "anthropic"
-               :model-name "claude-sonnet"
-               :input-messages input)))
-    ;; Call the model, then record the result.
-    (sigil-cl:set-result rec :output-messages output :usage usage)
-    (sigil-cl:recorder-end rec)
+  (sigil-cl:with-trial (trial run "case-1")
+    (let ((rec (sigil-cl:start-generation client
+                 :model-provider "anthropic"
+                 :model-name "claude-sonnet"
+                 :input-messages input)))
+      ;; Call the model, then record the result.
+      (sigil-cl:set-result rec :output-messages output :usage usage)
+      (sigil-cl:recorder-end rec)
+      (sigil-cl:trial-bind-generation trial (sigil-cl:gen-rec-generation-id rec)))
 
-    (sigil-cl:experiment-run-add-scores
-     run
+    (sigil-cl:trial-add-scores
+     trial
      (list (sigil-cl:make-score :evaluator-id "verifier"
                                 :evaluator-version "1"
-                                :score-key "reward"
+                                :score-key "final"
                                 :value 0.9
                                 :passed t)))))
 ```
 
-`with-experiment` finalizes the run as `succeeded` on normal exit, `failed` on
-errors, and cancels it on non-local exits such as interrupts. A `409 Conflict`
-from run creation reopens the run by patching it back to `running` before the
-body runs (a sigil-cl extension; the reference SDKs fail on duplicate run ids —
-pass `:on-conflict :error` for that behavior).
+`with-experiment` closes every open trial, then finalizes the run `completed`
+on normal exit and `failed` on an error or a non-local exit such as an
+interrupt. `"succeeded"` is accepted as an alias for `"completed"`; any other
+status signals `sigil-validation-error` before a request goes out.
+
+The upsert route claims an existing run idempotently, so a rerun with the same
+`:run-id` continues it. A `409 Conflict` means the run is in a state the
+backend will not reclaim; the default `:on-conflict :reopen` proceeds anyway,
+and `:on-conflict :error` re-signals.
+
+### Trials
+
+A trial is one attempt at one test case. Its id is deterministic —
+`(stable-id "trial" experiment-id test-case-id attempt)` — so a rerun addresses
+the same trial instead of creating a duplicate. Opening the same
+`(test-case-id, attempt)` pair twice on one run signals `sigil-validation-error`
+before any request; bump `:attempt` for a retry.
+
+```lisp
+(sigil-cl:with-trial (trial run "case-1" :attempt 2)
+  ...)
+```
+
+Scores anchor to the trial, so a generation is optional. Bind one with
+`trial-bind-generation` when there is a model call worth linking, and bind the
+conversation with `trial-bind-conversation`; both are local setters that issue
+no request.
+
+A trial closes `completed` unless its body raised, in which case it closes
+`failed` carrying the error text. The pass/fail verdict is not the trial
+status — it belongs in the final score's `:passed`, which is what drives the
+report's pass rate.
 
 ### Upload modes
 
-`:upload` controls when scores reach the server, matching the reference SDKs:
+`:upload` controls when scores reach the server:
 
-| Mode | `experiment-run-add-scores` | On normal exit |
+| Mode | `experiment-run-add-scores` (no trial) | On normal exit |
 |------|-----------------------------|----------------|
-| `:continuous` (default) | exports immediately, returns accepted count | finalized `succeeded` |
-| `:bulk` | buffers, returns buffered count | buffered scores published, then finalized `succeeded` |
+| `:continuous` (default) | exports immediately, returns accepted count | finalized `completed` |
+| `:bulk` | buffers, returns buffered count | buffered scores published, then finalized `completed` |
 | `:manual` | buffers, returns buffered count | left open; call `experiment-run-publish` then `experiment-run-finalize` yourself |
+
+Scores added to a trial are always held on it and flushed when the trial
+closes, ahead of the closing `PATCH`. In `:continuous` mode that flush exports
+them; in `:bulk` and `:manual` it moves them to the run buffer.
 
 `experiment-run-buffered-score-count` reports what is waiting;
 `experiment-run-publish` exports the buffer and returns the newly accepted
 count. Score ids are deterministic (`stable-id`, SHA-1, identical to the
-Go/Python SDKs), so re-publishing after a partial failure dedupes server-side.
+Go/Python SDKs): the first score for a `(score-key, evaluator-id)` pair on a
+trial is `(stable-id "score" experiment-id trial-id score-key evaluator-id)`,
+and a repeat appends an occurrence counter, so rescoring produces a distinct
+durable id and re-publishing after a partial failure dedupes server-side.
+
+If a trial cannot be closed, the run still attempts the remaining closes, then
+finalizes `failed` and omits `score_count` — a partial run has no trustworthy
+local count.
+
+### Local suites
+
+`test-suite` and `test-case` describe an evaluation locally. There is no YAML
+loader and no stored-suite control plane; build suites in Lisp from plists,
+alists, or parsed JSON.
+
+```lisp
+(let ((suite (sigil-cl:make-test-suite
+              :suite-id "suite-1" :version "v2"
+              :cases (list (sigil-cl:make-test-case :id "case-1"
+                                                    :input "2+2?"
+                                                    :expected "4"
+                                                    :tags '("math"))))))
+  (sigil-cl:with-experiment (run client :run-id "exp-1" :name "suite run"
+                                 :suite suite)
+    (sigil-cl:with-trial (trial run "case-1")
+      ...)))
+```
+
+The run payload carries the suite's `suite_id` and `suite_version`, and each
+trial stores a snapshot of its case. Snapshot `input` and `expected` are always
+JSON objects: a scalar is wrapped as `{"value": ...}`, a mapping (a hash table,
+an alist, or a plist) is kept as is.
+
+Evaluator provenance travels as the `:evaluator-id` and `:evaluator-version`
+strings on `make-score`. There is no evaluator value type, because no route
+accepts one.
 
 ### Dataset runner
 
 `run-experiment` loops a dataset through a target function and scorers under
-one run, the counterpart of `ExperimentRunner` in the reference SDKs:
+one run, creating one trial per item:
 
 ```lisp
 (sigil-cl:run-experiment
@@ -298,14 +386,15 @@ one run, the counterpart of `ExperimentRunner` in the reference SDKs:
  :run-id "exp-prompt-a" :name "prompt A")
 ```
 
-Each item gets a stable per-item conversation id
+Each item also gets a stable per-item conversation id
 (`(stable-id "conv" run-id item-id)`), so generations and scores link up in the
-Sigil UI and reruns are idempotent. The return value is a plist with
+UI and reruns are idempotent. Item ids must be distinct: two items with the
+same id would mint the same trial id. The return value is a plist with
 `:run-id`, `:accepted-scores`, `:url`, and `:report`.
 
 ### Datasets from collections
 
-`dataset-from-collection` turns a Sigil collection of saved conversations into
+`dataset-from-collection` turns a collection of saved conversations into
 dataset items by fetching each conversation and recovering its initial user
 prompt. The underlying read calls (`list-collection-members`,
 `get-conversation`, `initial-user-prompt`) are also exported:
@@ -317,17 +406,46 @@ prompt. The underlying read calls (`list-collection-members`,
                            :collection-id "col-123"))
 ```
 
-Experiment control-plane calls are synchronous. Configure them with
-`:eval-endpoint`, `:eval-path-prefix`, `:eval-auth-token`,
-`:scores-export-path`, and `:experiment-url-template`, or the matching
-`SIGIL_EVAL_*` environment variables. If `:eval-endpoint` is unset, the SDK
-derives the base URL from `:generation-endpoint`. `:eval-auth-token` (or
-`SIGIL_EVAL_AUTH_TOKEN`) sends a separate `Bearer` token on control-plane
-requests — useful when generation export uses tenant/basic auth but the Sigil
-plugin API needs a service-account token. Score export is intentionally
-independent of the `SIGIL_EVAL_*` settings: scores are a tenant ingest write
-that goes to the generation endpoint host with generation auth, same as the
-reference SDKs.
+The upsert route rejects a `collection_id` field, so `:collection-id` is
+carried as a `collectionId:` tag and a metadata key instead.
+
+### Errors
+
+| Condition | Raised when |
+|---|---|
+| `sigil-validation-error` | HTTP 400/422, or a local check such as an unknown finalize status or a duplicate trial attempt |
+| `sigil-not-found-error` | HTTP 404 |
+| `sigil-conflict-error` | HTTP 409; `sigil-conflict-error-kind` classifies it |
+| `sigil-actor-mismatch-error` | HTTP 401 naming actor ownership; not retried |
+| `sigil-export-error` | any other non-2xx, or rejected scores |
+
+`sigil-conflict-error-kind` returns `:score-count-mismatch`,
+`:running-trials`, `:pending-evaluations`, `:terminal`, `:immutable-field`,
+`:open-draft`, or `:unknown`. `conflict-recoverable-p` says whether the caller
+can fix it and retry. `classify-conflict` exposes the classifier directly.
+
+### Configuration
+
+Experiment calls are synchronous. Configure them with `:eval-endpoint`,
+`:eval-path-prefix`, `:eval-auth-token`, `:scores-export-path`,
+`:ingest-actor`, and `:experiment-url-template`, or the matching `SIGIL_*`
+environment variables (`SIGIL_EVAL_ENDPOINT`, `SIGIL_EVAL_PATH_PREFIX`,
+`SIGIL_EVAL_AUTH_TOKEN`, `SIGIL_INGEST_ACTOR`,
+`SIGIL_EXPERIMENT_URL_TEMPLATE`).
+
+If `:eval-endpoint` is unset, the SDK derives the base URL from
+`:generation-endpoint`. `:eval-auth-token` sends a separate `Bearer` token on
+control-plane requests — useful when generation export uses tenant or basic
+auth but the plugin API needs a service-account token. Score export is
+intentionally independent of the `SIGIL_EVAL_*` settings: scores are a tenant
+ingest write that goes to the generation endpoint host with generation auth,
+same as the reference SDKs.
+
+Every eval request carries an ingest-actor header identifying the writer,
+`X-Agento11y-Ingest-Actor: ingest:sdk/lisp` by default. It is appended to both
+the eval auth and the score-export auth headers, so the reads carry it too.
+Override the value with `:ingest-actor`; set it to `""` to send no header. A backend
+that answers `401` naming actor ownership means another actor claimed the run.
 
 ## Running tests
 

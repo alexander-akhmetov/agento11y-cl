@@ -29,15 +29,15 @@
    ;; Ratings
    #:submit-conversation-rating
    ;; Experiments and scores
-   #:create-experiment
+   #:upsert-experiment-run
+   #:finalize-experiment-run
    #:get-experiment
-   #:update-experiment
-   #:complete-experiment
-   #:cancel-experiment
    #:get-experiment-report
    #:list-experiment-scores
    #:export-scores
    #:experiment-url
+   #:classify-conflict
+   #:conflict-recoverable-p
    #:with-experiment
    #:run-experiment
    #:experiment-run
@@ -52,10 +52,58 @@
    #:experiment-run-reset-capture
    #:experiment-run-active-conversation-id
    #:experiment-run-accepted-count
+   #:experiment-run-open-trial
+   #:experiment-run-open-trials-list
+   #:experiment-run-close-open-trials
+   #:experiment-run-suite
    #:make-score
    #:make-dataset-item
    #:make-target-result
    #:stable-id
+   ;; Trials
+   #:experiment-trial
+   #:with-trial
+   #:create-trial
+   #:finalize-trial
+   #:trial-open
+   #:trial-close
+   #:trial-add-scores
+   #:trial-bind-generation
+   #:trial-bind-conversation
+   #:trial-mint-id
+   #:trial-id
+   #:trial-run
+   #:trial-experiment-id
+   #:trial-test-case-id
+   #:trial-attempt
+   #:trial-status
+   #:trial-error-text
+   #:trial-conversation-id
+   #:trial-generation-id
+   #:trial-trace-id
+   #:trial-span-id
+   #:trial-created-p
+   #:trial-closed-p
+   ;; Local suites
+   #:test-suite
+   #:test-case
+   #:make-test-suite
+   #:make-test-case
+   #:test-case-snapshot
+   #:test-suite-case
+   #:test-suite-suite-id
+   #:test-suite-version
+   #:test-suite-name
+   #:test-suite-description
+   #:test-suite-cases
+   #:test-case-test-case-id
+   #:test-case-name
+   #:test-case-description
+   #:test-case-tags
+   #:test-case-category
+   #:test-case-input
+   #:test-case-expected
+   #:test-case-metadata
    ;; Conversations and collections (read-only)
    #:list-collection-members
    #:get-conversation
@@ -76,6 +124,7 @@
    #:config-eval-path-prefix
    #:config-eval-auth-token
    #:config-scores-export-path
+   #:config-ingest-actor
    #:config-experiment-url-template
    ;; Types + constructors
    #:message
@@ -141,4 +190,6 @@
    #:sigil-export-error-status-code
    #:sigil-validation-error
    #:sigil-not-found-error
-   #:sigil-conflict-error))
+   #:sigil-conflict-error
+   #:sigil-conflict-error-kind
+   #:sigil-actor-mismatch-error))

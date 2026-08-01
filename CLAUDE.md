@@ -51,6 +51,14 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 | `queue.lisp` | Thread-safe bounded queue (drop-oldest overflow) |
 | `auth.lisp` | Build auth headers from config (basic/bearer/tenant) |
 | `types.lisp` | CLOS message/part/token-usage types and constructors |
+| `env.lisp` | Resolve `SIGIL_*` environment variables into a config |
+| `eval.lisp` | Experiment wire protocol: run upsert and finalize, score export, the read routes, ingest actor, HTTP status classification |
+| `suite.lisp` | Local `test-suite` and `test-case` values; trial snapshots |
+| `trial.lisp` | `experiment-trial`, `create-trial`, `finalize-trial`, `with-trial`, bind helpers |
+| `experiment.lisp` | `experiment-run` orchestration: upload modes, score building, trial lifecycle, `run-experiment` |
+| `conversations.lisp` | Read collections and conversations; build datasets from them |
+| `metrics.lisp` | OTLP histogram registry and export |
+| `rating.lisp` | Submit conversation ratings |
 
 ## Conventions
 
@@ -59,3 +67,4 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 - Timestamps are ISO 8601 strings (`iso8601-now`) or nanosecond strings (`current-unix-nano`) -- never fixnums
 - Tool call `input_json` is base64-encoded in serialized output
 - ASDF system loads files serially (`:serial t`); file order in the `.asd` matters
+- Experiment writes go to `/api/v1/experiment-runs`; only reads use `/api/v1/eval/experiments`. See the comment block at the top of `eval.lisp` for the full contract and where it came from
