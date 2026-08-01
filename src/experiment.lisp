@@ -63,6 +63,12 @@ generation or trial being judged."
    ;; trial-id -> trial, for trials still open at finalization time.
    (open-trials :initform (make-hash-table :test 'equal)
                 :reader experiment-run-open-trials)
+   ;; Trial ids claimed whose create has not returned yet. A trial reaches
+   ;; OPEN-TRIALS only once the backend created it, so two opens racing inside
+   ;; that round trip would both read an empty OPEN-TRIALS and neither would
+   ;; report the overlap. Held from the claim to the end of the create.
+   (opening-trial-ids :initform (make-hash-table :test 'equal)
+                      :reader experiment-run-opening-trial-ids)
    ;; (anchor score-key evaluator-id) -> times seen, for deterministic score
    ;; ids. The anchor is the trial id for a trial-scoped score, so one table
    ;; still counts each trial separately.
@@ -231,11 +237,27 @@ non-terminal, and a silent one leaves no trace of why."
     (nreverse ids)))
 
 (defun experiment-run-track-generation-id (run generation-id)
-  "Record GENERATION-ID for later score attribution."
-  (let ((id (%trimmed-text generation-id)))
+  "Record GENERATION-ID for later score attribution.
+A generation recorded after the run finalized is still tracked, because it did
+happen and dropping it would lose the id a later score needs, but it is
+reported: the score count and the trial statuses on the backend were written
+without it."
+  (let ((id (%trimmed-text generation-id))
+        (late-p nil))
     (when (plusp (length id))
       (bt2:with-lock-held ((experiment-run-lock run))
-        (push id (experiment-run-tracked-generation-ids run)))))
+        (setf late-p (experiment-run-finalized-p run))
+        (push id (experiment-run-tracked-generation-ids run)))
+      ;; Logged outside the lock: %experiment-log reaches the caller's log-fn,
+      ;; and no lock is ever held across a user callback.
+      (when late-p
+        (%experiment-log
+         run :warn
+         (format nil "generation ~a was recorded on run ~a after the run finalized, ~
+so it is not counted in the score count or the trial statuses already reported. A ~
+context captured with capture-telemetry-context outlives the with-experiment scope it ~
+was taken in; join the threads that use it before that scope exits."
+                 id (experiment-run-run-id run))))))
   run)
 
 (defun experiment-run-reset-capture (run &key conversation-id)
@@ -551,6 +573,7 @@ the same trial id and collide."
     (let* ((run-id (experiment-run-run-id run))
            (trial-id (trial-mint-id run-id test-case-id attempt))
            (suite (experiment-run-suite run))
+           (already-open nil)
            (trial nil))
       (bt2:with-lock-held ((experiment-run-lock run))
         (when (gethash trial-id (experiment-run-claimed-trial-ids run))
@@ -558,29 +581,62 @@ the same trial id and collide."
                  :message (format nil "trial for test case ~s attempt ~a already exists on run ~s; increment attempt for a retry"
                                   test-case-id attempt run-id)))
         (setf (gethash trial-id (experiment-run-claimed-trial-ids run)) t)
+        ;; Snapshot the ids of every trial that claimed the run and has not
+        ;; closed yet, for the warning below. Trials still being created count
+        ;; too, because the wipe on the next line is what they lose. Every id
+        ;; is named: an overlap is already an error state, so the count is
+        ;; small, and naming them all tells the reader which trials just lost
+        ;; their captured generations.
+        (flet ((collect-ids (table)
+                 (maphash (lambda (id value)
+                            (declare (ignore value))
+                            (push id already-open))
+                          table)))
+          (collect-ids (experiment-run-open-trials run))
+          (collect-ids (experiment-run-opening-trial-ids run)))
+        (setf already-open (sort already-open #'string<))
+        (setf (gethash trial-id (experiment-run-opening-trial-ids run)) t)
         ;; A trial is a fresh unit of work. Generations captured before it
         ;; opened belong to the previous one, so its scores must not fall back
         ;; on them. The active conversation id is left alone: callers bind it
         ;; per trial and reading it back is how a score finds its conversation.
         (setf (experiment-run-tracked-generation-ids run) nil))
-      ;; The claim is released again when the create fails, because nothing
-      ;; exists on the backend to collide with and the retry needs the same
-      ;; deterministic id.
+      ;; The claim and the opening marker are released again when the create
+      ;; fails, because nothing exists on the backend to collide with and the
+      ;; retry needs the same deterministic id. The warning is inside the
+      ;; unwind-protect for the same reason: a log-fn that signals would
+      ;; otherwise leave the id claimed with no trial behind it.
       (unwind-protect
-           (setf trial (trial-open (experiment-run-client run) run-id test-case-id
-                                   :attempt attempt
-                                   :run run
-                                   :trial-id trial-id
-                                   :test-case resolved-case
-                                   :suite-id (when suite (test-suite-suite-id suite))
-                                   :suite-version (when suite (test-suite-version suite))
-                                   :metadata metadata
-                                   :flush-fn #'%trial-flush-scores
-                                   :closed-fn (lambda (closed)
-                                                (bt2:with-lock-held ((experiment-run-lock run))
-                                                  (remhash (trial-id closed)
-                                                           (experiment-run-open-trials run))))))
+           (progn
+             ;; Logged outside the lock: %experiment-log reaches the caller's
+             ;; log-fn, and no lock is ever held across a user callback.
+             (when already-open
+               (%experiment-log
+                run :warn
+                (format nil "trial ~a opened on run ~a while ~a still open. ~
+Generation capture is held per run, not per trial. This open cleared the ~
+generation ids captured for ~:[that trial~;those trials~], so scores on ~
+~:*~:[it~;them~] can attribute to the wrong generations. Run trials sequentially."
+                        trial-id run-id
+                        (if (= 1 (length already-open))
+                            (format nil "trial ~a is" (first already-open))
+                            (format nil "trials ~{~a~^, ~} are" already-open))
+                        (rest already-open))))
+             (setf trial (trial-open (experiment-run-client run) run-id test-case-id
+                                     :attempt attempt
+                                     :run run
+                                     :trial-id trial-id
+                                     :test-case resolved-case
+                                     :suite-id (when suite (test-suite-suite-id suite))
+                                     :suite-version (when suite (test-suite-version suite))
+                                     :metadata metadata
+                                     :flush-fn #'%trial-flush-scores
+                                     :closed-fn (lambda (closed)
+                                                  (bt2:with-lock-held ((experiment-run-lock run))
+                                                    (remhash (trial-id closed)
+                                                             (experiment-run-open-trials run)))))))
         (bt2:with-lock-held ((experiment-run-lock run))
+          (remhash trial-id (experiment-run-opening-trial-ids run))
           (if trial
               (setf (gethash trial-id (experiment-run-open-trials run)) trial)
               (remhash trial-id (experiment-run-claimed-trial-ids run)))))

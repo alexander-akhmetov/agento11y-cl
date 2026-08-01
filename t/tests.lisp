@@ -20,7 +20,7 @@
                                (auth-mode :bearer)
                                (auth-password "test-token")
                                (max-retries 5)
-                               http-fn)
+                               http-fn log-fn)
   "Create a client with mock HTTP that captures requests."
   (let ((requests nil))
     (values
@@ -46,6 +46,7 @@
        :auth-mode auth-mode
        :auth-password auth-password
        :max-retries max-retries
+       :log-fn log-fn
        :http-fn (or http-fn
                     (lambda (url &key method headers content &allow-other-keys)
                       (declare (ignore method headers))
@@ -1504,7 +1505,258 @@ the cdr of CALLS-PLACE as (method url content), newest first."
           (check "all span kinds enqueued" (= (length spans) 5))
           (check "every span carries sigil.tag.env"
                  (every (lambda (s) (equal (span-attr s "sigil.tag.env") "prod"))
-                        spans)))))))
+                        spans)))))
+
+    ;; --- Telemetry context: capture and rebind ---
+    ;;
+    ;; Sentinels rather than real values: nothing here dereferences either
+    ;; special, and EQ then proves the capture carried the object itself.
+    (let* ((captured-run (list :captured-run))
+           (captured-trace (list :trace-id "trace-parent" :span-id "span-parent"))
+           (context (let ((*experiment-run* captured-run)
+                          (*trace-context* captured-trace))
+                      (capture-telemetry-context)))
+           (outer-run (list :outer-run))
+           (outer-trace (list :outer-trace)))
+      (let ((*experiment-run* outer-run)
+            (*trace-context* outer-trace))
+        (with-telemetry-context (context)
+          (check "captured context rebinds *experiment-run* by identity"
+                 (eq *experiment-run* captured-run))
+          (check "captured context rebinds *trace-context* by identity"
+                 (eq *trace-context* captured-trace)))
+        (check "with-telemetry-context restores the surrounding *experiment-run*"
+               (eq *experiment-run* outer-run))
+        (check "with-telemetry-context restores the surrounding *trace-context*"
+               (eq *trace-context* outer-trace))))
+
+    ;; A NIL context is the no-run case, not an error.
+    (let ((outer-run (list :outer-run))
+          (outer-trace (list :outer-trace))
+          (inside-run :unset)
+          (inside-trace :unset)
+          (signaled nil))
+      (let ((*experiment-run* outer-run)
+            (*trace-context* outer-trace))
+        (handler-case
+            (with-telemetry-context (nil)
+              (setf inside-run *experiment-run*
+                    inside-trace *trace-context*))
+          (error () (setf signaled t)))
+        (check "a NIL telemetry context binds both specials to NIL"
+               (and (null inside-run) (null inside-trace)))
+        (check "a NIL telemetry context signals nothing" (not signaled))
+        (check "a NIL telemetry context restores both surrounding bindings"
+               (and (eq *experiment-run* outer-run)
+                    (eq *trace-context* outer-trace)))))
+
+    ;; The context form is evaluated exactly once.
+    (let ((evaluations 0))
+      (flet ((context ()
+               (incf evaluations)
+               (list :experiment-run nil :trace-context nil)))
+        (with-telemetry-context ((context))
+          nil)
+        (check "with-telemetry-context evaluates its context form once"
+               (= evaluations 1))))
+
+    ;; --- telemetry-context-thunk captures at wrap time, on the caller ---
+    (let* ((wrap-run (list :wrap-run))
+           (wrap-trace (list :wrap-trace))
+           (thunk (let ((*experiment-run* wrap-run)
+                        (*trace-context* wrap-trace))
+                    (telemetry-context-thunk
+                     (lambda () (list *experiment-run* *trace-context*)))))
+           (seen nil))
+      ;; Called outside the wrapping scope and under different bindings: what
+      ;; the closure sees can only have come from wrap time.
+      (let ((*experiment-run* (list :call-run))
+            (*trace-context* (list :call-trace)))
+        (setf seen (funcall thunk)))
+      (check "telemetry-context-thunk binds the run captured at wrap time"
+             (eq (first seen) wrap-run))
+      (check "telemetry-context-thunk binds the trace captured at wrap time"
+             (eq (second seen) wrap-trace))
+      ;; And on a child thread, which starts at the global NIL values.
+      (let ((from-child (bt2:join-thread
+                         (bt2:make-thread thunk :name "sigil-test-wrap-time"))))
+        (check "telemetry-context-thunk carries the wrap-time run onto a child thread"
+               (eq (first from-child) wrap-run))
+        (check "telemetry-context-thunk carries the wrap-time trace onto a child thread"
+               (eq (second from-child) wrap-trace))))
+
+    ;; --- The run and the trace cross a thread the caller spawns ---
+    ;;
+    ;; The unwrapped child is the control: it proves the tracking below comes
+    ;; from the propagated context and not from ambient state.
+    (flet ((exported-generation (calls id)
+             (let ((found nil))
+               (dolist (call (reverse (cdr calls)) found)
+                 (when (search "generations:export" (second call))
+                   (loop for gen across (jget (payload call) "generations")
+                         when (equal (jget gen "id") id)
+                           do (setf found gen)))))))
+      (let ((calls (cons :calls nil))
+            (run-object nil)
+            (conversation-id nil)
+            (child-rec nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :traces-enabled nil
+                              :http-fn (routed-http calls "exp-threads"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-threads" :name "threads")
+            (setf run-object run)
+            (let ((*trace-context* (list :trace-id "trace-parent"
+                                         :span-id "span-parent")))
+              (let ((context (capture-telemetry-context)))
+                (setf child-rec
+                      (bt2:join-thread
+                       (bt2:make-thread
+                        (lambda ()
+                          (with-telemetry-context (context)
+                            (let ((rec (start-generation
+                                        client
+                                        :mode :sync
+                                        :generation-id "generation-child"
+                                        :model-provider "openai"
+                                        :model-name "gpt-4")))
+                              (recorder-end rec)
+                              rec)))
+                        :name "sigil-test-child-generation")))
+                ;; Control: same thread constructor, no context carried.
+                (bt2:join-thread
+                 (bt2:make-thread
+                  (lambda ()
+                    (recorder-end (start-generation client
+                                                    :mode :sync
+                                                    :generation-id "generation-orphan"
+                                                    :model-provider "openai"
+                                                    :model-name "gpt-4")))
+                  :name "sigil-test-orphan-generation"))))
+            (setf conversation-id (experiment-run-active-conversation-id run)))
+          (client-flush client))
+        (check "child-thread generation is tracked by the run"
+               (equal (experiment-run-produced-generation-ids run-object)
+                      (list "generation-child")))
+        (check "an uncarried child-thread generation is not tracked"
+               (not (member "generation-orphan"
+                            (experiment-run-produced-generation-ids run-object)
+                            :test #'equal)))
+        (check "child-thread generation inherits the captured trace id"
+               (equal (gen-rec-trace-id child-rec) "trace-parent"))
+        (check "child-thread generation parents to the captured span"
+               (equal (sigil-cl::gen-rec-parent-span-id child-rec) "span-parent"))
+        (let ((carried (exported-generation calls "generation-child"))
+              (orphan (exported-generation calls "generation-orphan")))
+          (check "child-thread generation carries the run-id tag"
+                 (equal (jget* carried "tags" "experiment.run_id") "exp-threads"))
+          (check "child-thread generation carries the run's conversation id"
+                 (equal (jget carried "conversation_id") conversation-id))
+          (check "an uncarried child-thread generation has no run-id tag"
+                 (null (jget* orphan "tags" "experiment.run_id")))))
+
+      ;; The same hop through telemetry-context-thunk, started from a call
+      ;; site that has itself lost the run: only the wrap-time capture can
+      ;; explain the registration.
+      (let ((calls (cons :calls nil))
+            (run-object nil)
+            (child-id nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :traces-enabled nil
+                              :http-fn (routed-http calls "exp-thunk"))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-thunk" :name "thunk")
+            (setf run-object run)
+            (let ((wrapped (telemetry-context-thunk
+                            (lambda ()
+                              (let ((rec (start-generation
+                                          client
+                                          :mode :sync
+                                          :generation-id "generation-wrapped"
+                                          :model-provider "openai"
+                                          :model-name "gpt-4")))
+                                (recorder-end rec)
+                                (gen-rec-generation-id rec))))))
+              (let ((*experiment-run* nil)
+                    (*trace-context* nil))
+                (setf child-id
+                      (bt2:join-thread
+                       (bt2:make-thread wrapped :name "sigil-test-wrapped"))))))
+          (client-flush client))
+        (check "a wrapped thunk records the generation it was asked to"
+               (equal child-id "generation-wrapped"))
+        (check "a wrapped thunk registers its generation with the captured run"
+               (member "generation-wrapped"
+                       (experiment-run-produced-generation-ids run-object)
+                       :test #'equal))
+        (check "a wrapped thunk's generation carries the captured run-id tag"
+               (equal (jget* (exported-generation calls "generation-wrapped")
+                             "tags" "experiment.run_id")
+                      "exp-thunk")))
+
+      ;; A captured context outlives the scope it was taken in, so a thread
+      ;; joined too late reaches a run that already finalized. The generation
+      ;; is still tracked - it happened, and dropping the id would lose what a
+      ;; later score needs - but the run says the reported counts predate it.
+      (let ((calls (cons :calls nil))
+            (logged nil)
+            (wrapped nil)
+            (run-object nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :traces-enabled nil
+                              :http-fn (routed-http calls "exp-late")
+                              :log-fn (lambda (level component message &rest kvs)
+                                        (declare (ignore component kvs))
+                                        (push (list level message) logged)))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-late" :name "late")
+            (setf run-object run)
+            (setf wrapped
+                  (telemetry-context-thunk
+                   (lambda ()
+                     (recorder-end (start-generation client
+                                                     :mode :sync
+                                                     :generation-id "generation-late"
+                                                     :model-provider "openai"
+                                                     :model-name "gpt-4"))))))
+          ;; Only what the late generation emits is counted.
+          (setf logged nil)
+          (bt2:join-thread (bt2:make-thread wrapped :name "sigil-test-late"))
+          (client-flush client))
+        (check "a generation recorded after the run finalized is still tracked"
+               (member "generation-late"
+                       (experiment-run-produced-generation-ids run-object)
+                       :test #'equal))
+        (let ((warning (find :warn (reverse logged) :key #'first)))
+          (check "a generation recorded after the run finalized is reported"
+                 (and warning
+                      (search "generation-late" (second warning))
+                      (search "after the run finalized" (second warning))))))
+
+      ;; The same generation inside the run's scope logs nothing.
+      (let ((calls (cons :calls nil))
+            (logged nil))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :traces-enabled nil
+                              :http-fn (routed-http calls "exp-in-time")
+                              :log-fn (lambda (level component message &rest kvs)
+                                        (declare (ignore component kvs))
+                                        (push (list level message) logged)))
+          (declare (ignore get-requests))
+          (with-experiment (run client :run-id "exp-in-time" :name "in time")
+            (declare (ignore run))
+            (setf logged nil)
+            (recorder-end (start-generation client
+                                            :mode :sync
+                                            :generation-id "generation-in-time"
+                                            :model-provider "openai"
+                                            :model-name "gpt-4"))))
+        (check "a generation recorded before the run finalized is not reported"
+               (null (find :warn logged :key #'first)))))))
 
 (defun run-normalize-tests ()
   (with-test-suite ("Normalize")
@@ -1606,6 +1858,22 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                (loop for call in calls
                      when (finalize-call-p call)
                        collect (jget (payload call) "status"))))
+
+      ;; --- The thread-propagation API is public ---
+      (check "*experiment-run* is exported"
+             (eq :external (nth-value 1 (find-symbol "*EXPERIMENT-RUN*" :sigil-cl))))
+      (check "the telemetry context helpers are exported"
+             (every (lambda (name)
+                      (eq :external (nth-value 1 (find-symbol name :sigil-cl))))
+                    '("CAPTURE-TELEMETRY-CONTEXT"
+                      "WITH-TELEMETRY-CONTEXT"
+                      "TELEMETRY-CONTEXT-THUNK")))
+      (check "*experiment-run* documents that a spawned thread sees NIL"
+             (let ((doc (documentation (find-symbol "*EXPERIMENT-RUN*" :sigil-cl)
+                                       'variable)))
+               (and doc
+                    (search "spawned thread" doc)
+                    (search "NIL" doc))))
 
       ;; --- Eval base derivation and URL generation ---
       (let ((cfg (make-config
@@ -2451,6 +2719,55 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                  (member "failed" (finalize-statuses (reverse (cdr calls)))
                          :test #'equal))))
 
+      ;; --- A plain run-experiment sends exactly these request bodies ---
+      ;;
+      ;; Every request body a plain RUN-EXPERIMENT sends, pinned whole. The
+      ;; fixture records no generation, so the only byte that varies between
+      ;; runs is the upsert's created_at, which is read back and spliced into
+      ;; the expected body. The trial, conversation, and score ids are SHA-1
+      ;; derived and stay literal here on purpose: a changed hash is exactly
+      ;; the drift this check exists to catch.
+      (let ((calls (cons :calls nil)))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :eval-endpoint "https://sigil.example.test"
+                              :generation-enabled nil :traces-enabled nil
+                              :http-fn (routed-http calls "exp-stable"))
+          (declare (ignore get-requests))
+          (run-experiment
+           client
+           (list (make-dataset-item :id "it1" :input "2+2?"))
+           (lambda (item run) (declare (ignore item run)) nil)
+           (list (lambda (item target-result)
+                   (declare (ignore item target-result))
+                   (list (make-score :evaluator-id "judge"
+                                     :evaluator-version "1"
+                                     :score-key "quality"
+                                     :value 1.0
+                                     :passed t))))
+           :run-id "exp-stable" :name "stable" :fetch-report nil))
+        (let* ((ordered (reverse (cdr calls)))
+               (bodies (mapcar #'third ordered))
+               (created-at (when ordered
+                             (jget* (payload (first ordered)) "metadata" "created_at"))))
+          (check "a plain run-experiment issues exactly five requests"
+                 (= (length bodies) 5))
+          (check "upsert body matches the pinned bytes"
+                 (equal (first bodies)
+                        (format nil "{\"name\":\"stable\",\"source\":{\"kind\":\"sdk\",\"id\":\"lisp\"},\"experiment_id\":\"exp-stable\",\"planned_trial_count\":1,\"metadata\":{\"created_at\":\"~a\"}}"
+                                created-at)))
+          (check "trial create body matches the pinned bytes"
+                 (equal (second bodies)
+                        "{\"trial_id\":\"trial-011f75bdcfbbe2dc\",\"test_case_id\":\"it1\",\"attempt\":1,\"status\":\"running\",\"test_case\":{\"test_case_id\":\"it1\",\"name\":\"\",\"description\":\"\",\"tags\":[],\"category\":\"\",\"input\":{\"value\":\"2+2?\"},\"expected\":{}}}"))
+          (check "score export body matches the pinned bytes"
+                 (equal (third bodies)
+                        "{\"scores\":[{\"score_id\":\"score-f97882d5fc838573\",\"evaluator_id\":\"judge\",\"evaluator_version\":\"1\",\"score_key\":\"quality\",\"value\":{\"number\":1.0},\"trial_id\":\"trial-011f75bdcfbbe2dc\",\"experiment_id\":\"exp-stable\",\"conversation_id\":\"conv-e3921792bf7015da\",\"test_case_id\":\"it1\",\"passed\":true,\"metadata\":{\"item_id\":\"it1\"},\"source\":{\"kind\":\"experiment\",\"id\":\"exp-stable\"}}]}"))
+          (check "trial patch body matches the pinned bytes"
+                 (equal (fourth bodies)
+                        "{\"status\":\"completed\",\"conversation_id\":\"conv-e3921792bf7015da\"}"))
+          (check "finalize body matches the pinned bytes"
+                 (equal (fifth bodies)
+                        "{\"status\":\"completed\",\"source\":{\"kind\":\"sdk\",\"id\":\"lisp\"},\"score_count\":1}"))))
+
       ;; --- with-experiment: generation tagging, value shapes, completion ---
       (let ((calls (cons :calls nil))
             (accepted nil)
@@ -3270,6 +3587,156 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                    (equal (jget posted "status") "failed"))
             (check "a non-local exit names itself in the trial error"
                    (search "non-local exit" (jget posted "error")))))))
+
+    ;; --- Opening a trial over one that is already open is reported ---
+    ;;
+    ;; Capture is held per run, so opening a trial clears what the already-open
+    ;; trial captured. The open is allowed anyway: a failed close legitimately
+    ;; leaves a trial open, and signalling here would break that recovery.
+    (let ((calls (cons :calls nil))
+          (logged nil)
+          (trial-a nil)
+          (trial-b nil)
+          (open-ids nil)
+          (open-logs nil)
+          (signaled nil))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-overlap")
+                            :log-fn (lambda (level component message &rest kvs)
+                                      (declare (ignore kvs))
+                                      (push (list level component message) logged)))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-overlap" :name "overlap")
+          (setf trial-a (experiment-run-open-trial run "case-a"))
+          (setf logged nil)
+          (handler-case
+              (setf trial-b (experiment-run-open-trial run "case-b"))
+            (condition () (setf signaled t)))
+          ;; Snapshot before the closes and the finalize, so only what the
+          ;; second open emitted is counted.
+          (setf open-logs (reverse logged))
+          (setf open-ids (mapcar #'trial-id (experiment-run-open-trials-list run)))
+          (trial-close trial-a)
+          (trial-close trial-b)))
+      (check "an open trial logs exactly one message on the next open"
+             (= 1 (length open-logs)))
+      (let ((warning (first open-logs)))
+        (check "the overlap message is a warning"
+               (eq (first warning) :warn))
+        (check "the overlap warning names the newly opened trial"
+               (and warning (search (trial-id trial-b) (third warning))))
+        (check "the overlap warning names the already-open trial"
+               (and warning (search (trial-id trial-a) (third warning))))
+        (check "the overlap warning states the per-run capture constraint"
+               (and warning
+                    (search "per run, not per trial" (third warning))
+                    (search "sequentially" (third warning)))))
+      (check "the second trial still opens" (and trial-b (trial-created-p trial-b)))
+      (check "the first trial stays open alongside the second"
+             (and (member (trial-id trial-a) open-ids :test #'equal)
+                  (member (trial-id trial-b) open-ids :test #'equal)))
+      (check "opening over an open trial signals nothing" (not signaled)))
+
+    ;; --- A trial that opens while another is still being created ---
+    ;;
+    ;; A trial reaches OPEN-TRIALS only once its create returns, so this is the
+    ;; overlap that reading OPEN-TRIALS at claim time cannot see, and it is the
+    ;; shape two worker threads produce. Trial A's create blocks until trial
+    ;; B's create starts, which puts B's claim strictly inside A's round trip.
+    (let* ((calls (cons :calls nil))
+           (http-lock (bt2:make-lock :name "sigil-test-race-http"))
+           (log-lock (bt2:make-lock :name "sigil-test-race-log"))
+           (a-creating (bt2:make-semaphore :name "sigil-test-a-creating"))
+           (b-creating (bt2:make-semaphore :name "sigil-test-b-creating"))
+           (logged nil)
+           (overlap-logs nil)
+           (trial-a nil)
+           (trial-b nil)
+           (open-ids nil))
+      (multiple-value-bind (client get-requests)
+          (make-test-client
+           :eval-endpoint "https://sigil.example.test"
+           :generation-enabled nil :traces-enabled nil
+           :log-fn (lambda (level component message &rest kvs)
+                     (declare (ignore component kvs))
+                     (bt2:with-lock-held (log-lock) (push (list level message) logged)))
+           :http-fn (let ((base (routed-http calls "exp-race")))
+                      (lambda (url &rest args &key method content &allow-other-keys)
+                        (when (and (eq method :post) (search "/trials" url))
+                          (cond ((search "case-a" content)
+                                 (bt2:signal-semaphore a-creating)
+                                 (bt2:wait-on-semaphore b-creating :timeout 5))
+                                ((search "case-b" content)
+                                 (bt2:signal-semaphore b-creating))))
+                        ;; The stub's call list is shared by both threads.
+                        (bt2:with-lock-held (http-lock) (apply base url args)))))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-race" :name "race")
+          (bt2:with-lock-held (log-lock) (setf logged nil))
+          (let ((opener (bt2:make-thread
+                         (lambda () (setf trial-a (experiment-run-open-trial run "case-a")))
+                         :name "sigil-test-trial-a")))
+            (bt2:wait-on-semaphore a-creating :timeout 5)
+            (setf trial-b (experiment-run-open-trial run "case-b"))
+            (bt2:join-thread opener))
+          ;; Snapshot before the closes and the finalize, so only what the
+          ;; second open emitted is counted.
+          (setf overlap-logs (bt2:with-lock-held (log-lock) (reverse logged)))
+          (setf open-ids (mapcar #'trial-id (experiment-run-open-trials-list run)))
+          (trial-close trial-a)
+          (trial-close trial-b)))
+      (check "a trial opened mid-create logs exactly one message"
+             (= 1 (length overlap-logs)))
+      (let ((warning (first overlap-logs)))
+        (check "the mid-create overlap message is a warning"
+               (eq (first warning) :warn))
+        (check "the mid-create overlap warning names the newly opened trial"
+               (and warning trial-b (search (trial-id trial-b) (second warning))))
+        (check "the mid-create overlap warning names the trial still being created"
+               (and warning trial-a (search (trial-id trial-a) (second warning)))))
+      (check "both trials opened despite the overlap"
+             (and trial-a trial-b
+                  (trial-created-p trial-a) (trial-created-p trial-b)))
+      (check "both trials are open after the race"
+             (and (member (trial-id trial-a) open-ids :test #'equal)
+                  (member (trial-id trial-b) open-ids :test #'equal))))
+
+    ;; --- A log-fn that signals does not leave the trial id claimed ---
+    ;;
+    ;; The overlap warning runs between the claim and the create. A caller's
+    ;; log-fn is arbitrary code; if it throws, the claim has to be released or
+    ;; the retry fails with "already exists" and names the wrong cause.
+    (let* ((calls (cons :calls nil))
+           (boom t)
+           (trial-a nil)
+           (first-error nil)
+           (retry-error nil)
+           (retried nil))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :eval-endpoint "https://sigil.example.test"
+                            :generation-enabled nil :traces-enabled nil
+                            :http-fn (routed-http calls "exp-logfn")
+                            :log-fn (lambda (level component message &rest kvs)
+                                      (declare (ignore level component message kvs))
+                                      (when boom (error "log-fn boom"))))
+        (declare (ignore get-requests))
+        (with-experiment (run client :run-id "exp-logfn" :name "log-fn")
+          (setf trial-a (experiment-run-open-trial run "case-a"))
+          (handler-case
+              (experiment-run-open-trial run "case-b")
+            (error (e) (setf first-error (princ-to-string e))))
+          (setf boom nil)
+          (handler-case
+              (setf retried (experiment-run-open-trial run "case-b"))
+            (error (e) (setf retry-error (princ-to-string e))))
+          (trial-close trial-a)
+          (when retried (trial-close retried))))
+      (check "a signalling log-fn surfaces its own error"
+             (and first-error (search "log-fn boom" first-error)))
+      (check "a signalling log-fn leaves the trial id free to retry"
+             (and (null retry-error) retried (trial-created-p retried))))
 
     ;; --- Transport validation ---
     (multiple-value-bind (client get-requests)

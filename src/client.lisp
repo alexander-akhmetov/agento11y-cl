@@ -181,7 +181,13 @@ series on each recorder end."
       (config-service-version config)))
 
 (defvar *experiment-run* nil
-  "Current experiment run. Bound by WITH-EXPERIMENT and read by START-GENERATION.")
+  "Current experiment run. Bound by WITH-EXPERIMENT and read by START-GENERATION.
+Thread-confined, like *TRACE-CONTEXT*. A spawned thread starts at the global
+value NIL, so a generation recorded there is neither tagged with the run nor
+tracked for score attribution. To keep a generation on another thread inside
+the run, capture both specials on the parent with CAPTURE-TELEMETRY-CONTEXT
+and replay them on the child, or wrap the child's thunk in
+TELEMETRY-CONTEXT-THUNK.")
 
 (declaim (ftype function %experiment-run-prepare-generation-options
                 %experiment-run-register-recorder))

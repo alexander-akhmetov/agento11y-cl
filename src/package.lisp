@@ -158,8 +158,14 @@
    #:extract-system-prompt
    #:build-tool-name-map
    #:build-output-message
-   ;; Trace context
+   ;; Thread-propagated specials: both are thread-confined, so a spawned
+   ;; thread sees NIL unless the caller carries them across with
+   ;; CAPTURE-TELEMETRY-CONTEXT / TELEMETRY-CONTEXT-THUNK.
    #:*trace-context*
+   #:*experiment-run*
+   #:capture-telemetry-context
+   #:with-telemetry-context
+   #:telemetry-context-thunk
    #:gen-rec-generation-id
    #:gen-rec-trace-id
    #:gen-rec-span-id
