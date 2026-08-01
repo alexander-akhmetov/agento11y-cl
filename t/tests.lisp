@@ -1031,7 +1031,63 @@ the cdr of CALLS-PLACE as (method url content), newest first."
           (check "embedding span omits dimension.count when unset"
                  (loop for a across (jget span "attributes")
                        never (equal (jget a "key")
-                                    "gen_ai.embeddings.dimension.count"))))))))
+                                    "gen_ai.embeddings.dimension.count"))))))
+
+    ;; Error category on tool and embedding spans
+    (flet ((span-attr (span key)
+             (let ((found nil))
+               (loop for a across (jget span "attributes")
+                     when (equal (jget a "key") key)
+                       do (setf found (jget* a "value" "stringValue")))
+               found)))
+      ;; Tool execution error -> error.type + error.category
+      (multiple-value-bind (client get-requests) (make-test-client :generation-enabled nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc-1")))
+          (set-result rec :error-message "request timed out")
+          (recorder-end rec)
+          (let ((span (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-trace-queue client)))))
+            (check "tool error span: error.type"
+                   (equal (span-attr span "error.type") "tool_execution_error"))
+            (check "tool error span: error.category"
+                   (equal (span-attr span "error.category") "timeout")))))
+      ;; Tool success -> no error attrs
+      (multiple-value-bind (client get-requests) (make-test-client :generation-enabled nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc-1")))
+          (set-result rec :result "ok")
+          (recorder-end rec)
+          (let ((span (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-trace-queue client)))))
+            (check "tool success span: no error.type"
+                   (null (span-attr span "error.type")))
+            (check "tool success span: no error.category"
+                   (null (span-attr span "error.category"))))))
+      ;; Embedding call error -> error.type + error.category
+      (multiple-value-bind (client get-requests) (make-test-client :generation-enabled nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-embedding client :model-provider "openai"
+                                           :model-name "text-embedding-3-small")))
+          (set-call-error rec "provider returned status=429 too many requests")
+          (recorder-end rec)
+          (let ((span (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-trace-queue client)))))
+            (check "embedding error span: error.type"
+                   (equal (span-attr span "error.type") "provider_call_error"))
+            (check "embedding error span: error.category"
+                   (equal (span-attr span "error.category") "rate_limit")))))
+      ;; Embedding success -> no error attrs
+      (multiple-value-bind (client get-requests) (make-test-client :generation-enabled nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-embedding client :model-provider "openai"
+                                           :model-name "text-embedding-3-small")))
+          (set-result rec :input-count 1 :input-tokens 10)
+          (recorder-end rec)
+          (let ((span (first (sigil-cl::queue-drain-all
+                              (sigil-cl::client-trace-queue client)))))
+            (check "embedding success span: no error.category"
+                   (null (span-attr span "error.category")))))))))
 
 (defun run-workflow-step-tests ()
   (with-test-suite ("WorkflowStep")

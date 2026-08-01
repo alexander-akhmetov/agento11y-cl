@@ -536,7 +536,10 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
             (push (otel-int-attr "gen_ai.tool.call.result.length" (length res)) attrs)))
         (let ((err (or (tool-rec-error-message rec) (recorder-call-error rec))))
           (when err
-            (push (otel-string-attr "error.type" "tool_execution_error") attrs)))
+            (push (otel-string-attr "error.type" "tool_execution_error") attrs)
+            (let ((category (classify-error err)))
+              (when category
+                (push (otel-string-attr "error.category" category) attrs)))))
         (let ((start-nano (iso8601-to-unix-nano (recorder-started-at rec))))
           (queue-enqueue
            (client-trace-queue (recorder-client rec))
@@ -616,7 +619,10 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
           (when (and src (stringp src) (plusp (length src)))
             (push (otel-string-attr "sigil.embeddings.source" src) attrs)))
         (when (recorder-call-error rec)
-          (push (otel-string-attr "error.type" "provider_call_error") attrs))
+          (push (otel-string-attr "error.type" "provider_call_error") attrs)
+          (let ((category (classify-error (recorder-call-error rec))))
+            (when category
+              (push (otel-string-attr "error.category" category) attrs))))
         (let ((start-nano (iso8601-to-unix-nano (recorder-started-at rec))))
           (queue-enqueue
            (client-trace-queue (recorder-client rec))
