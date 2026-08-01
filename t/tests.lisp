@@ -2501,6 +2501,7 @@ the cdr of CALLS-PLACE as (method url content), newest first."
       (check "build-output: text last" (typep (third (message-parts msg)) 'text-part)))))
 
 (defun %make-hook-client (&key http-fn
+                               log-fn
                                (api-endpoint nil)
                                (generation-endpoint
                                 "https://sigil.example.com/api/v1/generations:export")
@@ -2516,7 +2517,8 @@ the cdr of CALLS-PLACE as (method url content), newest first."
                 :extra-headers extra-headers
                 :auth-mode auth-mode
                 :auth-password auth-password
-                :http-fn http-fn)
+                :http-fn http-fn
+                :log-fn log-fn)
    :env-fn (constantly nil)))
 
 (defun run-hooks-tests ()
@@ -2954,7 +2956,88 @@ the cdr of CALLS-PLACE as (method url content), newest first."
       (evaluate-hook client :phase :preflight)
       (check "schemeless api-endpoint strips trailing path"
              (equal captured-url
-                    "https://hooks.example.com/api/v1/hooks:evaluate")))))
+                    "https://hooks.example.com/api/v1/hooks:evaluate")))
+
+    ;; --- grpc:// endpoints resolve to the https host root ---
+    (let* ((captured-url nil)
+           (client (%make-hook-client
+                    :api-endpoint "grpc://hooks.example.com:4317"
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore headers content))
+                               (setf captured-url url)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (check "grpc:// api-endpoint resolves to https host root"
+             (equal captured-url
+                    "https://hooks.example.com:4317/api/v1/hooks:evaluate")))
+
+    (let* ((captured-url nil)
+           (client (%make-hook-client
+                    :api-endpoint nil
+                    :generation-endpoint "grpc://otlp.example.com:4317"
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore headers content))
+                               (setf captured-url url)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (check "grpc:// generation-endpoint resolves to https host root"
+             (equal captured-url
+                    "https://otlp.example.com:4317/api/v1/hooks:evaluate")))
+
+    ;; --- Non-positive timeouts fall back to the 15s default ---
+    (let* ((captured-headers nil)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t :timeout-sec 0)
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url content))
+                               (setf captured-headers headers)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight)
+      (check "zero configured timeout falls back to 15s"
+             (equal (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+                                :test #'string-equal))
+                    "15000")))
+
+    (let* ((captured-headers nil)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t :timeout-sec 2.5)
+                    :http-fn (lambda (url &key headers content)
+                               (declare (ignore url content))
+                               (setf captured-headers headers)
+                               (values "{\"action\":\"allow\"}" 200)))))
+      (evaluate-hook client :phase :preflight :timeout-sec -1)
+      (check "negative :timeout-sec keyword falls back to the config value"
+             (equal (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+                                :test #'string-equal))
+                    "2500")))
+
+    ;; --- Fail-open is logged, not silent ---
+    (let* ((logged nil)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t :fail-open t)
+                    :log-fn (lambda (level component message &rest kvs)
+                              (declare (ignore kvs))
+                              (push (list level component message) logged))
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (error "boom"))))
+           (resp (evaluate-hook client :phase :preflight))
+           (entry (first logged)))
+      (check "fail-open still allows" (eq (response-action resp) :allow))
+      (check "fail-open logs a warning"
+             (and entry
+                  (eq (first entry) :warn)
+                  (equal (second entry) "hooks")
+                  (search "boom" (third entry)))))
+
+    (let* ((logged nil)
+           (client (%make-hook-client
+                    :hooks-config (make-hooks-config :enabled t :fail-open nil)
+                    :log-fn (lambda (&rest _) (declare (ignore _))
+                              (push t logged))
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (error "boom")))))
+      (ignore-errors (evaluate-hook client :phase :preflight))
+      (check "fail-closed does not log a fail-open warning" (null logged)))))
 
 ;;; ================================================================
 ;;; Experiment tests

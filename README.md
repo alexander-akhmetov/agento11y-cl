@@ -13,7 +13,7 @@ Sigil captures LLM generations, tool executions, and embeddings from your applic
 - **Conversation ratings** — submit user feedback ratings to the Sigil API
 - **Offline experiments** — create eval runs, record tagged generations, export scores, and loop a dataset through a target and scorers
 - **Collection datasets** — read Sigil collections and conversations to build experiment datasets from saved conversations
-- **Synchronous hook evaluation** — preflight/postflight policy checks against the Sigil hooks API with allow/deny semantics, fail-open transport handling, and `transformed_input` rewrite passthrough
+- **Synchronous hook evaluation** — opt-in preflight/postflight guard checks against the Sigil hooks API with allow/deny semantics, fail-open transport handling, and `transformed_input` rewrite passthrough
 - **Message normalization** — convert raw Anthropic and OpenAI API responses into SDK types
 - **Background export** — batched, async HTTP export with exponential backoff retry
 - **Content capture modes** — `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only`
@@ -151,7 +151,9 @@ with neither a URL nor both a media type and inline data is dropped.
 
 ### Synchronous hook evaluation
 
-`evaluate-hook` performs a synchronous `POST /api/v1/hooks:evaluate` against the Sigil hooks API to enforce policy rules before (preflight) or after (postflight) an upstream LLM call. Hooks are disabled by default; opt in via `:hooks-config`:
+`evaluate-hook` performs a synchronous `POST /api/v1/hooks:evaluate` against the Sigil hooks API before (preflight) or after (postflight) an upstream LLM call. The hook is the SDK's call; the rules it runs are the guards you configure in Grafana Cloud, which decide whether to allow, deny, or transform the input. The naming matches the Python, Go, and JavaScript SDKs.
+
+Hooks are disabled by default. Nothing is sent until you pass `:hooks-config` with `:enabled t`:
 
 ```lisp
 (defvar *client*
@@ -206,10 +208,10 @@ Behaviour:
 
 - **Allow** → returns a `hook-evaluate-response` with `(response-action r) = :allow`.
 - **Deny** → signals `sigil-hook-denied-error` with `rule-id`, `reason`, and per-rule `evaluations`.
-- **Transport failure** → honours `(hooks-config-fail-open hooks)`: when `t` (default) returns a synthetic allow response so failed hook checks never block the LLM call; when `nil` signals `sigil-hook-transport-error`.
+- **Transport failure** → honours `(hooks-config-fail-open hooks)`: when `t` (default) returns a synthetic allow response so failed hook checks never block the LLM call; when `nil` signals `sigil-hook-transport-error`. A fail-open allow is reported through `:log-fn` at `:warn` with component `"hooks"`, so an evaluator outage does not read as a clean allow.
 - **transformed_input** → the response carries an optional `hook-input` accessible via `response-transformed-input`. Callers decide whether to substitute the rewritten `messages` / `tools` / `system_prompt` into the upstream call. The SDK does not mutate caller state.
-- **Endpoint** → derived from `:api-endpoint` when set, otherwise from the host root of `:generation-endpoint`. Both `https://host` and `https://host/api/v1/...` forms are accepted; only the scheme + host are used.
-- **Timeout** → `(hooks-config-timeout-sec hooks)` (default `15.0`) is sent to the server via the `X-Sigil-Hook-Timeout-Ms` header. The `:timeout-sec` keyword on `evaluate-hook` overrides it for a single call.
+- **Endpoint** → derived from `:api-endpoint` when set, otherwise from the host root of `:generation-endpoint`. Both `https://host` and `https://host/api/v1/...` forms are accepted; only the scheme + host are used. A schemeless or `grpc://` value contributes its host and resolves to `https://host`.
+- **Timeout** → `(hooks-config-timeout-sec hooks)` (default `15.0`) is sent to the server via the `X-Sigil-Hook-Timeout-Ms` header. The `:timeout-sec` keyword on `evaluate-hook` overrides it for a single call. Zero and negative values fall back to the default.
 - **Response size** → bodies larger than 4 MiB are treated as transport failures.
 - **Correlation** → `trace-id` and `span-id` on the context fall back to the ambient `*trace-context*`, so a hook called inside `with-generation` reports the same trace as the generation it guards. Set them (or `conversation-id`) explicitly to override.
 - **Part encoding** → every message part carries its `kind`; the server dispatches on that field. Tool call arguments and tool result payloads go out as embedded JSON so rules can match on them, while a tool definition's `input_schema_json` stays base64, which is what the server's protobuf bytes field expects.
@@ -233,7 +235,7 @@ Behaviour:
 | `:ingest-actor` | `"ingest:sdk/lisp"` | Value of the `X-Agento11y-Ingest-Actor` header. It is appended to both the eval auth and score-export auth headers, so it rides every eval request, reads included; `""` sends no header |
 | `:experiment-url-template` | `nil` | Optional UI URL template with `{base}` and `{run_id}` placeholders |
 | `:api-endpoint` | `nil` | Host root used to derive `/api/v1/...` URLs (currently the hooks endpoint). Falls back to the host of `:generation-endpoint` |
-| `:hooks-config` | `nil` | `(make-hooks-config :enabled t :phases '(:preflight) :timeout-sec 15.0 :fail-open t)` — synchronous hook evaluation config |
+| `:hooks-config` | `nil` (hooks off) | Synchronous hook evaluation config. Opt in with `(make-hooks-config :enabled t :phases '(:preflight) :timeout-sec 15.0 :fail-open t)`; `make-hooks-config` itself defaults to `:enabled nil` |
 | `:traces-endpoint` | `nil` | Full URL for OTLP trace export |
 | `:traces-enabled` | `nil` | Enable trace/span export |
 | `:metrics-endpoint` | `nil` | Full URL for OTLP metrics export (e.g. `https://{host}/v1/metrics`) |

@@ -105,25 +105,38 @@
        (or (alex:starts-with-subseq "http://" s)
            (alex:starts-with-subseq "https://" s))))
 
+(defun %has-grpc-scheme-p (s)
+  (and (stringp s) (alex:starts-with-subseq "grpc://" s)))
+
+(defun %https-host-root (endpoint)
+  "Host root for a schemeless or grpc:// ENDPOINT: drop the scheme and any
+path, then force https. The hooks API is HTTP, so a gRPC-shaped endpoint
+contributes only its host."
+  (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) endpoint))
+         (without-scheme (if (%has-grpc-scheme-p trimmed)
+                             (subseq trimmed (length "grpc://"))
+                             trimmed))
+         (host (subseq without-scheme 0 (or (position #\/ without-scheme)
+                                            (length without-scheme)))))
+    (when (plusp (length host))
+      (concatenate 'string "https://" host))))
+
 (defun %resolve-hooks-base-url (config)
   "Return the host root used to build the hooks endpoint, or NIL when neither
-api-endpoint nor generation-endpoint is set. Schemeless api-endpoint values
-get an https:// prefix to match the canonical Python SDK behaviour."
+api-endpoint nor generation-endpoint is set. Schemeless and grpc:// values
+resolve to https://host, matching the canonical Python SDK behaviour."
   (let ((api (config-api-endpoint config)))
     (cond
       ((and (stringp api) (plusp (length api)))
-       (cond
-         ((%has-http-scheme-p api)
-          (or (%host-root api) (%strip-trailing-slash api)))
-         (t
-          (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) api))
-                 (host (subseq trimmed 0 (or (position #\/ trimmed) (length trimmed)))))
-            (when (plusp (length host))
-              (concatenate 'string "https://" host))))))
+       (if (%has-http-scheme-p api)
+           (or (%host-root api) (%strip-trailing-slash api))
+           (%https-host-root api)))
       (t
        (let ((gen (config-generation-endpoint config)))
          (when (and (stringp gen) (plusp (length gen)))
-           (%host-root gen)))))))
+           (cond
+             ((%has-http-scheme-p gen) (%host-root gen))
+             ((%has-grpc-scheme-p gen) (%https-host-root gen)))))))))
 
 ;;; --- Wire serialization ---
 
@@ -411,11 +424,22 @@ rewritten prompt content, and the server does not send tool parts back."
 (defun %allow-response ()
   (make-instance 'hook-evaluate-response :action :allow))
 
-(defun %fail-open-or-raise (hooks detail)
+(defun %fail-open-or-raise (config hooks detail)
   (if (hooks-config-fail-open hooks)
-      (%allow-response)
+      (progn
+        ;; A dead evaluator allows every request. Without this line the outage
+        ;; looks the same as a clean allow.
+        (sigil-log config :warn "hooks"
+                   (format nil "hook evaluation failed, allowing request (fail-open): ~a"
+                           detail))
+        (%allow-response))
       (error 'sigil-hook-transport-error
              :message (format nil "sigil hook evaluation failed: ~a" detail))))
+
+(defun %positive-timeout (value)
+  "VALUE when it is a positive real, else NIL. Zero and negative timeouts fall
+back to the default instead of producing a 1 ms budget."
+  (when (and (realp value) (plusp value)) value))
 
 ;;; --- HTTP ---
 
@@ -481,12 +505,12 @@ synthetic allow response, when nil signals sigil-hook-transport-error."
     (let ((base-url (%resolve-hooks-base-url config)))
       (unless base-url
         (return-from evaluate-hook
-          (%fail-open-or-raise hooks "api endpoint is required")))
+          (%fail-open-or-raise config hooks "api endpoint is required")))
       (let* ((endpoint (concatenate 'string
                                     (%strip-trailing-slash base-url)
                                     +hooks-evaluate-path+))
-             (effective-timeout (or timeout-sec
-                                    (and hooks (hooks-config-timeout-sec hooks))
+             (effective-timeout (or (%positive-timeout timeout-sec)
+                                    (%positive-timeout (hooks-config-timeout-sec hooks))
                                     +default-hook-timeout-sec+))
              (timeout-ms (max 1 (round (* effective-timeout 1000))))
              (ctx (or context (make-hook-context)))
@@ -502,34 +526,34 @@ synthetic allow response, when nil signals sigil-hook-transport-error."
                 (%hook-http-post config endpoint headers payload effective-timeout)
               (error (e)
                 (return-from evaluate-hook
-                  (%fail-open-or-raise hooks (princ-to-string e)))))
+                  (%fail-open-or-raise config hooks (princ-to-string e)))))
           (cond
             ((or (null status)
                  (not (integerp status))
                  (< status 200)
                  (>= status 300))
              (return-from evaluate-hook
-               (%fail-open-or-raise hooks
+               (%fail-open-or-raise config hooks
                                     (format nil "status ~a"
                                             (or status "?")))))
             ((null resp-body)
              (return-from evaluate-hook
-               (%fail-open-or-raise hooks "empty hook response payload")))
+               (%fail-open-or-raise config hooks "empty hook response payload")))
             ((> (%body-octet-length resp-body) +max-hook-response-bytes+)
              (return-from evaluate-hook
-               (%fail-open-or-raise hooks "hook response too large")))
+               (%fail-open-or-raise config hooks "hook response too large")))
             (t
              (let* ((decoded (%decode-response-body resp-body))
                     (trimmed (string-trim '(#\Space #\Tab #\Newline #\Return)
                                           decoded)))
                (when (zerop (length trimmed))
                  (return-from evaluate-hook
-                   (%fail-open-or-raise hooks "empty hook response payload")))
+                   (%fail-open-or-raise config hooks "empty hook response payload")))
                (let ((parsed (handler-case (jzon:parse trimmed)
                                (error (e)
                                  (return-from evaluate-hook
                                    (%fail-open-or-raise
-                                    hooks
+                                    config hooks
                                     (format nil "invalid JSON response: ~a"
                                             (princ-to-string e))))))))
                  (let ((response (%parse-response parsed)))
