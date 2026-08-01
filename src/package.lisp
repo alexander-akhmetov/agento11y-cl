@@ -126,6 +126,9 @@
    #:config-scores-export-path
    #:config-ingest-actor
    #:config-experiment-url-template
+   #:config-embedding-capture-input
+   #:config-embedding-max-input-items
+   #:config-embedding-max-text-length
    ;; Types + constructors
    #:message
    #:text-part

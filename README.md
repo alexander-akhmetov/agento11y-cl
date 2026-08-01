@@ -71,6 +71,32 @@ Child tool executions and embeddings within the body are automatically parented 
     (sigil-cl:set-result tool :result "search results here")))
 ```
 
+### Record an embedding
+
+```lisp
+(sigil-cl:with-embedding (rec *client*
+                          :model-provider "openai"
+                          :model-name "text-embedding-3-small"
+                          :dimensions 1536
+                          :encoding-format "float")
+  ;; ... call the embedding API ...
+  (sigil-cl:set-result rec
+    :input-count 2
+    :input-tokens 24
+    :dimensions 1536
+    :response-model "text-embedding-3-small"
+    :input-texts '("first document" "second document")))
+```
+
+`:dimensions` and `:encoding-format` describe the request. `:response-model`
+and the `set-result` `:dimensions` describe the response; a result dimension
+count wins over the requested one on the span.
+
+`:input-texts` reaches the span as `gen_ai.embeddings.input_texts` only when
+`:embedding-capture-input` is enabled and the content capture mode is `:full`
+or `:no-tool-content`. The SDK keeps the first `:embedding-max-input-items`
+texts in order and cuts each one to `:embedding-max-text-length` characters.
+
 ### Normalize API responses
 
 Convert raw LLM API hash-tables into SDK types:
@@ -118,6 +144,9 @@ Convert raw LLM API hash-tables into SDK types:
 | `:tenant-id` | `nil` | Grafana Cloud tenant ID |
 | `:extra-headers` | `nil` | Alist of extra HTTP headers merged with auth headers (user wins on case-insensitive collision) |
 | `:content-capture-mode` | `:metadata-only` | `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only` |
+| `:embedding-capture-input` | `nil` | Put embedding input texts on the span as `gen_ai.embeddings.input_texts`. Also needs a content capture mode of `:full` or `:no-tool-content`; the other two modes suppress the texts. No `SIGIL_*` variable sets this, matching the Go, Python, and JavaScript SDKs |
+| `:embedding-max-input-items` | `20` | Number of input texts kept on the span. A zero or negative value falls back to 20 |
+| `:embedding-max-text-length` | `1024` | Characters kept per input text. If the length is above 3, longer text keeps its first `length - 3` characters plus `...`. If the length is 3 or less, the text is cut with no suffix. A zero or negative value falls back to 1024 |
 | `:batch-size` | `20` | Generations per export batch |
 | `:flush-interval-sec` | `5` | Background flush interval |
 | `:queue-max` | `500` | Generation queue capacity |

@@ -265,8 +265,11 @@ its span-id as parent so spans nest under the workflow span."
       :model-name model-name)))
 
 (defun start-embedding (client &key model-provider model-name
-                                     agent-name agent-version source)
-  "Create and start an embedding recorder."
+                                     agent-name agent-version source
+                                     dimensions encoding-format)
+  "Create and start an embedding recorder.
+DIMENSIONS is the requested dimension count; a result dimension count set later
+via set-result takes precedence over it on the span."
   (let ((config (client-config client)))
     (make-instance 'embedding-recorder
       :client client
@@ -275,7 +278,9 @@ its span-id as parent so spans nest under the workflow span."
       :model-name model-name
       :agent-name (%resolve-agent-name config agent-name)
       :agent-version (%resolve-agent-version config agent-version)
-      :source source)))
+      :source source
+      :request-dimensions dimensions
+      :encoding-format encoding-format)))
 
 (defun start-workflow-step (client &key conversation-id step-name framework
                                          agent-name agent-version

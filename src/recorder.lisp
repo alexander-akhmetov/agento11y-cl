@@ -573,21 +573,66 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
    (agent-name       :initarg :agent-name       :accessor emb-rec-agent-name       :initform nil)
    (agent-version    :initarg :agent-version    :accessor emb-rec-agent-version    :initform nil)
    (source           :initarg :source           :accessor emb-rec-source           :initform nil)
+   (request-dimensions :initarg :request-dimensions :accessor emb-rec-request-dimensions :initform nil)
+   (encoding-format    :initarg :encoding-format    :accessor emb-rec-encoding-format    :initform nil)
    ;; Set via set-result
    (input-count      :initarg :input-count      :accessor emb-rec-input-count      :initform nil)
    (input-tokens     :initarg :input-tokens     :accessor emb-rec-input-tokens     :initform nil)
    (dimensions       :initarg :dimensions       :accessor emb-rec-dimensions       :initform nil)
+   (response-model   :initarg :response-model   :accessor emb-rec-response-model   :initform nil)
+   (input-texts      :initarg :input-texts      :accessor emb-rec-input-texts      :initform nil)
    (duration-seconds :initarg :duration-seconds :accessor emb-rec-duration-seconds :initform nil)))
 
 (defmethod recorder-type-key ((rec embedding-recorder)) :embedding)
 
 (defmethod set-result ((rec embedding-recorder) &key input-count input-tokens
-                                                      dimensions duration-seconds)
+                                                      dimensions response-model
+                                                      input-texts duration-seconds)
   (when input-count      (setf (emb-rec-input-count rec) input-count))
   (when input-tokens     (setf (emb-rec-input-tokens rec) input-tokens))
   (when dimensions       (setf (emb-rec-dimensions rec) dimensions))
+  (when response-model   (setf (emb-rec-response-model rec) response-model))
+  (when input-texts      (setf (emb-rec-input-texts rec) input-texts))
   (when duration-seconds (setf (emb-rec-duration-seconds rec) duration-seconds))
   rec)
+
+(defun %trimmed-or-nil (value)
+  "Return VALUE trimmed, or NIL when VALUE is not a string or trims to empty."
+  (when (stringp value)
+    (let ((trimmed (%trim value)))
+      (when (plusp (length trimmed)) trimmed))))
+
+(defun %truncate-embedding-text (text max-length)
+  "Keep at most MAX-LENGTH characters of TEXT. A longer TEXT keeps its first
+MAX-LENGTH - 3 characters plus \"...\"; when MAX-LENGTH is 3 or less the text
+is cut without a suffix. Counts characters, not UTF-8 bytes."
+  (cond
+    ((<= (length text) max-length) text)
+    ((> max-length 3) (concatenate 'string (subseq text 0 (- max-length 3)) "..."))
+    (t (subseq text 0 max-length))))
+
+(defun truncate-embedding-texts (texts max-items max-length)
+  "Return the first MAX-ITEMS strings of TEXTS, each truncated to MAX-LENGTH
+characters. TEXTS is a list or vector of strings; non-string entries are
+ignored. A limit that is NIL, zero, or negative falls back to 20 items and
+1024 characters."
+  (let ((max-kept (if (and (integerp max-items) (plusp max-items))
+                      max-items
+                      +default-embedding-max-input-items+))
+        (max-chars (if (and (integerp max-length) (plusp max-length))
+                       max-length
+                       +default-embedding-max-text-length+))
+        (kept nil)
+        (count 0))
+    (block collect
+      (map nil
+           (lambda (text)
+             (when (stringp text)
+               (push (%truncate-embedding-text text max-chars) kept)
+               (incf count)
+               (when (>= count max-kept) (return-from collect))))
+           texts))
+    (nreverse kept)))
 
 (defmethod recorder-end ((rec embedding-recorder))
   (let ((config (client-config (recorder-client rec))))
@@ -606,15 +651,33 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
         (push (otel-string-attr "gen_ai.operation.name" "embeddings") attrs)
         (when (plusp (length model))
           (push (otel-string-attr "gen_ai.request.model" model) attrs))
+        (let ((encoding (%trimmed-or-nil (emb-rec-encoding-format rec))))
+          (when encoding
+            (push (otel-string-array-attr "gen_ai.request.encoding_formats"
+                                          (list encoding)) attrs)))
         (when (and (emb-rec-input-count rec) (plusp (emb-rec-input-count rec)))
           (push (otel-int-attr "gen_ai.embeddings.input_count"
                                 (emb-rec-input-count rec)) attrs))
         (when (and (emb-rec-input-tokens rec) (plusp (emb-rec-input-tokens rec)))
           (push (otel-int-attr "gen_ai.usage.input_tokens"
                                 (emb-rec-input-tokens rec)) attrs))
-        (when (and (emb-rec-dimensions rec) (plusp (emb-rec-dimensions rec)))
-          (push (otel-int-attr "gen_ai.embeddings.dimension.count"
-                                (emb-rec-dimensions rec)) attrs))
+        (let ((response-model (%trimmed-or-nil (emb-rec-response-model rec))))
+          (when response-model
+            (push (otel-string-attr "gen_ai.response.model" response-model) attrs)))
+        ;; The result value wins over the request value, matching the reference
+        ;; SDKs, where the end span overwrites what the start span set.
+        (let ((dimensions (or (emb-rec-dimensions rec) (emb-rec-request-dimensions rec))))
+          (when (and dimensions (plusp dimensions))
+            (push (otel-int-attr "gen_ai.embeddings.dimension.count" dimensions) attrs)))
+        (when (and (config-embedding-capture-input config)
+                   capture-content
+                   (emb-rec-input-texts rec))
+          (let ((texts (truncate-embedding-texts
+                        (emb-rec-input-texts rec)
+                        (config-embedding-max-input-items config)
+                        (config-embedding-max-text-length config))))
+            (when texts
+              (push (otel-string-array-attr "gen_ai.embeddings.input_texts" texts) attrs))))
         (let ((src (emb-rec-source rec)))
           (when (and src (stringp src) (plusp (length src)))
             (push (otel-string-attr "sigil.embeddings.source" src) attrs)))
