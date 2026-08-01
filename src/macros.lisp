@@ -38,6 +38,42 @@ are correctly parented to this workflow step."
             (progn ,@body)
          (recorder-end ,var)))))
 
+;;; --- Carrying telemetry onto a thread the caller spawns ---
+;;;
+;;; *EXPERIMENT-RUN* and *TRACE-CONTEXT* are both thread-confined, and
+;;; START-GENERATION reads them together. A thread that keeps the run but
+;;; loses the trace context produces a tracked generation on an orphan trace,
+;;; which is worse than losing both, so they are captured and replayed as a
+;;; single unit.
+
+(defun capture-telemetry-context ()
+  "Snapshot the calling thread's telemetry specials for replay on another thread.
+Call this on the thread that owns the context. A capture taken inside a
+spawned thread's own body runs after that thread already started at the
+global values, so it carries nothing."
+  (list :experiment-run *experiment-run*
+        :trace-context *trace-context*))
+
+(defmacro with-telemetry-context ((context) &body body)
+  "Execute BODY with the specials captured by CAPTURE-TELEMETRY-CONTEXT rebound.
+CONTEXT is evaluated once. A NIL context binds both to NIL, which is what a
+fresh thread would see anyway."
+  (let ((ctx (gensym "CTX-")))
+    `(let* ((,ctx ,context)
+            (*experiment-run* (getf ,ctx :experiment-run))
+            (*trace-context* (getf ,ctx :trace-context)))
+       ,@body)))
+
+(defun telemetry-context-thunk (thunk)
+  "Wrap THUNK so it runs with the calling thread's telemetry context.
+Capture happens now, at wrap time, on the caller. Rebinding happens when the
+returned closure is called, wherever that is. Pass the result straight to a
+thread constructor."
+  (let ((context (capture-telemetry-context)))
+    (lambda ()
+      (with-telemetry-context (context)
+        (funcall thunk)))))
+
 (defmacro with-span ((client name &key (kind 1) attributes-var) &body body)
   "Execute BODY wrapped in a Sigil OTel span.
 Zero overhead when traces are disabled on CLIENT's config.

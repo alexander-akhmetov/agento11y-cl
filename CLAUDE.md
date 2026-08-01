@@ -44,7 +44,7 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 | `config.lisp` | `sigil-config` class, all tunables |
 | `client.lisp` | `sigil-client`, background flush loop, lifecycle, recorder factory functions |
 | `recorder.lisp` | Base `recorder` class, `generation-recorder`, `tool-execution-recorder`, `embedding-recorder`, serialization |
-| `macros.lisp` | `with-generation`, `with-tool-execution`, `with-embedding`, `with-span` |
+| `macros.lisp` | `with-generation`, `with-tool-execution`, `with-embedding`, `with-span`; the telemetry context capture/replay helpers |
 | `exporter.lisp` | HTTP POST with exponential backoff retry |
 | `normalize.lisp` | Convert raw Anthropic/OpenAI API hash-tables into SDK CLOS types |
 | `otel.lisp` | OTel attribute helpers, span/payload builders |
@@ -68,3 +68,4 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 - Tool call `input_json` is base64-encoded in serialized output
 - ASDF system loads files serially (`:serial t`); file order in the `.asd` matters
 - Experiment writes go to `/api/v1/experiment-runs`; only reads use `/api/v1/eval/experiments`. See the comment block at the top of `eval.lisp` for the full contract and where it came from
+- `*trace-context*` and `*experiment-run*` are the thread-propagated specials: callers carry them onto spawned threads with `capture-telemetry-context` / `with-telemetry-context` / `telemetry-context-thunk` (`macros.lisp`). New dynamic state that `start-generation` reads alongside either one must be added to both `capture-telemetry-context` (which snapshots it) and `with-telemetry-context` (which rebinds it); adding it to one alone still drops it at the thread hop

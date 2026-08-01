@@ -471,6 +471,54 @@ prompt. The underlying read calls (`list-collection-members`,
 The upsert route rejects a `collection_id` field, so `:collection-id` is
 carried as a `collectionId:` tag and a metadata key instead.
 
+### Threads
+
+`sigil-cl:*experiment-run*` and `sigil-cl:*trace-context*` are thread-confined
+dynamic bindings. A thread you spawn starts at their global value `NIL`, so a
+generation recorded there is neither tagged with the run nor tracked for score
+attribution, and its span starts a new trace instead of joining the current
+one. Carry both across with `telemetry-context-thunk`:
+
+```lisp
+(sigil-cl:with-experiment (run client :run-id "exp-1" :name "threaded")
+  (sigil-cl:with-generation (parent client :mode :sync
+                                    :model-provider "openai" :model-name "gpt-4")
+    (let ((worker (bt2:make-thread
+                   (sigil-cl:telemetry-context-thunk
+                    (lambda ()
+                      (let ((rec (sigil-cl:start-generation
+                                  client :mode :sync
+                                  :model-provider "openai" :model-name "gpt-4")))
+                        (sigil-cl:recorder-end rec)
+                        (sigil-cl:gen-rec-generation-id rec)))))))
+      (bt2:join-thread worker))))
+```
+
+`telemetry-context-thunk` captures on the thread that calls it, which is the
+point: a capture written inside the spawned lambda runs after the child already
+started at `NIL` and carries nothing. For a caller that keeps its own list of
+specials to rebind, `capture-telemetry-context` returns the snapshot and
+`with-telemetry-context` rebinds it:
+
+```lisp
+(let ((context (sigil-cl:capture-telemetry-context)))   ; on the parent
+  (bt2:make-thread
+   (lambda ()
+     (sigil-cl:with-telemetry-context (context)         ; on the child
+       ...))))
+```
+
+Capture is held per run, not per trial, so trials on one run must stay
+sequential. Opening a trial clears the run's captured generation ids; if
+another trial is still open at that moment its scores can attribute to the
+wrong generations, and the SDK logs a warning naming both trials. Spawning
+threads inside one trial is fine, which is what these helpers are for.
+
+A captured context outlives the `with-experiment` scope it was taken in, so
+join your threads before that scope exits. A generation recorded after the run
+finalized is still tracked, but the SDK warns: the score count and the trial
+statuses already reported were written without it.
+
 ### Errors
 
 | Condition | Raised when |
