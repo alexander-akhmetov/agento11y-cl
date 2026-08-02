@@ -17,7 +17,7 @@ The SBCL invocation uses `--no-userinit` and loads deps via Quicklisp. Set `QUIC
 ## Architecture
 
 Common Lisp SDK that captures LLM telemetry and exports it via two paths:
-- **Generations** -- structured JSON payloads POSTed to the Sigil generation API
+- **Generations** -- structured JSON payloads POSTed to the generation API
 - **Traces** -- OTel spans POSTed to an OTLP-compatible traces endpoint
 
 ### Data flow
@@ -41,8 +41,8 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 
 | File | Role |
 |------|------|
-| `config.lisp` | `sigil-config` class, all tunables, the content-capture-mode vocabulary and predicates |
-| `client.lisp` | `sigil-client`, background flush loop, lifecycle, recorder factory functions |
+| `config.lisp` | `agento11y-config` class, all tunables, the content-capture-mode vocabulary and predicates |
+| `client.lisp` | `agento11y-client`, background flush loop, lifecycle, recorder factory functions |
 | `recorder.lisp` | Base `recorder` class, `generation-recorder`, `tool-execution-recorder`, `embedding-recorder`, serialization |
 | `macros.lisp` | `with-generation`, `with-tool-execution`, `with-embedding`, `with-span`; the telemetry context capture/replay helpers |
 | `exporter.lisp` | HTTP POST with exponential backoff retry |
@@ -51,7 +51,7 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 | `queue.lisp` | Thread-safe bounded queue (drop-oldest overflow) |
 | `auth.lisp` | Build auth headers from config (basic/bearer/tenant) |
 | `types.lisp` | CLOS message/part/token-usage types and constructors |
-| `env.lisp` | Resolve `SIGIL_*` environment variables into a config |
+| `env.lisp` | Resolve `AGENTO11Y_*` environment variables (with `SIGIL_*` legacy fallback) into a config |
 | `eval.lisp` | Experiment wire protocol: run upsert and finalize, score export, the read routes, ingest actor, HTTP status classification |
 | `suite.lisp` | Local `test-suite` and `test-case` values; trial snapshots |
 | `trial.lisp` | `experiment-trial`, `create-trial`, `finalize-trial`, `with-trial`, bind helpers |

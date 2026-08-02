@@ -1,4 +1,4 @@
-(defpackage :sigil-cl
+(defpackage :agento11y-cl
   (:use :cl)
   (:local-nicknames (:jzon :com.inuoe.jzon)
                     (:bt2 :bordeaux-threads-2)
@@ -175,13 +175,13 @@
    #:evaluation-latency-ms
    #:evaluation-explanation
    #:evaluation-reason
-   #:sigil-hook-denied-error
-   #:sigil-hook-denied-error-rule-id
-   #:sigil-hook-denied-error-reason
-   #:sigil-hook-denied-error-evaluations
-   #:sigil-hook-transport-error
+   #:agento11y-hook-denied-error
+   #:agento11y-hook-denied-error-rule-id
+   #:agento11y-hook-denied-error-reason
+   #:agento11y-hook-denied-error-evaluations
+   #:agento11y-hook-transport-error
    ;; Config
-   #:sigil-config
+   #:agento11y-config
    #:make-config
    #:resolve-config-from-env
    #:config-agent-name
@@ -273,18 +273,18 @@
    #:iso8601-now
    #:iso8601-to-unix-nano
    ;; Conditions
-   #:sigil-error
-   #:sigil-error-message
-   #:sigil-config-error
-   #:sigil-export-error
-   #:sigil-export-error-status-code
-   #:sigil-validation-error
-   #:sigil-not-found-error
-   #:sigil-conflict-error
-   #:sigil-conflict-error-kind
-   #:sigil-actor-mismatch-error
-   #:sigil-experimental-disabled-error
-   #:sigil-trial-evaluation-failed-error
-   #:sigil-trial-evaluation-timeout-error
-   #:sigil-trial-evaluation-error-id
-   #:sigil-trial-evaluation-error-detail))
+   #:agento11y-error
+   #:agento11y-error-message
+   #:agento11y-config-error
+   #:agento11y-export-error
+   #:agento11y-export-error-status-code
+   #:agento11y-validation-error
+   #:agento11y-not-found-error
+   #:agento11y-conflict-error
+   #:agento11y-conflict-error-kind
+   #:agento11y-actor-mismatch-error
+   #:agento11y-experimental-disabled-error
+   #:agento11y-trial-evaluation-failed-error
+   #:agento11y-trial-evaluation-timeout-error
+   #:agento11y-trial-evaluation-error-id
+   #:agento11y-trial-evaluation-error-detail))

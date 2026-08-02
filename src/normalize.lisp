@@ -1,10 +1,10 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; Message normalization — convert raw LLM API responses (hash-tables)
-;;; into sigil-cl CLOS types. Supports Anthropic and OpenAI formats.
+;;; into agento11y-cl CLOS types. Supports Anthropic and OpenAI formats.
 
 (defun normalize-role (role-string)
-  "Map an API role string to a sigil-cl keyword."
+  "Map an API role string to an agento11y-cl keyword."
   (cond
     ((equal role-string "user")      :user)
     ((equal role-string "assistant") :assistant)

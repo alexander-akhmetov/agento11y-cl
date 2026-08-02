@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; --- Epoch constant ---
 
@@ -63,7 +63,7 @@ Parses fractional seconds if present. Returns NIL for invalid input."
 ;;; --- ID generation (thread-safe) ---
 
 (defvar *id-counter* 0)
-(defvar *id-lock* (bt2:make-lock :name "sigil-id"))
+(defvar *id-lock* (bt2:make-lock :name "agento11y-id"))
 (defvar *id-random-state* (make-random-state t))
 
 (defun generate-id ()
@@ -205,7 +205,7 @@ booleans and floats) differs from Go fmt.Sprint and Python str."
 
 ;;; --- Internal logging ---
 
-(defun sigil-log (config level component message &rest kvs)
+(defun agento11y-log (config level component message &rest kvs)
   "Log via config's log-fn callback if set."
   (let ((log-fn (when config (config-log-fn config))))
     (when log-fn

@@ -1,8 +1,8 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
-;;; Read-only access to Sigil conversations and eval collections.
+;;; Read-only access to conversations and eval collections.
 ;;;
-;;; Backs DATASET-FROM-COLLECTION: a Sigil collection groups saved
+;;; Backs DATASET-FROM-COLLECTION: a collection groups saved
 ;;; conversations, and each conversation carries the generations (with their
 ;;; input/output messages) that produced it. Turning a collection into a
 ;;; dataset means listing its members, then fetching each conversation to
@@ -46,7 +46,7 @@ Returns the raw member objects (saved_id, conversation_id, name, ...) as a
 list of hash-tables."
   (let ((cid (%trimmed-text collection-id)))
     (when (zerop (length cid))
-      (error 'sigil-validation-error :message "collection_id is required"))
+      (error 'agento11y-validation-error :message "collection_id is required"))
     (let* ((config (client-config client))
            (url (%eval-api-url config
                                (format nil "/eval/collections/~a/members"
@@ -58,7 +58,7 @@ list of hash-tables."
   "Fetch one conversation with all of its generations. Returns a hash-table."
   (let ((cid (%trimmed-text conversation-id)))
     (when (zerop (length cid))
-      (error 'sigil-validation-error :message "conversation_id is required"))
+      (error 'agento11y-validation-error :message "conversation_id is required"))
     (let* ((config (client-config client))
            (url (%eval-api-url config
                                (format nil "/query/conversations/~a"
@@ -125,24 +125,24 @@ empty string."
 
 (defun dataset-from-collection (client collection-id
                                 &key (mode :user-prompt) limit (skip-empty t))
-  "Build dataset items for RUN-EXPERIMENT from a Sigil collection.
+  "Build dataset items for RUN-EXPERIMENT from a collection.
 Lists the collection's saved conversations, fetches each one, and turns it
 into an item whose input is the conversation's initial user prompt. Each
 item carries collection_id, conversation_id, saved_id, and task_id in its
-metadata so the Sigil report groups scores cleanly. LIMIT caps how many
+metadata so the report groups scores cleanly. LIMIT caps how many
 members are pulled; SKIP-EMPTY drops conversations with no recoverable user
 prompt. Mode :golden (capturing the original answer as expected) is not
 implemented yet."
   (when (eq mode :golden)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "dataset mode :golden is not implemented yet; use :user-prompt"))
   (unless (eq mode :user-prompt)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message (format nil "unknown dataset mode ~s; expected :user-prompt or :golden"
                             mode)))
   (let ((cid (%trimmed-text collection-id)))
     (when (zerop (length cid))
-      (error 'sigil-validation-error :message "collection_id is required"))
+      (error 'agento11y-validation-error :message "collection_id is required"))
     (let ((members (list-collection-members client cid)))
       (when limit
         (setf members (subseq members 0 (min (max limit 0) (length members)))))

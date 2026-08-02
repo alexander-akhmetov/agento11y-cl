@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 (defparameter +experiment-run-id-tag+ "experiment.run_id")
 (defparameter +experiment-run-id-metadata-key+ "experiment_run_id")
@@ -41,7 +41,7 @@ generation or trial being judged."
    (buffer :initform nil :accessor experiment-run-buffer)
    (dataset :initarg :dataset :accessor experiment-run-dataset :initform nil)
    (candidate :initarg :candidate :accessor experiment-run-candidate :initform nil)
-   (lock :initform (bt2:make-lock :name "sigil-experiment-run")
+   (lock :initform (bt2:make-lock :name "agento11y-experiment-run")
          :reader experiment-run-lock)
    (agent-name :initarg :agent-name :accessor experiment-run-agent-name :initform nil)
    (agent-version :initarg :agent-version :accessor experiment-run-agent-version :initform nil)
@@ -80,7 +80,7 @@ generation or trial being judged."
                       :reader experiment-run-score-occurrences)))
 
 (defun %experiment-log (run level message)
-  (sigil-log (client-config (experiment-run-client run)) level "experiment" message))
+  (agento11y-log (client-config (experiment-run-client run)) level "experiment" message))
 
 (defun %call-swallowing-errors (run label thunk)
   "Run THUNK and return its value, or log the error and return NIL.
@@ -98,7 +98,7 @@ non-terminal, and a silent one leaves no trace of why."
 (defun %normalize-upload-mode (upload)
   (let ((mode (or upload :continuous)))
     (unless (member mode '(:continuous :bulk :manual))
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message (format nil "unknown upload mode ~s; expected :continuous, :bulk, or :manual"
                               mode)))
     mode))
@@ -329,10 +329,10 @@ one."
         ((= (length generation-ids) 1) (first generation-ids))
         (anchored-p "")
         ((> (length generation-ids) 1)
-         (error 'sigil-validation-error
+         (error 'agento11y-validation-error
                 :message "score generation_id is required when an experiment item produced multiple generations"))
         (t
-         (error 'sigil-validation-error
+         (error 'agento11y-validation-error
                 :message "score generation_id or trial_id is required"))))))
 
 (defun %score-anchor (trial-id item-id generation-id)
@@ -456,7 +456,7 @@ the two functions do not each carry their own list of score keys."
 (defun %check-trial-open (trial)
   "Signal when TRIAL has already closed, since its buffer will never drain."
   (when (trial-closed-p trial)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message (format nil "trial ~a is closed; its scores were already flushed"
                             (trial-id trial)))))
 
@@ -513,7 +513,7 @@ count for EXPERIMENT-RUN-PUBLISH to export."
   "Attach SCORES to TRIAL. They are exported when the trial closes."
   (let ((run (trial-run trial)))
     (unless run
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial is not attached to an experiment run"))
     (experiment-run-add-scores run scores
                                :item item
@@ -613,10 +613,10 @@ it. Returns the number of scores now buffered on the trial."
          (grader-generation-id nil)
          (grader-conversation-id nil))
     (unless run
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial is not attached to an experiment run"))
     (when (zerop (length evaluator-id))
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "score validation failed: missing evaluator_id"))
     (when (and grader publish-grader)
       (let ((base (%grader-id-base run trial key evaluator-id)))
@@ -685,12 +685,12 @@ test-case id resolved against the run's suite, or a dataset item."
 
 (defun experiment-run-open-trial (run test-case &key (attempt 1) metadata)
   "Open a typed trial on RUN for TEST-CASE and create it on the backend.
-Signals SIGIL-VALIDATION-ERROR before any request when the
+Signals AGENTO11Y-VALIDATION-ERROR before any request when the
 (test-case-id, attempt) pair was already used on this run: both would mint
 the same trial id and collide."
   (multiple-value-bind (test-case-id resolved-case) (%resolve-test-case run test-case)
     (when (zerop (length test-case-id))
-      (error 'sigil-validation-error :message "trial requires a test case id"))
+      (error 'agento11y-validation-error :message "trial requires a test case id"))
     (let* ((run-id (experiment-run-run-id run))
            (trial-id (trial-mint-id run-id test-case-id attempt))
            (suite (experiment-run-suite run))
@@ -698,7 +698,7 @@ the same trial id and collide."
            (trial nil))
       (bt2:with-lock-held ((experiment-run-lock run))
         (when (gethash trial-id (experiment-run-claimed-trial-ids run))
-          (error 'sigil-validation-error
+          (error 'agento11y-validation-error
                  :message (format nil "trial for test case ~s attempt ~a already exists on run ~s; increment attempt for a retry"
                                   test-case-id attempt run-id)))
         (setf (gethash trial-id (experiment-run-claimed-trial-ids run)) t)
@@ -873,9 +873,9 @@ the local total against it answers 409 score-count-mismatch."
                                       extra-metadata suite planned-trial-count
                                       (on-conflict :reopen) (upload :continuous))
   (when (%blank-string-p run-id)
-    (error 'sigil-validation-error :message "experiment run_id is required"))
+    (error 'agento11y-validation-error :message "experiment run_id is required"))
   (when (%blank-string-p name)
-    (error 'sigil-validation-error :message "experiment name is required"))
+    (error 'agento11y-validation-error :message "experiment name is required"))
   (setf upload (%normalize-upload-mode upload))
   (let* ((create-metadata (%run-metadata metadata dataset candidate))
          (run-tags tags))
@@ -897,17 +897,17 @@ the local total against it answers 409 score-count-mismatch."
                                :candidate candidate
                                :planned-trial-count planned-trial-count
                                :metadata create-metadata)
-      (sigil-conflict-error (e)
+      (agento11y-conflict-error (e)
         ;; Upsert claims an existing run, so a conflict means the backend
         ;; would not reclaim this one. :reopen keeps going with the run as it
         ;; is, but only for a conflict the caller can still work through: a
         ;; terminal or immutable run would take trials and a finalize it has
         ;; already refused.
-        (let ((kind (sigil-conflict-error-kind e)))
+        (let ((kind (agento11y-conflict-error-kind e)))
           (when (or (not (eq on-conflict :reopen))
                     (not (conflict-recoverable-p kind)))
             (error e))
-          (sigil-log (client-config client) :warn "experiment"
+          (agento11y-log (client-config client) :warn "experiment"
                      (format nil "run ~a: reopening after a recoverable upsert conflict (~a)"
                              run-id kind)))))
     (%make-experiment-run :client client

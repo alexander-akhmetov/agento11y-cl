@@ -1,8 +1,8 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; Local test suites.
 ;;;
-;;; Deliberately minimal. There is no YAML loader (sigil-cl has no YAML
+;;; Deliberately minimal. There is no YAML loader (agento11y-cl has no YAML
 ;;; dependency, and every dependency here becomes a vendored dependency
 ;;; downstream) and no stored-suite control plane (nine routes, a second host,
 ;;; and a Grafana service-account token, none of which a local evaluation
@@ -49,7 +49,7 @@
   (let ((case-id (%trimmed-text (or (unless (%blank-string-p test-case-id) test-case-id)
                                     id))))
     (when (zerop (length case-id))
-      (error 'sigil-validation-error :message "test case requires an id"))
+      (error 'agento11y-validation-error :message "test case requires an id"))
     (%make-test-case :test-case-id case-id
                      :name (%text name)
                      :description (%text description)
@@ -78,7 +78,7 @@
 %COERCE-TEST-CASE understands (plists, alists, jzon-parsed objects)."
   (let ((id (%trimmed-text suite-id)))
     (when (zerop (length id))
-      (error 'sigil-validation-error :message "suite_id is required"))
+      (error 'agento11y-validation-error :message "suite_id is required"))
     (let* ((coerced (mapcar #'%coerce-test-case
                             (if (vectorp cases) (coerce cases 'list) cases)))
            (index (make-hash-table :test 'equal)))

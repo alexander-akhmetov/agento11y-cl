@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 (defmacro with-generation ((var client &rest initargs) &body body)
   "Execute BODY with a generation recorder bound to VAR.
@@ -75,7 +75,7 @@ thread constructor."
         (funcall thunk)))))
 
 (defmacro with-span ((client name &key (kind 1) attributes-var) &body body)
-  "Execute BODY wrapped in a Sigil OTel span.
+  "Execute BODY wrapped in an OTel span.
 Zero overhead when traces are disabled on CLIENT's config.
 NAME is a string (evaluated). KIND: 1=INTERNAL (default), 3=CLIENT.
 ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto."
@@ -110,7 +110,7 @@ ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto
                                       (or (getf ctx :trace-id) (generate-trace-id))))
                           (span-id (generate-span-id))
                           (parent-span-id (getf *trace-context* :span-id))
-                          (base-attrs (list (otel-string-attr "sigil.sdk.name" +sdk-name+))))
+                          (base-attrs (list (otel-string-attr "agento11y.sdk.name" +sdk-name+))))
                      (let ((agent (or (config-agent-name cfg)
                                       (config-service-name cfg)))
                            (agent-ver (or (config-agent-version cfg)
@@ -139,6 +139,6 @@ ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto
                        (bt2:condition-notify (client-wake-cv ,client-var))))
                  (error (e)
                    (handler-case
-                       (sigil-log (client-config ,client-var) :warn "span"
+                       (agento11y-log (client-config ,client-var) :warn "span"
                                  (format nil "span recording failed: ~a" (princ-to-string e)))
                      (error () nil))))))))))

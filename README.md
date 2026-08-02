@@ -1,8 +1,8 @@
-# sigil-cl
+# agento11y-cl
 
-Common Lisp SDK for [Grafana Sigil](https://github.com/grafana/sigil-sdk) AI observability.
+Common Lisp SDK for [Grafana Agent Observability](https://github.com/grafana/agento11y).
 
-Sigil captures LLM generations, tool executions, and embeddings from your application and exports them as structured telemetry — generation payloads over HTTP and traces via OTLP.
+It captures LLM generations, tool executions, and embeddings from your application and exports them as structured telemetry — generation payloads over HTTP and traces via OTLP.
 
 ## Features
 
@@ -10,32 +10,32 @@ Sigil captures LLM generations, tool executions, and embeddings from your applic
 - **Tool execution tracing** — record tool/function calls as child spans linked to parent generations
 - **Embedding tracing** — track embedding API calls with input counts and token usage
 - **Ad-hoc spans** — wrap arbitrary code blocks in OTel spans via `with-span`
-- **Conversation ratings** — submit user feedback ratings to the Sigil API
+- **Conversation ratings** — submit user feedback ratings to the API
 - **Offline experiments** — create eval runs, record tagged generations, export scores, and loop a dataset through a target and scorers
 - **Built-in evaluators** — grade output in-process with an LLM judge or a regex judge, and record the grader's own generation alongside the score
 - **Trial artifacts** — attach files, text, or raw bytes to a trial
 - **Cloud trial evaluation** — queue a tenant-stored evaluator against a trial and wait for its verdict (experimental)
-- **Collection datasets** — read Sigil collections and conversations to build experiment datasets from saved conversations
-- **Synchronous hook evaluation** — opt-in preflight/postflight guard checks against the Sigil hooks API with allow/deny semantics, fail-open transport handling, and `transformed_input` rewrite passthrough
+- **Collection datasets** — read collections and conversations to build experiment datasets from saved conversations
+- **Synchronous hook evaluation** — opt-in preflight/postflight guard checks against the hooks API with allow/deny semantics, fail-open transport handling, and `transformed_input` rewrite passthrough
 - **Message normalization** — convert raw Anthropic and OpenAI API responses into SDK types
 - **Background export** — batched, async HTTP export with exponential backoff retry
 - **Content capture modes** — `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only`
 
 ## Installation
 
-Add `sigil-cl` to your ASDF system definition:
+Add `agento11y-cl` to your ASDF system definition:
 
 ```lisp
-:depends-on (:sigil-cl ...)
+:depends-on (:agento11y-cl ...)
 ```
 
 ## Quick start
 
 ```lisp
 (defvar *client*
-  (sigil-cl:make-client
-   (sigil-cl:make-config
-    :generation-endpoint "https://{your-sigil-host}/api/v1/generations:export"
+  (agento11y-cl:make-client
+   (agento11y-cl:make-config
+    :generation-endpoint "https://{your-agento11y-host}/api/v1/generations:export"
     :generation-enabled t
     :traces-endpoint "https://{your-otel-host}/v1/traces"
     :traces-enabled t
@@ -45,46 +45,46 @@ Add `sigil-cl` to your ASDF system definition:
     :content-capture-mode :full
     :service-name "my-app")))
 
-(sigil-cl:client-start *client*)
+(agento11y-cl:client-start *client*)
 ```
 
 ### Record a generation
 
 ```lisp
-(sigil-cl:with-generation (rec *client*
+(agento11y-cl:with-generation (rec *client*
                            :model-provider "anthropic"
                            :model-name "claude-sonnet-4-20250514"
                            :conversation-id "conv-123")
   ;; Call your LLM here, then record the result:
-  (sigil-cl:set-result rec
+  (agento11y-cl:set-result rec
     :input-messages input-msgs
     :output-messages output-msgs
-    :usage (sigil-cl:make-token-usage :input 500 :output 200)
+    :usage (agento11y-cl:make-token-usage :input 500 :output 200)
     :stop-reason "end_turn"))
 ```
 
 Child tool executions and embeddings within the body are automatically parented to the generation's trace:
 
 ```lisp
-(sigil-cl:with-generation (gen *client* :model-provider "openai" :model-name "gpt-4")
+(agento11y-cl:with-generation (gen *client* :model-provider "openai" :model-name "gpt-4")
   ;; ... LLM call ...
-  (sigil-cl:with-tool-execution (tool *client*
+  (agento11y-cl:with-tool-execution (tool *client*
                                  :tool-name "web-search"
                                  :tool-call-id "tc_1")
     ;; ... execute tool ...
-    (sigil-cl:set-result tool :result "search results here")))
+    (agento11y-cl:set-result tool :result "search results here")))
 ```
 
 ### Record an embedding
 
 ```lisp
-(sigil-cl:with-embedding (rec *client*
+(agento11y-cl:with-embedding (rec *client*
                           :model-provider "openai"
                           :model-name "text-embedding-3-small"
                           :dimensions 1536
                           :encoding-format "float")
   ;; ... call the embedding API ...
-  (sigil-cl:set-result rec
+  (agento11y-cl:set-result rec
     :input-count 2
     :input-tokens 24
     :dimensions 1536
@@ -117,7 +117,7 @@ A message carries a list of parts. There are five kinds:
 The four string fields default to `""`; `:provider-type` defaults to `nil`.
 
 ```lisp
-(sigil-cl:make-media-part :kind "image"
+(agento11y-cl:make-media-part :kind "image"
                           :url "https://example.com/chart.png"
                           :mime-type "image/png"
                           :name "chart.png"
@@ -135,13 +135,13 @@ Convert raw LLM API hash-tables into SDK types:
 
 ```lisp
 ;; Anthropic/OpenAI message arrays -> CLOS message objects
-(let* ((system (sigil-cl:extract-system-prompt api-messages))
-       (input  (sigil-cl:normalize-input-messages api-messages))
-       (output (sigil-cl:build-output-message
+(let* ((system (agento11y-cl:extract-system-prompt api-messages))
+       (input  (agento11y-cl:normalize-input-messages api-messages))
+       (output (agento11y-cl:build-output-message
                 :text response-text
                 :reasoning thinking-text
                 :tool-calls tool-call-list)))
-  (sigil-cl:set-result rec
+  (agento11y-cl:set-result rec
     :system-prompt system
     :input-messages input
     :output-messages (list output)))
@@ -154,19 +154,19 @@ with neither a URL nor both a media type and inline data is dropped.
 
 ### Synchronous hook evaluation
 
-`evaluate-hook` performs a synchronous `POST /api/v1/hooks:evaluate` against the Sigil hooks API before (preflight) or after (postflight) an upstream LLM call. The hook is the SDK's call; the rules it runs are the guards you configure in Grafana Cloud, which decide whether to allow, deny, or transform the input. The naming matches the Python, Go, and JavaScript SDKs.
+`evaluate-hook` performs a synchronous `POST /api/v1/hooks:evaluate` against the hooks API before (preflight) or after (postflight) an upstream LLM call. The hook is the SDK's call; the rules it runs are the guards you configure in Grafana Cloud, which decide whether to allow, deny, or transform the input. The naming matches the Python, Go, and JavaScript SDKs.
 
 Hooks are disabled by default. Nothing is sent until you pass `:hooks-config` with `:enabled t`:
 
 ```lisp
 (defvar *client*
-  (sigil-cl:make-client
-   (sigil-cl:make-config
-    :generation-endpoint "https://sigil.example.com/api/v1/generations:export"
+  (agento11y-cl:make-client
+   (agento11y-cl:make-config
+    :generation-endpoint "https://agento11y.example.com/api/v1/generations:export"
     ;; Optional: override the hooks API host root explicitly. When unset, the
     ;; hooks endpoint is derived from :generation-endpoint's host root.
-    :api-endpoint "https://sigil.example.com"
-    :hooks-config (sigil-cl:make-hooks-config :enabled t
+    :api-endpoint "https://agento11y.example.com"
+    :hooks-config (agento11y-cl:make-hooks-config :enabled t
                                               :phases '(:preflight)
                                               :timeout-sec 5.0
                                               :fail-open t)
@@ -175,33 +175,33 @@ Hooks are disabled by default. Nothing is sent until you pass `:hooks-config` wi
     :tenant-id "12345")))
 
 (handler-case
-    (let* ((ctx (sigil-cl:make-hook-context
+    (let* ((ctx (agento11y-cl:make-hook-context
                  :model-provider "anthropic"
                  :model-name "claude-sonnet-4-20250514"
                  :agent-name "router"
                  :tags '(("env" . "prod"))))
-           (input (sigil-cl:make-hook-input
+           (input (agento11y-cl:make-hook-input
                    :system-prompt system-prompt
                    :messages input-messages))
-           (response (sigil-cl:evaluate-hook *client*
+           (response (agento11y-cl:evaluate-hook *client*
                                              :phase :preflight
                                              :context ctx
                                              :input input)))
       ;; If the server returns transformed_input, substitute the rewritten
       ;; messages/tools/system-prompt into the upstream LLM call. The SDK
       ;; never mutates caller state -- the caller decides whether to use it.
-      (let ((rewritten (sigil-cl:response-transformed-input response)))
+      (let ((rewritten (agento11y-cl:response-transformed-input response)))
         (when rewritten
-          (setf system-prompt (sigil-cl:hook-input-system-prompt rewritten))
-          (when (sigil-cl:hook-input-messages rewritten)
-            (setf input-messages (sigil-cl:hook-input-messages rewritten)))))
+          (setf system-prompt (agento11y-cl:hook-input-system-prompt rewritten))
+          (when (agento11y-cl:hook-input-messages rewritten)
+            (setf input-messages (agento11y-cl:hook-input-messages rewritten)))))
       ;; ... call the upstream LLM ...
       )
-  (sigil-cl:sigil-hook-denied-error (c)
+  (agento11y-cl:agento11y-hook-denied-error (c)
     ;; Block the LLM call -- the server denied this request.
-    (log-denied (sigil-cl:sigil-hook-denied-error-rule-id c)
-                (sigil-cl:sigil-hook-denied-error-reason c)))
-  (sigil-cl:sigil-hook-transport-error (c)
+    (log-denied (agento11y-cl:agento11y-hook-denied-error-rule-id c)
+                (agento11y-cl:agento11y-hook-denied-error-reason c)))
+  (agento11y-cl:agento11y-hook-transport-error (c)
     ;; Only reachable when :fail-open nil -- otherwise transport errors
     ;; resolve to a synthetic allow response.
     (log-transport-failure c)))
@@ -210,11 +210,11 @@ Hooks are disabled by default. Nothing is sent until you pass `:hooks-config` wi
 Behaviour:
 
 - **Allow** → returns a `hook-evaluate-response` with `(response-action r) = :allow`.
-- **Deny** → signals `sigil-hook-denied-error` with `rule-id`, `reason`, and per-rule `evaluations`.
-- **Transport failure** → honours `(hooks-config-fail-open hooks)`: when `t` (default) returns a synthetic allow response so failed hook checks never block the LLM call; when `nil` signals `sigil-hook-transport-error`. A fail-open allow is reported through `:log-fn` at `:warn` with component `"hooks"`, so an evaluator outage does not read as a clean allow.
+- **Deny** → signals `agento11y-hook-denied-error` with `rule-id`, `reason`, and per-rule `evaluations`.
+- **Transport failure** → honours `(hooks-config-fail-open hooks)`: when `t` (default) returns a synthetic allow response so failed hook checks never block the LLM call; when `nil` signals `agento11y-hook-transport-error`. A fail-open allow is reported through `:log-fn` at `:warn` with component `"hooks"`, so an evaluator outage does not read as a clean allow.
 - **transformed_input** → the response carries an optional `hook-input` accessible via `response-transformed-input`. Callers decide whether to substitute the rewritten `messages` / `tools` / `system_prompt` into the upstream call. The SDK does not mutate caller state.
 - **Endpoint** → derived from `:api-endpoint` when set, otherwise from the host root of `:generation-endpoint`. Both `https://host` and `https://host/api/v1/...` forms are accepted; only the scheme + host are used. A schemeless or `grpc://` value contributes its host and resolves to `https://host`.
-- **Timeout** → `(hooks-config-timeout-sec hooks)` (default `15.0`) is sent to the server via the `X-Sigil-Hook-Timeout-Ms` header. The `:timeout-sec` keyword on `evaluate-hook` overrides it for a single call. Zero and negative values fall back to the default.
+- **Timeout** → `(hooks-config-timeout-sec hooks)` (default `15.0`) is sent to the server via the `X-Agento11y-Hook-Timeout-Ms` header. The `:timeout-sec` keyword on `evaluate-hook` overrides it for a single call. Zero and negative values fall back to the default.
 - **Response size** → bodies larger than 4 MiB are treated as transport failures.
 - **Correlation** → `trace-id` and `span-id` on the context fall back to the ambient `*trace-context*`, so a hook called inside `with-generation` reports the same trace as the generation it guards. Set them (or `conversation-id`) explicitly to override.
 - **Part encoding** → every message part carries its `kind`; the server dispatches on that field. Tool call arguments and tool result payloads go out as embedded JSON so rules can match on them, while a tool definition's `input_schema_json` stays base64, which is what the server's protobuf bytes field expects.
@@ -222,7 +222,7 @@ Behaviour:
 ### Shutdown
 
 ```lisp
-(sigil-cl:client-shutdown *client*)
+(agento11y-cl:client-shutdown *client*)
 ```
 
 ## Configuration
@@ -250,7 +250,7 @@ Behaviour:
 | `:tenant-id` | `nil` | Grafana Cloud tenant ID |
 | `:extra-headers` | `nil` | Alist of extra HTTP headers merged with auth headers (user wins on case-insensitive collision) |
 | `:content-capture-mode` | `:metadata-only` | `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only` |
-| `:embedding-capture-input` | `nil` | Put embedding input texts on the span as `gen_ai.embeddings.input_texts`. Also needs a content capture mode of `:full` or `:no-tool-content`; the other two modes suppress the texts. No `SIGIL_*` variable sets this, matching the Go, Python, and JavaScript SDKs |
+| `:embedding-capture-input` | `nil` | Put embedding input texts on the span as `gen_ai.embeddings.input_texts`. Also needs a content capture mode of `:full` or `:no-tool-content`; the other two modes suppress the texts. No environment variable sets this, matching the Go, Python, and JavaScript SDKs |
 | `:embedding-max-input-items` | `20` | Number of input texts kept on the span. A zero or negative value falls back to 20 |
 | `:embedding-max-text-length` | `1024` | Characters kept per input text. If the length is above 3, longer text keeps its first `length - 3` characters plus `...`. If the length is 3 or less, the text is cut with no suffix. A zero or negative value falls back to 1024 |
 | `:batch-size` | `20` | Generations per export batch |
@@ -263,53 +263,59 @@ Behaviour:
 | `:agent-version` | `nil` | Agent version for `gen_ai.agent.version` span attribute and generation `agent_version` field; falls back to `service-version` |
 | `:user-id` | `nil` | User identifier (OTel `user.id` span attribute) |
 | `:tags` | `nil` | Alist of tags applied to generation payloads |
-| `:debug` | `nil` | Debug flag (also settable via `SIGIL_DEBUG`) |
+| `:debug` | `nil` | Debug flag (also settable via `AGENTO11Y_DEBUG`) |
 | `:log-fn` | `nil` | `(lambda (level component message) ...)` |
 | `:metrics-fn` | `nil` | `(lambda (type recorder) ...)` |
 
 ### Environment variables
 
-`make-client` automatically layers `SIGIL_*` environment variables on top of
+`make-client` automatically layers `AGENTO11Y_*` environment variables on top of
 the supplied config: explicit caller config wins over env, env wins over
-schema defaults. This matches the canonical sigil-sdk schema (Go, Python, JS).
+schema defaults. This matches the canonical agento11y SDKs schema (Go, Python, JS).
+
+Every variable also has a legacy `SIGIL_<SUFFIX>` spelling. The `AGENTO11Y_`
+name wins when both are set, and the choice is made before parsing, so a stale
+legacy value cannot resurface when the preferred one fails validation. The two
+spellings are never merged: the selected value is used whole, including for
+`TAGS` and `HEADERS`.
 
 | Variable | Config slot | Notes |
 |----------|-------------|-------|
-| `SIGIL_ENDPOINT` | `:generation-endpoint` | Full URL; sigil-cl is HTTP-only, no scheme auto-prepend |
-| `SIGIL_EVAL_ENDPOINT` | `:eval-endpoint` | Base URL for experiment control-plane requests |
-| `SIGIL_EVAL_PATH_PREFIX` | `:eval-path-prefix` | Defaults to `/api/v1` |
-| `SIGIL_EVAL_AUTH_TOKEN` | `:eval-auth-token` | Sent as `Bearer` on control-plane requests, replacing generation auth; not used for score export |
-| `SIGIL_INGEST_ACTOR` | `:ingest-actor` | Defaults to `ingest:sdk/lisp` |
-| `SIGIL_EXPERIMENT_URL_TEMPLATE` | `:experiment-url-template` | Supports `{base}` and `{run_id}` |
-| `SIGIL_HEADERS` | `:extra-headers` | `k=v,k2=v2`; merged into auth headers (user header wins on case-insensitive collision) |
-| `SIGIL_AUTH_MODE` | `:auth-mode` | `none` / `tenant` / `bearer` / `basic`; unknown values warn and are ignored |
-| `SIGIL_AUTH_TENANT_ID` | `:tenant-id` | |
-| `SIGIL_AUTH_TOKEN` | `:auth-password` | Used as bearer token or basic password |
-| `SIGIL_AGENT_NAME` | `:agent-name` | |
-| `SIGIL_AGENT_VERSION` | `:agent-version` | |
-| `SIGIL_USER_ID` | `:user-id` | |
-| `SIGIL_TAGS` | `:tags` | `k=v,k2=v2`; env is the base layer, caller-supplied tags win on key collision |
-| `SIGIL_CONTENT_CAPTURE_MODE` | `:content-capture-mode` | Accepts `full` / `no_tool_content` / `metadata_only`; unknown values warn and are ignored. `:metadata-with-system-prompt` is a code-only extension. An unsupported caller keyword warns and falls back to `:metadata-only` |
-| `SIGIL_DEBUG` | `:debug` | `1` / `true` / `yes` / `on` → t, otherwise nil |
-| `SIGIL_ENABLE_EXPERIMENTAL_FEATURES` | `:experimental-features` | Same truthy values as `SIGIL_DEBUG`. Also read from `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES`; the `SIGIL_` spelling wins when both are set |
+| `AGENTO11Y_ENDPOINT` | `:generation-endpoint` | Full URL; agento11y-cl is HTTP-only, no scheme auto-prepend |
+| `AGENTO11Y_EVAL_ENDPOINT` | `:eval-endpoint` | Base URL for experiment control-plane requests |
+| `AGENTO11Y_EVAL_PATH_PREFIX` | `:eval-path-prefix` | Defaults to `/api/v1` |
+| `AGENTO11Y_EVAL_AUTH_TOKEN` | `:eval-auth-token` | Sent as `Bearer` on control-plane requests, replacing generation auth; not used for score export |
+| `AGENTO11Y_INGEST_ACTOR` | `:ingest-actor` | Defaults to `ingest:sdk/lisp` |
+| `AGENTO11Y_EXPERIMENT_URL_TEMPLATE` | `:experiment-url-template` | Supports `{base}` and `{run_id}` |
+| `AGENTO11Y_HEADERS` | `:extra-headers` | `k=v,k2=v2`; merged into auth headers (user header wins on case-insensitive collision) |
+| `AGENTO11Y_AUTH_MODE` | `:auth-mode` | `none` / `tenant` / `bearer` / `basic`; unknown values warn and are ignored |
+| `AGENTO11Y_AUTH_TENANT_ID` | `:tenant-id` | |
+| `AGENTO11Y_AUTH_TOKEN` | `:auth-password` | Used as bearer token or basic password |
+| `AGENTO11Y_AGENT_NAME` | `:agent-name` | |
+| `AGENTO11Y_AGENT_VERSION` | `:agent-version` | |
+| `AGENTO11Y_USER_ID` | `:user-id` | |
+| `AGENTO11Y_TAGS` | `:tags` | `k=v,k2=v2`; env is the base layer, caller-supplied tags win on key collision |
+| `AGENTO11Y_CONTENT_CAPTURE_MODE` | `:content-capture-mode` | Accepts `full` / `no_tool_content` / `metadata_only`; unknown values warn and are ignored. `:metadata-with-system-prompt` is a code-only extension. An unsupported caller keyword warns and falls back to `:metadata-only` |
+| `AGENTO11Y_DEBUG` | `:debug` | `1` / `true` / `yes` / `on` → t, otherwise nil |
+| `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES` | `:experimental-features` | Same truthy values as `AGENTO11Y_DEBUG` |
 
-`SIGIL_PROTOCOL` is not supported (sigil-cl is HTTP-only); a warning is logged
-when set to anything other than `http`/`https`. `SIGIL_INSECURE` is a no-op
-because TLS is controlled by the URL scheme.
+`AGENTO11Y_PROTOCOL` is not supported (agento11y-cl is HTTP-only); a warning is
+logged when set to anything other than `http`/`https`. `AGENTO11Y_INSECURE` is a
+no-op because TLS is controlled by the URL scheme.
 
 > **Caveat: env can override caller defaults for a few slots.** The resolver
 > cannot distinguish "caller passed the schema default" from "caller never set
 > the slot". Practically this affects two security-sensitive options:
 >
-> - `:auth-mode :none` — `SIGIL_AUTH_MODE` will replace it. A caller asking
+> - `:auth-mode :none` — `AGENTO11Y_AUTH_MODE` will replace it. A caller asking
 >   for "no auth" can have credentials added by env.
-> - `:content-capture-mode :metadata-only` — `SIGIL_CONTENT_CAPTURE_MODE` will
->   replace it. A caller relying on `:metadata-only` to keep prompt/response
->   text out of telemetry can be silently downgraded to `full` by the
->   environment.
+> - `:content-capture-mode :metadata-only` — `AGENTO11Y_CONTENT_CAPTURE_MODE`
+>   will replace it. A caller relying on `:metadata-only` to keep
+>   prompt/response text out of telemetry can be silently downgraded to `full`
+>   by the environment.
 >
 > If a deployment relies on these defaults for privacy or auth posture,
-> either set the matching `SIGIL_*` var to the desired value or unset it
+> either set the matching variable to the desired value or unset it
 > before constructing the client. `make-client` accepts `:env-fn` for callers
 > that want to ignore the host environment entirely (e.g. tests).
 >
@@ -365,7 +371,7 @@ without a signal.
 
 Every exported generation carries the tag
 `agento11y.sdk.content_capture_mode`, holding `full`, `no_tool_content`, or
-`metadata_only`. The Sigil backend reads it to tell a stripped generation from a
+`metadata_only`. The server reads it to tell a stripped generation from a
 full one: it collapses stripped generations in conversation transcripts, skips
 them as per-generation judge variables, and warns on test-case promotion. The
 SDK sets the tag last, so a caller tag using the same key cannot override it.
@@ -395,7 +401,7 @@ default and independent of the user `:metrics-fn` callback.
 
 Duration and token bucket boundaries match the current OTel GenAI semantic
 conventions. `gen_ai.client.time_to_first_token` and
-`gen_ai.client.tool_calls_per_operation` are Sigil-custom metric names, not part
+`gen_ai.client.tool_calls_per_operation` are SDK-custom metric names, not part
 of the OTel spec; they preserve parity with the reference SDK's wire output. The
 spec's standardized TTFT equivalent is
 `gen_ai.client.operation.time_to_first_chunk` (Development stability). The
@@ -427,20 +433,20 @@ extent are tagged with `experiment.run_id`, include `experiment_run_id`
 metadata, and are captured so scores can attach to them.
 
 ```lisp
-(sigil-cl:with-experiment (run client :run-id "exp-prompt-a" :name "prompt A")
-  (sigil-cl:with-trial (trial run "case-1")
-    (let ((rec (sigil-cl:start-generation client
+(agento11y-cl:with-experiment (run client :run-id "exp-prompt-a" :name "prompt A")
+  (agento11y-cl:with-trial (trial run "case-1")
+    (let ((rec (agento11y-cl:start-generation client
                  :model-provider "anthropic"
                  :model-name "claude-sonnet"
                  :input-messages input)))
       ;; Call the model, then record the result.
-      (sigil-cl:set-result rec :output-messages output :usage usage)
-      (sigil-cl:recorder-end rec)
-      (sigil-cl:trial-bind-generation trial (sigil-cl:gen-rec-generation-id rec)))
+      (agento11y-cl:set-result rec :output-messages output :usage usage)
+      (agento11y-cl:recorder-end rec)
+      (agento11y-cl:trial-bind-generation trial (agento11y-cl:gen-rec-generation-id rec)))
 
-    (sigil-cl:trial-add-scores
+    (agento11y-cl:trial-add-scores
      trial
-     (list (sigil-cl:make-score :evaluator-id "verifier"
+     (list (agento11y-cl:make-score :evaluator-id "verifier"
                                 :evaluator-version "1"
                                 :score-key "final"
                                 :value 0.9
@@ -450,7 +456,7 @@ metadata, and are captured so scores can attach to them.
 `with-experiment` closes every open trial, then finalizes the run `completed`
 on normal exit and `failed` on an error or a non-local exit such as an
 interrupt. `"succeeded"` is accepted as an alias for `"completed"`; any other
-status signals `sigil-validation-error` before a request goes out.
+status signals `agento11y-validation-error` before a request goes out.
 
 The upsert route claims an existing run idempotently, so a rerun with the same
 `:run-id` continues it. A `409 Conflict` means the run is in a state the
@@ -462,11 +468,11 @@ and `:on-conflict :error` re-signals.
 A trial is one attempt at one test case. Its id is deterministic —
 `(stable-id "trial" experiment-id test-case-id attempt)` — so a rerun addresses
 the same trial instead of creating a duplicate. Opening the same
-`(test-case-id, attempt)` pair twice on one run signals `sigil-validation-error`
+`(test-case-id, attempt)` pair twice on one run signals `agento11y-validation-error`
 before any request; bump `:attempt` for a retry.
 
 ```lisp
-(sigil-cl:with-trial (trial run "case-1" :attempt 2)
+(agento11y-cl:with-trial (trial run "case-1" :attempt 2)
   ...)
 ```
 
@@ -518,17 +524,17 @@ as a second value. The dependency list stays as it is, and any client adapts in
 a few lines.
 
 ```lisp
-(let ((judge (sigil-cl:make-llm-judge
+(let ((judge (agento11y-cl:make-llm-judge
               :evaluator-id "helpfulness"
               :model-name "claude-sonnet-4-5"
               :model-provider "anthropic"
               :invoke (lambda (prompt)
                         (values (my-llm-call prompt) (my-usage))))))
-  (sigil-cl:with-trial (trial run "case-1")
-    (sigil-cl:trial-bind-conversation trial conversation-id)
-    (sigil-cl:trial-record-evaluation
+  (agento11y-cl:with-trial (trial run "case-1")
+    (agento11y-cl:trial-bind-conversation trial conversation-id)
+    (agento11y-cl:trial-record-evaluation
      trial
-     (sigil-cl:evaluate-output judge (list :input question
+     (agento11y-cl:evaluate-output judge (list :input question
                                            :output answer
                                            :expected reference)))))
 ```
@@ -543,7 +549,7 @@ Pass `:parser` to replace the whole step.
 `make-regex-judge` is the deterministic counterpart. Its value is the boolean.
 
 ```lisp
-(sigil-cl:make-regex-judge :evaluator-id "no-secrets"
+(agento11y-cl:make-regex-judge :evaluator-id "no-secrets"
                            :pattern "sk-[A-Za-z0-9]+"
                            :negate t)
 ```
@@ -569,15 +575,15 @@ identical grader ids for the same score.
 your tenant, instead of a score computed locally.
 
 ```lisp
-(sigil-cl:trial-bind-conversation trial conversation-id)
-(sigil-cl:trial-evaluate trial "my-stored-evaluator" :timeout-sec 120)
+(agento11y-cl:trial-bind-conversation trial conversation-id)
+(agento11y-cl:trial-evaluate trial "my-stored-evaluator" :timeout-sec 120)
 ```
 
 It persists the conversation binding, flushes pending generations so the
 evaluator can read what it is asked to grade, queues the evaluation, then polls
 until the status is `success` or `failed`. The poll interval starts at 0.5s and
-doubles up to 5s. Worker failure signals `sigil-trial-evaluation-failed-error`
-and an exceeded deadline signals `sigil-trial-evaluation-timeout-error`; both
+doubles up to 5s. Worker failure signals `agento11y-trial-evaluation-failed-error`
+and an exceeded deadline signals `agento11y-trial-evaluation-timeout-error`; both
 carry the evaluation id, and the evaluation keeps running server-side either
 way, so triggering the same combination again returns the same row.
 
@@ -591,11 +597,11 @@ run cannot mark anything, so that caller must pass `:score-count nil` to
 underneath, for a caller who wants to queue an evaluation without blocking.
 
 All three are gated: without the experimental flag they signal
-`sigil-experimental-disabled-error` and send no request. Set it on the config
+`agento11y-experimental-disabled-error` and send no request. Set it on the config
 directly or through the environment:
 
 ```lisp
-(sigil-cl:make-config :experimental-features t ...)
+(agento11y-cl:make-config :experimental-features t ...)
 ```
 
 ### Trial artifacts
@@ -604,8 +610,8 @@ directly or through the environment:
 one of `:content`, `:text`, or `:path`.
 
 ```lisp
-(sigil-cl:trial-artifact trial :name "transcript" :text conversation-log)
-(sigil-cl:trial-artifact trial :name "screenshot" :path "/tmp/shot.png")
+(agento11y-cl:trial-artifact trial :name "transcript" :text conversation-log)
+(agento11y-cl:trial-artifact trial :name "screenshot" :path "/tmp/shot.png")
 ```
 
 `:kind` is inferred from the MIME type when unset, and the MIME type is inferred
@@ -613,7 +619,7 @@ from the file extension for `:path`. The content posts as the raw request body;
 `name`, `kind`, and `mime` ride the query string.
 
 > **This SDK does not redact artifacts.** Go and Python strip secrets from
-> text-like artifacts by default. sigil-cl has no secret sanitizer yet, so
+> text-like artifacts by default. agento11y-cl has no secret sanitizer yet, so
 > content uploads exactly as supplied. Code ported from Python that relied on
 > the default redaction has to strip secrets itself.
 
@@ -624,15 +630,15 @@ loader and no stored-suite control plane; build suites in Lisp from plists,
 alists, or parsed JSON.
 
 ```lisp
-(let ((suite (sigil-cl:make-test-suite
+(let ((suite (agento11y-cl:make-test-suite
               :suite-id "suite-1" :version "v2"
-              :cases (list (sigil-cl:make-test-case :id "case-1"
+              :cases (list (agento11y-cl:make-test-case :id "case-1"
                                                     :input "2+2?"
                                                     :expected "4"
                                                     :tags '("math"))))))
-  (sigil-cl:with-experiment (run client :run-id "exp-1" :name "suite run"
+  (agento11y-cl:with-experiment (run client :run-id "exp-1" :name "suite run"
                                  :suite suite)
-    (sigil-cl:with-trial (trial run "case-1")
+    (agento11y-cl:with-trial (trial run "case-1")
       ...)))
 ```
 
@@ -651,20 +657,20 @@ accepts one.
 one run, creating one trial per item:
 
 ```lisp
-(sigil-cl:run-experiment
+(agento11y-cl:run-experiment
  client
- (list (sigil-cl:make-dataset-item :id "it1" :input "2+2?")
-       (sigil-cl:make-dataset-item :id "it2" :input "3+3?"))
+ (list (agento11y-cl:make-dataset-item :id "it1" :input "2+2?")
+       (agento11y-cl:make-dataset-item :id "it2" :input "3+3?"))
  ;; target: run the agent for one item; generations recorded here are
  ;; captured and tagged automatically
  (lambda (item run)
    (declare (ignore run))
-   (my-agent (sigil-cl:jget item "input"))
+   (my-agent (agento11y-cl:jget item "input"))
    nil)                                  ; or (make-target-result ...)
  ;; scorers: grade one item, return a list of score outputs
  (list (lambda (item result)
          (declare (ignore item result))
-         (list (sigil-cl:make-score :evaluator-id "judge"
+         (list (agento11y-cl:make-score :evaluator-id "judge"
                                     :evaluator-version "1"
                                     :score-key "quality"
                                     :value 1.0))))
@@ -685,8 +691,8 @@ prompt. The underlying read calls (`list-collection-members`,
 `get-conversation`, `initial-user-prompt`) are also exported:
 
 ```lisp
-(let ((items (sigil-cl:dataset-from-collection client "col-123")))
-  (sigil-cl:run-experiment client items target scorers
+(let ((items (agento11y-cl:dataset-from-collection client "col-123")))
+  (agento11y-cl:run-experiment client items target scorers
                            :run-id "exp-col" :name "collection eval"
                            :collection-id "col-123"))
 ```
@@ -696,24 +702,24 @@ carried as a `collectionId:` tag and a metadata key instead.
 
 ### Threads
 
-`sigil-cl:*experiment-run*` and `sigil-cl:*trace-context*` are thread-confined
+`agento11y-cl:*experiment-run*` and `agento11y-cl:*trace-context*` are thread-confined
 dynamic bindings. A thread you spawn starts at their global value `NIL`, so a
 generation recorded there is neither tagged with the run nor tracked for score
 attribution, and its span starts a new trace instead of joining the current
 one. Carry both across with `telemetry-context-thunk`:
 
 ```lisp
-(sigil-cl:with-experiment (run client :run-id "exp-1" :name "threaded")
-  (sigil-cl:with-generation (parent client :mode :sync
+(agento11y-cl:with-experiment (run client :run-id "exp-1" :name "threaded")
+  (agento11y-cl:with-generation (parent client :mode :sync
                                     :model-provider "openai" :model-name "gpt-4")
     (let ((worker (bt2:make-thread
-                   (sigil-cl:telemetry-context-thunk
+                   (agento11y-cl:telemetry-context-thunk
                     (lambda ()
-                      (let ((rec (sigil-cl:start-generation
+                      (let ((rec (agento11y-cl:start-generation
                                   client :mode :sync
                                   :model-provider "openai" :model-name "gpt-4")))
-                        (sigil-cl:recorder-end rec)
-                        (sigil-cl:gen-rec-generation-id rec)))))))
+                        (agento11y-cl:recorder-end rec)
+                        (agento11y-cl:gen-rec-generation-id rec)))))))
       (bt2:join-thread worker))))
 ```
 
@@ -724,10 +730,10 @@ specials to rebind, `capture-telemetry-context` returns the snapshot and
 `with-telemetry-context` rebinds it:
 
 ```lisp
-(let ((context (sigil-cl:capture-telemetry-context)))   ; on the parent
+(let ((context (agento11y-cl:capture-telemetry-context)))   ; on the parent
   (bt2:make-thread
    (lambda ()
-     (sigil-cl:with-telemetry-context (context)         ; on the child
+     (agento11y-cl:with-telemetry-context (context)         ; on the child
        ...))))
 ```
 
@@ -746,38 +752,38 @@ statuses already reported were written without it.
 
 | Condition | Raised when |
 |---|---|
-| `sigil-validation-error` | HTTP 400/422, or a local check such as an unknown finalize status or a duplicate trial attempt |
-| `sigil-not-found-error` | HTTP 404 |
-| `sigil-conflict-error` | HTTP 409; `sigil-conflict-error-kind` classifies it |
-| `sigil-actor-mismatch-error` | HTTP 401 naming actor ownership; not retried |
-| `sigil-export-error` | any other non-2xx, rejected scores, or an evaluation response the SDK cannot act on |
-| `sigil-experimental-disabled-error` | an experimental call with the gate off; no request is sent |
-| `sigil-trial-evaluation-failed-error` | a cloud evaluation reported `failed`; carries the evaluation id and the worker's detail |
-| `sigil-trial-evaluation-timeout-error` | a cloud evaluation did not finish in time; carries the evaluation id |
+| `agento11y-validation-error` | HTTP 400/422, or a local check such as an unknown finalize status or a duplicate trial attempt |
+| `agento11y-not-found-error` | HTTP 404 |
+| `agento11y-conflict-error` | HTTP 409; `agento11y-conflict-error-kind` classifies it |
+| `agento11y-actor-mismatch-error` | HTTP 401 naming actor ownership; not retried |
+| `agento11y-export-error` | any other non-2xx, rejected scores, or an evaluation response the SDK cannot act on |
+| `agento11y-experimental-disabled-error` | an experimental call with the gate off; no request is sent |
+| `agento11y-trial-evaluation-failed-error` | a cloud evaluation reported `failed`; carries the evaluation id and the worker's detail |
+| `agento11y-trial-evaluation-timeout-error` | a cloud evaluation did not finish in time; carries the evaluation id |
 
-`sigil-conflict-error-kind` returns `:score-count-mismatch`,
+`agento11y-conflict-error-kind` returns `:score-count-mismatch`,
 `:running-trials`, `:pending-evaluations`, `:terminal`, `:immutable-field`,
 `:open-draft`, or `:unknown`. `conflict-recoverable-p` says whether the caller
 can fix it and retry. `classify-conflict` exposes the classifier directly.
 
-`sigil-trial-evaluation-error-id` reads the evaluation id off either evaluation
-condition; `sigil-trial-evaluation-error-detail` reads the worker's message off
+`agento11y-trial-evaluation-error-id` reads the evaluation id off either evaluation
+condition; `agento11y-trial-evaluation-error-detail` reads the worker's message off
 the failure.
 
 ### Configuration
 
 Experiment calls are synchronous. Configure them with `:eval-endpoint`,
 `:eval-path-prefix`, `:eval-auth-token`, `:scores-export-path`,
-`:ingest-actor`, and `:experiment-url-template`, or the matching `SIGIL_*`
-environment variables (`SIGIL_EVAL_ENDPOINT`, `SIGIL_EVAL_PATH_PREFIX`,
-`SIGIL_EVAL_AUTH_TOKEN`, `SIGIL_INGEST_ACTOR`,
-`SIGIL_EXPERIMENT_URL_TEMPLATE`).
+`:ingest-actor`, and `:experiment-url-template`, or the matching
+environment variables (`AGENTO11Y_EVAL_ENDPOINT`, `AGENTO11Y_EVAL_PATH_PREFIX`,
+`AGENTO11Y_EVAL_AUTH_TOKEN`, `AGENTO11Y_INGEST_ACTOR`,
+`AGENTO11Y_EXPERIMENT_URL_TEMPLATE`).
 
 If `:eval-endpoint` is unset, the SDK derives the base URL from
 `:generation-endpoint`. `:eval-auth-token` sends a separate `Bearer` token on
 control-plane requests — useful when generation export uses tenant or basic
 auth but the plugin API needs a service-account token. Score export is
-intentionally independent of the `SIGIL_EVAL_*` settings: scores are a tenant
+intentionally independent of the `AGENTO11Y_EVAL_*` settings: scores are a tenant
 ingest write that goes to the generation endpoint host with generation auth,
 same as the reference SDKs.
 

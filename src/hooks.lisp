@@ -1,16 +1,16 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; Synchronous hook evaluation.
 ;;;
-;;; Mirrors the canonical sigil-sdk Python hooks.py: a synchronous POST to
+;;; Mirrors the canonical agento11y SDKs Python hooks.py: a synchronous POST to
 ;;; /api/v1/hooks:evaluate before (preflight) or after (postflight) an
 ;;; upstream LLM call. Returns a hook-evaluate-response on allow; signals
-;;; sigil-hook-denied-error on deny. Honours hooks-config-fail-open for
+;;; agento11y-hook-denied-error on deny. Honours hooks-config-fail-open for
 ;;; transport failures.
 
 (alex:define-constant +hooks-evaluate-path+ "/api/v1/hooks:evaluate"
   :test #'string=)
-(alex:define-constant +hook-timeout-header+ "X-Sigil-Hook-Timeout-Ms"
+(alex:define-constant +hook-timeout-header+ "X-Agento11y-Hook-Timeout-Ms"
   :test #'string=)
 (defconstant +default-hook-timeout-sec+ 15.0)
 (defconstant +max-hook-response-bytes+ (ash 4 20)) ; 4 MiB
@@ -429,12 +429,12 @@ rewritten prompt content, and the server does not send tool parts back."
       (progn
         ;; A dead evaluator allows every request. Without this line the outage
         ;; looks the same as a clean allow.
-        (sigil-log config :warn "hooks"
+        (agento11y-log config :warn "hooks"
                    (format nil "hook evaluation failed, allowing request (fail-open): ~a"
                            detail))
         (%allow-response))
-      (error 'sigil-hook-transport-error
-             :message (format nil "sigil hook evaluation failed: ~a" detail))))
+      (error 'agento11y-hook-transport-error
+             :message (format nil "hook evaluation failed: ~a" detail))))
 
 (defun %positive-timeout (value)
   "VALUE when it is a positive real, else NIL. Zero and negative timeouts fall
@@ -483,16 +483,16 @@ invalid sequences to mirror Python's errors='replace' behaviour."
 ;;; --- Public entry point ---
 
 (defun evaluate-hook (client &key (phase :preflight) context input timeout-sec)
-  "Synchronously evaluate a Sigil hook for CLIENT.
+  "Synchronously evaluate a hook for CLIENT.
 
 PHASE is :preflight or :postflight. CONTEXT and INPUT are hook-context and
 hook-input instances respectively (constructed via make-hook-context /
 make-hook-input). TIMEOUT-SEC overrides the configured per-call timeout.
 
 Returns a hook-evaluate-response when the server allows. Signals
-sigil-hook-denied-error when the server denies. On transport failure,
+agento11y-hook-denied-error when the server denies. On transport failure,
 honours (hooks-config-fail-open hooks): when t (default) returns a
-synthetic allow response, when nil signals sigil-hook-transport-error."
+synthetic allow response, when nil signals agento11y-hook-transport-error."
   (let* ((config (client-config client))
          (hooks (or (config-hooks-config config) (make-hooks-config))))
     (unless (hooks-config-enabled hooks)
@@ -558,7 +558,7 @@ synthetic allow response, when nil signals sigil-hook-transport-error."
                                             (princ-to-string e))))))))
                  (let ((response (%parse-response parsed)))
                    (when (eq (response-action response) :deny)
-                     (error 'sigil-hook-denied-error
+                     (error 'agento11y-hook-denied-error
                             :message (or (response-reason response) "")
                             :rule-id (response-rule-id response)
                             :reason (response-reason response)

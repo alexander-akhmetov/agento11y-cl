@@ -1,10 +1,16 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
-;;; Canonical SIGIL_* environment variable resolution.
+;;; Canonical AGENTO11Y_* environment variable resolution.
 ;;;
-;;; Mirrors the env schema shipped in the canonical sigil-sdk
-;;; (Go: sigil-sdk/go/sigil/env.go, Python: sigil-sdk/python/sigil_sdk/config.py).
+;;; Mirrors the env schema shipped in the canonical agento11y SDKs
+;;; (Go: go/agento11y/env.go, Python: python/agento11y/config.py).
 ;;; Resolution precedence: explicit caller config > env var > schema defaults.
+;;;
+;;; Every variable has a preferred AGENTO11Y_<SUFFIX> name and a legacy
+;;; SIGIL_<SUFFIX> fallback. Selection happens before parsing, so a nonblank
+;;; preferred value wins even when it later fails validation and stale legacy
+;;; config cannot silently resurface. This matches envPair/envTrimmed in
+;;; go/agento11y/env.go.
 
 ;;; --- String helpers ---
 
@@ -19,6 +25,21 @@
         (unless (zerop (length trimmed))
           trimmed)))))
 
+(defun env-branded* (env-fn suffix)
+  "Read the AGENTO11Y_<SUFFIX> variable, falling back to SIGIL_<SUFFIX>.
+Returns (VALUE . NAME) for the first nonblank value, so a warning can name the
+spelling the caller actually set. Returns (NIL . NIL) when neither is set. The
+two spellings are never merged; the selected value is used whole."
+  (loop for name in (list (concatenate 'string "AGENTO11Y_" suffix)
+                          (concatenate 'string "SIGIL_" suffix))
+        for value = (env-trimmed env-fn name)
+        when value return (cons value name)
+        finally (return (cons nil nil))))
+
+(defun env-branded (env-fn suffix)
+  "Value half of ENV-BRANDED*, for the vars whose warnings never name them."
+  (car (env-branded* env-fn suffix)))
+
 (defun parse-bool (s)
   "Map common truthy strings (\"1\", \"true\", \"yes\", \"on\", case-insensitive) to T,
 falsy strings to NIL. Unknown values return NIL."
@@ -30,7 +51,7 @@ falsy strings to NIL. Unknown values return NIL."
 
 (defun parse-strict-bool (s config var-name)
   "Strictly map a bool env value: 1/true/yes/on/t -> T, 0/false/no/off/nil -> NIL
-(case-insensitive). Any other value logs a warning via sigil-log and returns
+(case-insensitive). Any other value logs a warning via agento11y-log and returns
 :invalid so a typo can't silently flip behavior. The warning never includes the
 value: these vars gate redaction, and a value pasted there by mistake could be a
 secret."
@@ -39,7 +60,7 @@ secret."
       ((member normalized '("1" "true" "yes" "on" "t") :test #'string=) t)
       ((member normalized '("0" "false" "no" "off" "nil") :test #'string=) nil)
       (t
-       (sigil-log config :warn "env"
+       (agento11y-log config :warn "env"
                   (format nil "ignoring ~a (unsupported value)" var-name))
        :invalid))))
 
@@ -63,23 +84,24 @@ Skips empty entries and entries with no '='. Returns a fresh list in source orde
                  (setf start (1+ end)))))
     (nreverse result)))
 
-(defun parse-content-capture-mode (s config)
-  "Map canonical content capture string to a sigil-cl keyword.
+(defun parse-content-capture-mode (s config &optional (var-name "AGENTO11Y_CONTENT_CAPTURE_MODE"))
+  "Map canonical content capture string to an agento11y-cl keyword.
 Accepts \"full\", \"no_tool_content\", and \"metadata_only\". The
 :metadata-with-system-prompt mode is a CL-only extension and is not exposed
-via env. Unknown values produce a warning via sigil-log and return :invalid."
+via env. Unknown values produce a warning via agento11y-log and return :invalid.
+VAR-NAME names the variable the value came from, so the warning points at the
+spelling the caller actually set."
   (let ((normalized (string-downcase (%trim s))))
     (cond
       ((string= normalized "full") :full)
       ((string= normalized "no_tool_content") :no-tool-content)
       ((string= normalized "metadata_only") :metadata-only)
       (t
-       (sigil-log config :warn "env"
-                  (format nil "ignoring SIGIL_CONTENT_CAPTURE_MODE=~a (unsupported value)"
-                          s))
+       (agento11y-log config :warn "env"
+                  (format nil "ignoring ~a=~a (unsupported value)" var-name s))
        :invalid))))
 
-(defun %parse-auth-mode (s config)
+(defun %parse-auth-mode (s config &optional (var-name "AGENTO11Y_AUTH_MODE"))
   "Map a canonical auth-mode string to a keyword. Unknown values warn and return :invalid."
   (let ((normalized (string-downcase (%trim s))))
     (cond
@@ -88,8 +110,8 @@ via env. Unknown values produce a warning via sigil-log and return :invalid."
       ((string= normalized "bearer") :bearer)
       ((string= normalized "basic")  :basic)
       (t
-       (sigil-log config :warn "env"
-                  (format nil "ignoring SIGIL_AUTH_MODE=~a (unsupported value)" s))
+       (agento11y-log config :warn "env"
+                  (format nil "ignoring ~a=~a (unsupported value)" var-name s))
        :invalid))))
 
 (defun %merge-alist-env-base (env-list caller-list key-test)
@@ -106,7 +128,7 @@ HTTP headers). Returns a fresh alist."
 
 ;;; --- Slot copying via MOP ---
 ;;;
-;;; To avoid losing values when sigil-config grows new slots, the resolver
+;;; To avoid losing values when agento11y-config grows new slots, the resolver
 ;;; reflects over the class to copy every initarg-bound slot from the input
 ;;; config into a fresh instance, then layers env overrides on top. CLOS
 ;;; resolves duplicate initargs by taking the first occurrence, so overrides
@@ -126,30 +148,28 @@ HTTP headers). Returns a fresh alist."
 ;;; --- Public resolver ---
 
 (defun resolve-config-from-env (config &key (env-fn #'uiop:getenv))
-  "Return a fresh sigil-config with SIGIL_* env vars layered on top of defaults
-but below explicit caller-supplied values. CONFIG is the user's config; ENV-FN
-is called with each variable name and must return a string or nil.
+  "Return a fresh agento11y-config with AGENTO11Y_* env vars layered on top of
+defaults but below explicit caller-supplied values. CONFIG is the user's config;
+ENV-FN is called with each variable name and must return a string or nil.
 
 Resolution precedence per slot: caller value (explicit) > env > schema default.
 
-Recognized variables:
-  SIGIL_ENDPOINT, SIGIL_EVAL_ENDPOINT, SIGIL_EVAL_PATH_PREFIX,
-  SIGIL_EVAL_AUTH_TOKEN, SIGIL_INGEST_ACTOR,
-  SIGIL_EXPERIMENT_URL_TEMPLATE, SIGIL_HEADERS, SIGIL_AUTH_MODE,
-  SIGIL_AUTH_TENANT_ID, SIGIL_AUTH_TOKEN, SIGIL_AGENT_NAME,
-  SIGIL_AGENT_VERSION, SIGIL_USER_ID, SIGIL_TAGS,
-  SIGIL_CONTENT_CAPTURE_MODE, SIGIL_REDACT_SECRETS,
-  SIGIL_REDACT_INPUT_MESSAGES, SIGIL_DEBUG,
-  SIGIL_ENABLE_EXPERIMENTAL_FEATURES.
+Recognized suffixes, each read as AGENTO11Y_<SUFFIX> with a legacy
+SIGIL_<SUFFIX> fallback:
+  ENDPOINT, EVAL_ENDPOINT, EVAL_PATH_PREFIX, EVAL_AUTH_TOKEN, INGEST_ACTOR,
+  EXPERIMENT_URL_TEMPLATE, HEADERS, AUTH_MODE, AUTH_TENANT_ID, AUTH_TOKEN,
+  AGENT_NAME, AGENT_VERSION, USER_ID, TAGS, CONTENT_CAPTURE_MODE,
+  REDACT_SECRETS, REDACT_INPUT_MESSAGES, DEBUG,
+  ENABLE_EXPERIMENTAL_FEATURES.
 
-SIGIL_ENABLE_EXPERIMENTAL_FEATURES also reads its agento11y spelling,
-AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES, so a polyglot harness that already
-exports the Go gate unlocks this SDK too. The SIGIL_ name wins when both are
-set.
+The AGENTO11Y_ spelling wins whenever both are set, and the choice is made
+before parsing, so a stale SIGIL_ value cannot resurface when the preferred one
+fails validation. The two spellings are never merged: the selected value is
+used whole, including for TAGS and HEADERS.
 
-SIGIL_PROTOCOL is not supported (sigil-cl is HTTP-only); a warning is logged
-when set to anything other than http/https. SIGIL_INSECURE is a no-op since
-TLS is controlled by the URL scheme.
+AGENTO11Y_PROTOCOL is not supported (agento11y-cl is HTTP-only); a warning is
+logged when set to anything other than http/https. AGENTO11Y_INSECURE is a
+no-op since TLS is controlled by the URL scheme.
 
 Note: an explicit caller value that equals the slot's schema default is
 indistinguishable from \"unset\" and WILL be overridden by env. This applies to
@@ -157,36 +177,48 @@ indistinguishable from \"unset\" and WILL be overridden by env. This applies to
 :redact-secrets / :redact-input-messages. For the redaction flags the asymmetry
 fails safe: env can only turn redaction on when the caller did not ask for it.
 Callers that need to enforce these defaults against deployment env must either
-set the matching SIGIL_* var or unset it.
+set the matching variable or unset it.
 :eval-path-prefix and :ingest-actor do not have that problem: their slots hold
 NIL until a caller sets them, so an explicit value equal to the default still
 wins over env."
-  (let* ((endpoint  (env-trimmed env-fn "SIGIL_ENDPOINT"))
-         (eval-endpoint (env-trimmed env-fn "SIGIL_EVAL_ENDPOINT"))
-         (eval-path-prefix (env-trimmed env-fn "SIGIL_EVAL_PATH_PREFIX"))
-         (eval-auth-token (env-trimmed env-fn "SIGIL_EVAL_AUTH_TOKEN"))
-         (ingest-actor (env-trimmed env-fn "SIGIL_INGEST_ACTOR"))
-         (experiment-url-template (env-trimmed env-fn "SIGIL_EXPERIMENT_URL_TEMPLATE"))
-         (headers   (env-trimmed env-fn "SIGIL_HEADERS"))
-         (auth-mode (env-trimmed env-fn "SIGIL_AUTH_MODE"))
-         (tenant    (env-trimmed env-fn "SIGIL_AUTH_TENANT_ID"))
-         (token     (env-trimmed env-fn "SIGIL_AUTH_TOKEN"))
-         (agent     (env-trimmed env-fn "SIGIL_AGENT_NAME"))
-         (agent-ver (env-trimmed env-fn "SIGIL_AGENT_VERSION"))
-         (user      (env-trimmed env-fn "SIGIL_USER_ID"))
-         (tags      (env-trimmed env-fn "SIGIL_TAGS"))
-         (capture   (env-trimmed env-fn "SIGIL_CONTENT_CAPTURE_MODE"))
-         (redact-secrets (env-trimmed env-fn "SIGIL_REDACT_SECRETS"))
-         (redact-inputs  (env-trimmed env-fn "SIGIL_REDACT_INPUT_MESSAGES"))
-         (debug     (env-trimmed env-fn "SIGIL_DEBUG"))
-         (experimental (or (env-trimmed env-fn +experimental-features-env-var+)
-                           (env-trimmed env-fn "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES")))
-         (protocol  (env-trimmed env-fn "SIGIL_PROTOCOL")))
-    ;; Warn when SIGIL_PROTOCOL is set to something we don't support.
+  (let* ((endpoint  (env-branded env-fn "ENDPOINT"))
+         (eval-endpoint (env-branded env-fn "EVAL_ENDPOINT"))
+         (eval-path-prefix (env-branded env-fn "EVAL_PATH_PREFIX"))
+         (eval-auth-token (env-branded env-fn "EVAL_AUTH_TOKEN"))
+         (ingest-actor (env-branded env-fn "INGEST_ACTOR"))
+         (experiment-url-template (env-branded env-fn "EXPERIMENT_URL_TEMPLATE"))
+         (headers   (env-branded env-fn "HEADERS"))
+         (agent     (env-branded env-fn "AGENT_NAME"))
+         (agent-ver (env-branded env-fn "AGENT_VERSION"))
+         (user      (env-branded env-fn "USER_ID"))
+         (tags      (env-branded env-fn "TAGS"))
+         (debug     (env-branded env-fn "DEBUG"))
+         (experimental (env-branded env-fn +experimental-features-env-suffix+))
+         (tenant    (env-branded env-fn "AUTH_TENANT_ID"))
+         (token     (env-branded env-fn "AUTH_TOKEN"))
+         ;; These five keep the variable name next to the value, so a warning
+         ;; about an unsupported value names the spelling the caller set.
+         (auth-mode-pair (env-branded* env-fn "AUTH_MODE"))
+         (auth-mode (car auth-mode-pair))
+         (auth-mode-var (cdr auth-mode-pair))
+         (capture-pair (env-branded* env-fn "CONTENT_CAPTURE_MODE"))
+         (capture (car capture-pair))
+         (capture-var (cdr capture-pair))
+         (redact-secrets-pair (env-branded* env-fn "REDACT_SECRETS"))
+         (redact-secrets (car redact-secrets-pair))
+         (redact-secrets-var (cdr redact-secrets-pair))
+         (redact-inputs-pair (env-branded* env-fn "REDACT_INPUT_MESSAGES"))
+         (redact-inputs (car redact-inputs-pair))
+         (redact-inputs-var (cdr redact-inputs-pair))
+         (protocol-pair (env-branded* env-fn "PROTOCOL"))
+         (protocol (car protocol-pair))
+         (protocol-var (cdr protocol-pair)))
+    ;; Warn when the protocol var is set to something we don't support.
     (when (and protocol
                (not (member (string-downcase protocol) '("http" "https") :test #'string=)))
-      (sigil-log config :warn "env"
-                 (format nil "ignoring SIGIL_PROTOCOL=~a (sigil-cl is HTTP-only)" protocol)))
+      (agento11y-log config :warn "env"
+                 (format nil "ignoring ~a=~a (agento11y-cl is HTTP-only)"
+                         protocol-var protocol)))
     (let ((overrides nil))
       (flet ((override (k v) (push k overrides) (push v overrides)))
         ;; Endpoint.
@@ -210,7 +242,7 @@ wins over env."
           (override :experiment-url-template experiment-url-template))
         ;; Auth mode (caller :none is treated as "not set").
         (when (and auth-mode (eq (config-auth-mode config) :none))
-          (let ((parsed (%parse-auth-mode auth-mode config)))
+          (let ((parsed (%parse-auth-mode auth-mode config auth-mode-var)))
             (unless (eq parsed :invalid)
               (override :auth-mode parsed))))
         ;; Auth password.
@@ -221,7 +253,7 @@ wins over env."
           (override :tenant-id tenant))
         ;; Content capture mode (caller :metadata-only is treated as "not set").
         (when (and capture (eq (config-content-capture-mode config) :metadata-only))
-          (let ((parsed (parse-content-capture-mode capture config)))
+          (let ((parsed (parse-content-capture-mode capture config capture-var)))
             (unless (eq parsed :invalid)
               (override :content-capture-mode parsed))))
         ;; A caller mode outside the supported set falls back to :metadata-only.
@@ -229,18 +261,18 @@ wins over env."
         ;; mode to be :metadata-only, which is supported. Serialization redacts
         ;; an unsupported mode on its own; this warning is the diagnostic.
         (unless (valid-content-capture-mode-p (config-content-capture-mode config))
-          (sigil-log config :warn "config"
+          (agento11y-log config :warn "config"
                      (format nil "ignoring :content-capture-mode ~s (unsupported value), using :metadata-only"
                              (config-content-capture-mode config)))
           (override :content-capture-mode :metadata-only))
-        ;; Secret redaction master enable (sigil-cl extension).
+        ;; Secret redaction master enable (agento11y-cl extension).
         (when (and redact-secrets (null (config-redact-secrets config)))
-          (let ((parsed (parse-strict-bool redact-secrets config "SIGIL_REDACT_SECRETS")))
+          (let ((parsed (parse-strict-bool redact-secrets config redact-secrets-var)))
             (unless (eq parsed :invalid)
               (override :redact-secrets parsed))))
         ;; Input-message redaction gating. Name kept aligned with the Python SDK env var.
         (when (and redact-inputs (null (config-redact-input-messages config)))
-          (let ((parsed (parse-strict-bool redact-inputs config "SIGIL_REDACT_INPUT_MESSAGES")))
+          (let ((parsed (parse-strict-bool redact-inputs config redact-inputs-var)))
             (unless (eq parsed :invalid)
               (override :redact-input-messages parsed))))
         ;; Agent identity.
@@ -270,5 +302,5 @@ wins over env."
           (override :experimental-features (parse-bool experimental))))
       ;; Overrides come first so make-instance picks them over the copied slots
       ;; (CLOS uses the first occurrence of an initarg).
-      (apply #'make-instance 'sigil-config
+      (apply #'make-instance 'agento11y-config
              (append (nreverse overrides) (%copy-config-initargs config))))))

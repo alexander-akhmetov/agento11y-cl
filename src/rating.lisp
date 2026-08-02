@@ -1,14 +1,14 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 (defun submit-conversation-rating (client conversation-id rating
                                    &key rating-id feedback user-id)
-  "Submit a conversation rating to Sigil.
+  "Submit a conversation rating.
 RATING is :good or :bad. RATING-ID is required for idempotency.
 Synchronous (not queued)."
   (let* ((config (client-config client))
          (endpoint (config-generation-endpoint config)))
     (unless endpoint
-      (sigil-log config :warn "rating" "no generation endpoint configured")
+      (agento11y-log config :warn "rating" "no generation endpoint configured")
       (return-from submit-conversation-rating nil))
     (let* ((url (format nil "~a/api/v1/conversations/~a/ratings"
                         (string-right-trim "/" endpoint)
@@ -28,7 +28,7 @@ Synchronous (not queued)."
         (let ((capture (config-content-capture-mode config)))
           (if (capture-keeps-content-p capture)
               (setf (gethash "comment" payload) feedback)
-              (sigil-log config :warn "rating"
+              (agento11y-log config :warn "rating"
                         (format nil "content capture mode ~a withholds the rating comment"
                                 capture)))))
       (when user-id
@@ -37,6 +37,6 @@ Synchronous (not queued)."
           (post-with-retry config url (jzon:stringify payload)
                            auth-headers "rating" 1)
         (error (e)
-          (sigil-log config :warn "rating"
+          (agento11y-log config :warn "rating"
                     (format nil "failed to submit rating: ~a" (princ-to-string e)))
           nil)))))

@@ -1,6 +1,6 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
-(defclass sigil-config ()
+(defclass agento11y-config ()
   (;; Generation export
    (generation-endpoint :initarg :generation-endpoint :reader config-generation-endpoint :initform nil)
    (generation-enabled  :initarg :generation-enabled  :reader config-generation-enabled  :initform nil)
@@ -77,12 +77,12 @@
    (tags    :initarg :tags    :reader config-tags    :initform nil)
    ;; Extra HTTP headers merged into auth headers (case-insensitive de-dup; user wins)
    (extra-headers :initarg :extra-headers :reader config-extra-headers :initform nil)
-   ;; Debug flag (surfaced via SIGIL_DEBUG env var)
+   ;; Debug flag (surfaced via AGENTO11Y_DEBUG env var)
    (debug :initarg :debug :reader config-debug :initform nil)
    ;; Opt-in switch for features that are not stable yet. A slot rather than a
    ;; process-env read per call, so a caller and a test can both flip it without
    ;; touching the environment. Env resolution fills it from
-   ;; SIGIL_ENABLE_EXPERIMENTAL_FEATURES.
+   ;; AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES.
    (experimental-features :initarg :experimental-features
                           :reader config-experimental-features :initform nil)
    ;; Callbacks
@@ -173,13 +173,18 @@ NIL path or actor."
 (%define-defaulted-reader config-embedding-max-text-length embedding-max-text-length
                           +default-embedding-max-text-length+)
 
-(defparameter +experimental-features-env-var+ "SIGIL_ENABLE_EXPERIMENTAL_FEATURES")
+;; Suffix, not a full name: RESOLVE-CONFIG-FROM-ENV reads it under both the
+;; preferred AGENTO11Y_ prefix and the legacy SIGIL_ one.
+(defparameter +experimental-features-env-suffix+ "ENABLE_EXPERIMENTAL_FEATURES")
+(defparameter +experimental-features-env-var+
+  (concatenate 'string "AGENTO11Y_" +experimental-features-env-suffix+)
+  "Name quoted back to callers when an experimental call is blocked.")
 
 (defun %require-experimental (config feature)
   "Signal unless the experimental gate is set. FEATURE names the blocked call.
 An experimental feature can change or be removed in any release."
   (unless (config-experimental-features config)
-    (error 'sigil-experimental-disabled-error
+    (error 'agento11y-experimental-disabled-error
            :message (format nil "~a is experimental; set ~a=true to use it"
                             feature +experimental-features-env-var+))))
 
@@ -188,4 +193,4 @@ An experimental feature can change or be removed in any release."
   (or (config-trace-queue-max config) (config-queue-max config)))
 
 (defun make-config (&rest args)
-  (apply #'make-instance 'sigil-config args))
+  (apply #'make-instance 'agento11y-config args))

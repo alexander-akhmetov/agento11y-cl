@@ -1,8 +1,8 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; --- Client ---
 
-(defclass sigil-client ()
+(defclass agento11y-client ()
   ((config           :initarg :config           :accessor client-config)
    (generation-queue :initarg :generation-queue :accessor client-generation-queue)
    (trace-queue      :initarg :trace-queue      :accessor client-trace-queue)
@@ -10,19 +10,19 @@
    (metric-registry  :initarg :metric-registry  :accessor client-metric-registry)
    (worker-thread    :initform nil              :accessor client-worker-thread)
    (running-p        :initform nil              :accessor client-running-p)
-   (lock             :initform (bt2:make-lock :name "sigil-client")
+   (lock             :initform (bt2:make-lock :name "agento11y-client")
                      :accessor client-lock)
-   (wake-cv          :initform (bt2:make-condition-variable :name "sigil-wake")
+   (wake-cv          :initform (bt2:make-condition-variable :name "agento11y-wake")
                      :accessor client-wake-cv)))
 
 (defun make-client (config &key (env-fn #'uiop:getenv))
-  "Create a Sigil client from CONFIG.
-Layers SIGIL_* env vars on top of the supplied config (caller > env > defaults)
+  "Create an Agent Observability client from CONFIG.
+Layers AGENTO11Y_* env vars on top of the supplied config (caller > env > defaults)
 so deployments can configure the SDK without code changes. ENV-FN is the
 function used to read environment variables; defaults to uiop:getenv. Tests
 can pass (constantly nil) to ignore the host environment."
   (let ((resolved (resolve-config-from-env config :env-fn env-fn)))
-    (make-instance 'sigil-client
+    (make-instance 'agento11y-client
       :config resolved
       :generation-queue (make-bounded-queue :max-size (config-queue-max resolved)
                                             :name "generation")
@@ -71,7 +71,7 @@ series on each recorder end."
                        (bt2:condition-wait (client-wake-cv client) (client-lock client)
                                            :timeout (config-flush-interval-sec config)))))
                (error (e)
-                 (sigil-log config :warn "flush-loop"
+                 (agento11y-log config :warn "flush-loop"
                            (format nil "error: ~a" (princ-to-string e)))
                  (sleep 1))))))
 
@@ -90,8 +90,8 @@ series on each recorder end."
         (setf (client-running-p client) t)
         (setf (client-worker-thread client)
               (bt2:make-thread (lambda () (run-flush-loop client))
-                               :name "sigil-flush"))
-        (sigil-log config :info "client" "started"))))
+                               :name "agento11y-flush"))
+        (agento11y-log config :info "client" "started"))))
   client)
 
 (defun client-shutdown (client &key (timeout-sec 5))
@@ -101,7 +101,7 @@ series on each recorder end."
                          (setf (client-running-p client) nil)))))
     (when was-running
       (let ((config (client-config client)))
-        (sigil-log config :info "client" "shutting down")
+        (agento11y-log config :info "client" "shutting down")
         ;; Synchronous flush
         (client-flush client)
         ;; Wake the loop so it sees running-p=nil and exits
@@ -118,10 +118,10 @@ series on each recorder end."
               (when (bt2:thread-alive-p thread)
                 (handler-case (bt2:destroy-thread thread)
                   (error (e)
-                    (sigil-log config :warn "client"
+                    (agento11y-log config :warn "client"
                               (format nil "failed to stop worker: ~a" (princ-to-string e)))))))))
         (setf (client-worker-thread client) nil)
-        (sigil-log config :info "client" "stopped"))))
+        (agento11y-log config :info "client" "stopped"))))
   t)
 
 (defun client-flush (client)
@@ -134,7 +134,7 @@ series on each recorder end."
             do (handler-case
                    (export-generations config batch (build-auth-headers config))
                  (error (e)
-                   (sigil-log config :warn "flush"
+                   (agento11y-log config :warn "flush"
                              (format nil "generation batch export failed: ~a"
                                      (princ-to-string e)))))))
     (when (config-traces-enabled config)
@@ -143,7 +143,7 @@ series on each recorder end."
           (handler-case
               (export-traces config spans (build-traces-auth-headers config))
             (error (e)
-              (sigil-log config :warn "flush"
+              (agento11y-log config :warn "flush"
                         (format nil "trace export failed: ~a"
                                 (princ-to-string e))))))))
     (when (config-workflow-steps-enabled config)
@@ -153,7 +153,7 @@ series on each recorder end."
             do (handler-case
                    (export-workflow-steps config batch (build-auth-headers config))
                  (error (e)
-                   (sigil-log config :warn "flush"
+                   (agento11y-log config :warn "flush"
                              (format nil "workflow-step batch export failed: ~a"
                                      (princ-to-string e)))))))
     (when (config-metrics-enabled config)
@@ -161,7 +161,7 @@ series on each recorder end."
           (export-metrics config (client-metric-registry client)
                           (build-metrics-auth-headers config))
         (error (e)
-          (sigil-log config :warn "flush"
+          (agento11y-log config :warn "flush"
                     (format nil "metrics export failed: ~a"
                             (princ-to-string e)))))))
   nil)

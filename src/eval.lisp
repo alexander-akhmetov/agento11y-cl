@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; Experiment wire protocol.
 ;;;
@@ -36,7 +36,7 @@
 ;;;      spelling. Both SDKs were touched within a day of each other, so this
 ;;;      is a live fork, not one lagging the other. This SDK follows Python
 ;;;      (see +INGEST-ACTOR-HEADER+). A wrong choice surfaces as HTTP 401
-;;;      naming actor ownership on trial create, which SIGIL-ACTOR-MISMATCH-
+;;;      naming actor ownership on trial create, which AGENTO11Y-ACTOR-MISMATCH-
 ;;;      ERROR reports by name.
 ;;;   2. Whether the /eval/experiments write routes still answer. If they do,
 ;;;      the plane was superseded rather than removed and callers pinned to it
@@ -95,26 +95,26 @@
   (let* ((trimmed (%trimmed-text endpoint))
          (scheme-pos (search "://" trimmed)))
     (unless scheme-pos
-      (error 'sigil-config-error
+      (error 'agento11y-config-error
              :message (format nil "eval endpoint must include a URL scheme: ~a" trimmed)))
     (let* ((scheme (subseq trimmed 0 scheme-pos))
            (rest (subseq trimmed (+ scheme-pos 3)))
            (slash-pos (position #\/ rest))
            (host (if slash-pos (subseq rest 0 slash-pos) rest)))
       (when (or (zerop (length scheme)) (zerop (length host)))
-        (error 'sigil-config-error
+        (error 'agento11y-config-error
                :message (format nil "eval endpoint host is required: ~a" trimmed)))
       (format nil "~a://~a" scheme host))))
 
 (defun eval-base-url (config)
-  "Return the scheme and host used for Sigil eval API requests."
+  "Return the scheme and host used for eval API requests."
   (cond
     ((config-eval-endpoint config)
      (%base-url-from-endpoint (config-eval-endpoint config)))
     ((config-generation-endpoint config)
      (%base-url-from-endpoint (config-generation-endpoint config)))
     (t
-     (error 'sigil-config-error
+     (error 'agento11y-config-error
             :message "eval endpoint is required when generation endpoint is unset"))))
 
 (defun %url-encode (value)
@@ -147,7 +147,7 @@
 (defun %experiment-api-url (config run-id)
   "URL of one experiment on the read plane."
   (when (%blank-string-p run-id)
-    (error 'sigil-validation-error :message "experiment run_id is required"))
+    (error 'agento11y-validation-error :message "experiment run_id is required"))
   (format nil "~a/~a" (%experiments-url config) (%url-encode run-id)))
 
 (defun %experiment-runs-upsert-url (config)
@@ -159,7 +159,7 @@
   "URL of one experiment run on the write plane, plus an optional SUFFIX
 such as \":finalize\" or \"/trials\"."
   (when (%blank-string-p experiment-id)
-    (error 'sigil-validation-error :message "experiment experiment_id is required"))
+    (error 'agento11y-validation-error :message "experiment experiment_id is required"))
   (format nil "~a~a/~a~a"
           (%strip-trailing-slash (eval-base-url config))
           +experiment-runs-prefix+
@@ -248,7 +248,7 @@ so the three list shapes callers pass stay distinguishable."
   (multiple-value-bind (value found-p) (%field object string-key keyword-key)
     (let ((text (%trimmed-text value)))
       (unless (and found-p (plusp (length text)))
-        (error 'sigil-validation-error
+        (error 'agento11y-validation-error
                :message (format nil "score validation failed: missing ~a" label)))
       text)))
 
@@ -261,7 +261,7 @@ so the three list shapes callers pass stay distinguishable."
 (defun %serialize-score-value (value &optional (supplied-p t))
   (cond
     ((not supplied-p)
-     (error 'sigil-validation-error
+     (error 'agento11y-validation-error
             :message "score validation failed: value is required"))
     ((%score-value-object-p value) value)
     ((and (numberp value) (not (typep value 'boolean)))
@@ -271,7 +271,7 @@ so the three list shapes callers pass stay distinguishable."
     ((stringp value)
      (jobj "string" value))
     (t
-     (error 'sigil-validation-error
+     (error 'agento11y-validation-error
             :message "score validation failed: value must be number, boolean, or string"))))
 
 (defun %maybe-set-field (target key object string-key keyword-key)
@@ -313,7 +313,7 @@ client-side alias kept because callers and the run object still speak it."
     ;; that rule here so the error names the missing anchor instead of arriving
     ;; as an opaque 400.
     (unless (or generation-id trial-id)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "score validation failed: generation_id or trial_id is required"))
     (multiple-value-bind (value value-found-p) (%field item "value" :value)
       (let ((out (jobj "score_id" score-id
@@ -358,7 +358,7 @@ client-side alias kept because callers and the run object still speak it."
                 ((stringp body) (%trim body))
                 (t (%trim (princ-to-string body))))))
     (when (> (length text) +max-eval-response-bytes+)
-      (error 'sigil-export-error
+      (error 'agento11y-export-error
              :status-code status
              :message (format nil "~a response too large" label)))
     (if (zerop (length text))
@@ -366,7 +366,7 @@ client-side alias kept because callers and the run object still speak it."
         (handler-case
             (jzon:parse text)
           (error (e)
-            (error 'sigil-export-error
+            (error 'agento11y-export-error
                    :status-code status
                    :message (format nil "~a returned invalid JSON: ~a"
                                     label (princ-to-string e))))))))
@@ -424,19 +424,19 @@ Ports classify_conflict from agento11y python/agento11y/errors.py:71-97."
          (message (format nil "~a: ~a" label detail)))
     (cond
       ((member status '(400 422))
-       (error 'sigil-validation-error :message message))
+       (error 'agento11y-validation-error :message message))
       ;; Not retried: a run claimed by another ingest actor stays claimed, so
       ;; every retry returns the same 401 and only spends the budget.
       ((and (= status 401) (%actor-mismatch-p detail))
-       (error 'sigil-actor-mismatch-error
+       (error 'agento11y-actor-mismatch-error
               :message (format nil "~a: experiment is owned by another ingest actor: ~a"
                                label detail)))
       ((= status 404)
-       (error 'sigil-not-found-error :message message))
+       (error 'agento11y-not-found-error :message message))
       ((= status 409)
-       (error 'sigil-conflict-error :kind (classify-conflict detail) :message message))
+       (error 'agento11y-conflict-error :kind (classify-conflict detail) :message message))
       (t
-       (error 'sigil-export-error :status-code status :message message)))))
+       (error 'agento11y-export-error :status-code status :message message)))))
 
 (defun %do-http-request (config method url headers body)
   (let ((http-fn (config-http-fn config)))
@@ -463,7 +463,7 @@ scores are claimed by the same identity."
   "Auth headers for eval control-plane requests (experiment lifecycle,
 reports, conversations). When :eval-auth-token is set it replaces the
 generation auth headers with a single bearer Authorization header (matching
-SIGIL_EVAL_AUTH_TOKEN in the reference SDKs); otherwise the generation
+AGENTO11Y_EVAL_AUTH_TOKEN in the reference SDKs); otherwise the generation
 export auth headers are reused. Score export deliberately does not use
 this: it is a tenant ingest write that goes out with generation auth."
   (let ((token (%trimmed-text (config-eval-auth-token config))))
@@ -521,14 +521,14 @@ own supplied-p through, which is why this takes it as a plain argument."
                                                (config-initial-backoff-sec config)
                                                (config-max-backoff-sec config)))
                        (%signal-status-error status resp-body label))))
-               (sigil-error (e)
+               (agento11y-error (e)
                  (error e))
                (error (e)
                  (if (< attempt (1- attempts))
                      (sleep (backoff-seconds attempt
                                              (config-initial-backoff-sec config)
                                              (config-max-backoff-sec config)))
-                     (error 'sigil-export-error
+                     (error 'agento11y-export-error
                             :message (format nil "~a request failed: ~a"
                                              label (princ-to-string e)))))))))
 
@@ -565,9 +565,9 @@ this SDK's callers speak `run_id` while the wire key is `experiment_id`.
 unknown fields. Callers that group by collection carry it in tags and
 metadata instead."
   (when (%blank-string-p name)
-    (error 'sigil-validation-error :message "experiment name is required"))
+    (error 'agento11y-validation-error :message "experiment name is required"))
   (when (and planned-trial-count (minusp planned-trial-count))
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "experiment validation failed: planned_trial_count must be non-negative"))
   (let* ((config (client-config client))
          (id (or (unless (%blank-string-p experiment-id) (%trimmed-text experiment-id))
@@ -602,7 +602,7 @@ accepted as a caller-facing alias."
       ((member normalized '("succeeded" "completed") :test #'string=) "completed")
       ((string= normalized "failed") "failed")
       (t
-       (error 'sigil-validation-error
+       (error 'agento11y-validation-error
               :message (format nil "experiment validation failed: status must be completed or failed, got ~s"
                                normalized))))))
 
@@ -654,7 +654,7 @@ only a fallback when no generation endpoint is configured."
       (eval-base-url config)))
 
 (defun export-scores (client score-items)
-  "Export SCORE-ITEMS to the Sigil scores ingest API. Returns accepted count."
+  "Export SCORE-ITEMS to the scores ingest API. Returns accepted count."
   (when (null score-items)
     (return-from export-scores 0))
   (let* ((config (client-config client))
@@ -677,7 +677,7 @@ only a fallback when no generation endpoint is configured."
                                  (jget result "error"))
                          rejected))))
     (when rejected
-      (error 'sigil-export-error
+      (error 'agento11y-export-error
              :status-code 202
              :message (format nil "score export rejected: ~{~a~^, ~}"
                               (nreverse rejected))))
@@ -702,5 +702,5 @@ only a fallback when no generation endpoint is configured."
          (template (config-experiment-url-template config)))
     (if (and template (plusp (length (%trimmed-text template))))
         (%replace-all (%replace-all template "{run_id}" normalized) "{base}" base)
-        (format nil "~a/a/grafana-sigil-app/evaluation/experiments/~a"
+        (format nil "~a/a/grafana-agento11y-app/evaluation/experiments/~a"
                 base (%url-encode normalized)))))

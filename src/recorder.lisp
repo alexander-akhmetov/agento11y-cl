@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 (defconstant +tool-attr-max-length+ 2000)
 
@@ -46,7 +46,7 @@ Each with-generation call binds this per-thread via LET.")
               (handler-case
                   (record-builtin-metrics rec (client-metric-registry client) config)
                 (error (e)
-                  (sigil-log config :warn "metrics"
+                  (agento11y-log config :warn "metrics"
                             (format nil "builtin metric record failed: ~a"
                                     (princ-to-string e)))))))
           ;; Metrics callback
@@ -55,11 +55,11 @@ Each with-generation call binds this per-thread via LET.")
               (handler-case
                   (funcall metrics-fn (recorder-type-key rec) rec)
                 (error (e)
-                  (sigil-log (client-config client) :warn "recorder"
+                  (agento11y-log (client-config client) :warn "recorder"
                             (format nil "metrics callback failed: ~a" (princ-to-string e))))))))
       (error (e)
         (handler-case
-            (sigil-log (client-config client) :warn "recorder"
+            (agento11y-log (client-config client) :warn "recorder"
                       (format nil "~a end failed: ~a" (type-of rec) (princ-to-string e)))
           (error () nil))))))
 
@@ -319,11 +319,11 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
          (stop (or (gen-rec-stop-reason rec)
                    (if (recorder-call-error rec) "error" "end_turn")))
          ;; Build metadata: SDK fields + caller metadata merged
-         (meta (jobj "sigil.sdk.name" +sdk-name+))
+         (meta (jobj "agento11y.sdk.name" +sdk-name+))
          (_ (progn
               (let ((uid (or (gen-rec-user-id rec) (config-user-id config))))
                 (when uid
-                  (setf (gethash "sigil.user.id" meta) (princ-to-string uid))))
+                  (setf (gethash "agento11y.user.id" meta) (princ-to-string uid))))
               ;; Merge caller-supplied metadata
               (let ((user-meta (gen-rec-metadata rec)))
                 (when (and user-meta (hash-table-p user-meta))
@@ -335,7 +335,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
               ;; Store conversation title in metadata (not as top-level proto
               ;; field). The title is caller content, so a redacting mode drops it.
               (when (and capture-content (gen-rec-conversation-title rec))
-                (setf (gethash "sigil.conversation.title" meta)
+                (setf (gethash "agento11y.conversation.title" meta)
                       (if redactor
                           (apply-secret-redaction redactor :full
                                                   (gen-rec-conversation-title rec))
@@ -442,7 +442,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
     (when gen-payload
       (let ((gen-id (jget gen-payload "id")))
         (when (and gen-id (plusp (length gen-id)))
-          (push (otel-string-attr "sigil.generation.id" gen-id) attrs)))
+          (push (otel-string-attr "agento11y.generation.id" gen-id) attrs)))
       (setf (gethash "trace_id" gen-payload) trace-id)
       (setf (gethash "span_id" gen-payload) span-id))
     ;; Response metadata
@@ -482,10 +482,10 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
       (push (otel-string-attr "gen_ai.request.top_p"
                                (princ-to-string (gen-rec-top-p rec))) attrs))
     (when (gen-rec-tool-choice rec)
-      (push (otel-string-attr "sigil.gen_ai.request.tool_choice"
+      (push (otel-string-attr "agento11y.gen_ai.request.tool_choice"
                                (gen-rec-tool-choice rec)) attrs))
     (unless (eq (gen-rec-thinking-enabled rec) :unset)
-      (push (otel-bool-attr "sigil.gen_ai.request.thinking.enabled"
+      (push (otel-bool-attr "agento11y.gen_ai.request.thinking.enabled"
                              (gen-rec-thinking-enabled rec)) attrs))
     ;; Error attributes
     (when (recorder-call-error rec)
@@ -752,7 +752,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
               (push (otel-string-array-attr "gen_ai.embeddings.input_texts" texts) attrs))))
         (let ((src (emb-rec-source rec)))
           (when (and src (stringp src) (plusp (length src)))
-            (push (otel-string-attr "sigil.embeddings.source" src) attrs)))
+            (push (otel-string-attr "agento11y.embeddings.source" src) attrs)))
         (when (recorder-call-error rec)
           (push (otel-string-attr "error.type" "provider_call_error") attrs)
           (let ((category (classify-error (recorder-call-error rec))))
@@ -879,17 +879,17 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                   :agent-version (wfs-rec-agent-version rec)
                   :conversation-id (wfs-rec-conversation-id rec))))
     (push (otel-string-attr "gen_ai.operation.name" "workflow_step") attrs)
-    (push (otel-string-attr "sigil.workflow.step.id" (or (wfs-rec-step-id rec) "")) attrs)
-    (push (otel-string-attr "sigil.workflow.step.name" step-name) attrs)
+    (push (otel-string-attr "agento11y.workflow.step.id" (or (wfs-rec-step-id rec) "")) attrs)
+    (push (otel-string-attr "agento11y.workflow.step.name" step-name) attrs)
     (let ((fw (wfs-rec-framework rec)))
       (when (and fw (stringp fw) (plusp (length fw)))
-        (push (otel-string-attr "sigil.workflow.framework" fw) attrs)))
+        (push (otel-string-attr "agento11y.workflow.framework" fw) attrs)))
     (let ((parents (wfs-rec-parent-step-ids rec)))
       (when parents
-        (push (otel-string-array-attr "sigil.workflow.parent_step_ids" parents) attrs)))
+        (push (otel-string-array-attr "agento11y.workflow.parent_step_ids" parents) attrs)))
     (let ((linked (wfs-rec-linked-generation-ids rec)))
       (when linked
-        (push (otel-string-array-attr "sigil.workflow.linked_generation_ids" linked) attrs)))
+        (push (otel-string-array-attr "agento11y.workflow.linked_generation_ids" linked) attrs)))
     (when err
       (push (otel-string-attr "error.type" "workflow_step_error") attrs))
     (let* ((start-nano (iso8601-to-unix-nano (recorder-started-at rec)))

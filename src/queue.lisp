@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; --- Bounded queue ---
 
@@ -6,7 +6,7 @@
   ((items    :initform nil   :accessor queue-items)
    (count    :initform 0     :accessor queue-count :type fixnum)
    (max-size :initarg :max-size :accessor queue-max-size :initform 500)
-   (lock     :initform (bt2:make-lock :name "sigil-queue") :accessor queue-lock)
+   (lock     :initform (bt2:make-lock :name "agento11y-queue") :accessor queue-lock)
    (name     :initarg :name :accessor queue-name :initform "queue")))
 
 (defun make-bounded-queue (&key (max-size 500) (name "queue"))

@@ -1,4 +1,4 @@
-(in-package :sigil-cl/t)
+(in-package :agento11y-cl/t)
 
 (defmacro with-test-suite ((name) &body body)
   "Run test cases within a named suite. Provides local CHECK function.

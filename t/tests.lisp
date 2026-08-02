@@ -1,4 +1,4 @@
-(in-package :sigil-cl/t)
+(in-package :agento11y-cl/t)
 
 ;;; --- Helper: make a test client with captured requests ---
 
@@ -12,17 +12,17 @@
                                (redact-secrets nil)
                                (redact-input-messages nil)
                                (redact-email-addresses t)
-                               (generation-endpoint "http://test-sigil:4318/api/v1/generations:export")
+                               (generation-endpoint "http://test-agento11y:4318/api/v1/generations:export")
                                eval-endpoint
                                (eval-path-prefix "/api/v1")
                                (scores-export-path "/api/v1/scores:export")
                                eval-auth-token
                                (ingest-actor "ingest:sdk/lisp")
                                experiment-url-template
-                               (traces-endpoint "http://test-sigil:4318/v1/traces")
+                               (traces-endpoint "http://test-agento11y:4318/v1/traces")
                                (workflow-steps-endpoint
-                                "http://test-sigil:4318/api/v1/workflow-steps:export")
-                               (metrics-endpoint "http://test-sigil:4318/v1/metrics")
+                                "http://test-agento11y:4318/api/v1/workflow-steps:export")
+                               (metrics-endpoint "http://test-agento11y:4318/v1/metrics")
                                (auth-mode :bearer)
                                (auth-password "test-token")
                                (max-retries 5)
@@ -77,7 +77,7 @@
 (defun signals-condition-p (thunk expected-type)
   (handler-case
       (progn (funcall thunk) nil)
-    (sigil-error (e) (typep e expected-type))))
+    (agento11y-error (e) (typep e expected-type))))
 
 (defun payload (call)
   (jzon:parse (third call)))
@@ -152,16 +152,16 @@ experiment-runs branch, whose prefix they share."
 (defun run-util-tests ()
   (with-test-suite ("Util")
     ;; ID generation
-    (let ((id1 (sigil-cl::generate-id))
-          (id2 (sigil-cl::generate-id)))
+    (let ((id1 (agento11y-cl::generate-id))
+          (id2 (agento11y-cl::generate-id)))
       (check "generate-id starts with gen_"
              (and (stringp id1) (eql 0 (search "gen_" id1))))
       (check "generate-id unique" (not (equal id1 id2))))
 
     ;; Trace/span IDs
-    (let ((tid (sigil-cl::generate-trace-id)))
+    (let ((tid (agento11y-cl::generate-trace-id)))
       (check "trace-id is 32 hex chars" (and (stringp tid) (= (length tid) 32))))
-    (let ((sid (sigil-cl::generate-span-id)))
+    (let ((sid (agento11y-cl::generate-span-id)))
       (check "span-id is 16 hex chars" (and (stringp sid) (= (length sid) 16))))
 
     ;; ISO 8601
@@ -188,40 +188,40 @@ experiment-runs branch, whose prefix they share."
 
     ;; unix-nano-plus-seconds
     (check "unix-nano-plus-seconds"
-           (equal (sigil-cl::unix-nano-plus-seconds "1000000000000" 1.0d0)
+           (equal (agento11y-cl::unix-nano-plus-seconds "1000000000000" 1.0d0)
                   "1001000000000"))
     (check "unix-nano-plus-seconds nil duration"
-           (equal (sigil-cl::unix-nano-plus-seconds "1000000000000" nil)
+           (equal (agento11y-cl::unix-nano-plus-seconds "1000000000000" nil)
                   "1000000000000"))
 
     ;; backoff
-    (check "backoff attempt 0" (= (sigil-cl::backoff-seconds 0 0.1 5.0) 0.1))
-    (check "backoff attempt 3" (= (sigil-cl::backoff-seconds 3 0.1 5.0) 0.8))
-    (check "backoff capped" (= (sigil-cl::backoff-seconds 10 0.1 5.0) 5.0))
+    (check "backoff attempt 0" (= (agento11y-cl::backoff-seconds 0 0.1 5.0) 0.1))
+    (check "backoff attempt 3" (= (agento11y-cl::backoff-seconds 3 0.1 5.0) 0.8))
+    (check "backoff capped" (= (agento11y-cl::backoff-seconds 10 0.1 5.0) 5.0))
 
     ;; UTF-8 encoding
     (check "utf8 ascii"
-           (equalp (sigil-cl::string-to-utf8-octets "abc") #(97 98 99)))
+           (equalp (agento11y-cl::string-to-utf8-octets "abc") #(97 98 99)))
     (check "utf8 two-byte codepoint"
-           (equalp (sigil-cl::string-to-utf8-octets "é") #(195 169)))
+           (equalp (agento11y-cl::string-to-utf8-octets "é") #(195 169)))
     (check "utf8 three-byte codepoint"
-           (equalp (sigil-cl::string-to-utf8-octets "€") #(226 130 172)))
+           (equalp (agento11y-cl::string-to-utf8-octets "€") #(226 130 172)))
 
     ;; SHA-1 (FIPS 180 test vectors)
     (check "sha1 empty"
-           (equal (sigil-cl::sha1-hex (sigil-cl::string-to-utf8-octets ""))
+           (equal (agento11y-cl::sha1-hex (agento11y-cl::string-to-utf8-octets ""))
                   "da39a3ee5e6b4b0d3255bfef95601890afd80709"))
     (check "sha1 abc"
-           (equal (sigil-cl::sha1-hex (sigil-cl::string-to-utf8-octets "abc"))
+           (equal (agento11y-cl::sha1-hex (agento11y-cl::string-to-utf8-octets "abc"))
                   "a9993e364706816aba3e25717850c26c9cd0d89d"))
     (check "sha1 two-block message"
-           (equal (sigil-cl::sha1-hex
-                   (sigil-cl::string-to-utf8-octets
+           (equal (agento11y-cl::sha1-hex
+                   (agento11y-cl::string-to-utf8-octets
                     "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
                   "84983e441c3bd26ebaae4aa1f95129e5e54670f1"))
     (check "sha1 multi-block input"
-           (equal (sigil-cl::sha1-hex
-                   (sigil-cl::string-to-utf8-octets
+           (equal (agento11y-cl::sha1-hex
+                   (agento11y-cl::string-to-utf8-octets
                     (make-string 200 :initial-element #\a)))
                   "e61cfffe0d9195a525fc6cf06ca2d77119c24a40"))))
 
@@ -244,19 +244,19 @@ experiment-runs branch, whose prefix they share."
 (defun run-auth-tests ()
   (with-test-suite ("Auth")
     ;; None
-    (let ((headers (sigil-cl::build-auth-headers
+    (let ((headers (agento11y-cl::build-auth-headers
                     (make-config :auth-mode :none))))
       (check "auth none: no headers" (null headers)))
 
     ;; Bearer
-    (let ((headers (sigil-cl::build-auth-headers
+    (let ((headers (agento11y-cl::build-auth-headers
                     (make-config :auth-mode :bearer :auth-password "tok123"))))
       (check "auth bearer: has Authorization"
              (equal (cdr (assoc "Authorization" headers :test #'equal))
                     "Bearer tok123")))
 
     ;; Basic with explicit user
-    (let ((headers (sigil-cl::build-auth-headers
+    (let ((headers (agento11y-cl::build-auth-headers
                     (make-config :auth-mode :basic
                                  :auth-user "user" :auth-password "pass"
                                  :tenant-id "t1"))))
@@ -266,7 +266,7 @@ experiment-runs branch, whose prefix they share."
              (equal (cdr (assoc "X-Scope-OrgID" headers :test #'equal)) "t1")))
 
     ;; Basic with tenant-id fallback (Grafana Cloud pattern)
-    (let ((headers (sigil-cl::build-auth-headers
+    (let ((headers (agento11y-cl::build-auth-headers
                     (make-config :auth-mode :basic
                                  :auth-password "glc_key123"
                                  :tenant-id "12345"))))
@@ -279,7 +279,7 @@ experiment-runs branch, whose prefix they share."
              (equal (cdr (assoc "X-Scope-OrgID" headers :test #'equal)) "12345")))
 
     ;; Tenant
-    (let ((headers (sigil-cl::build-auth-headers
+    (let ((headers (agento11y-cl::build-auth-headers
                     (make-config :auth-mode :tenant :tenant-id "org42"))))
       (check "auth tenant: has X-Scope-OrgID"
              (equal (cdr (assoc "X-Scope-OrgID" headers :test #'equal)) "org42"))
@@ -292,19 +292,19 @@ experiment-runs branch, whose prefix they share."
                              :auth-mode :bearer :auth-password "tok"
                              :traces-forward-auth t)))
       (check "traces auth: forward-auth=t -> headers"
-             (not (null (sigil-cl::build-traces-auth-headers cfg)))))
+             (not (null (agento11y-cl::build-traces-auth-headers cfg)))))
     (let ((cfg (make-config :generation-endpoint "http://a:4318/api/v1/generations:export"
                              :traces-endpoint "http://b:4318/v1/traces"
                              :auth-mode :bearer :auth-password "tok"
                              :traces-forward-auth nil)))
       (check "traces auth: forward-auth=nil -> nil"
-             (null (sigil-cl::build-traces-auth-headers cfg))))
+             (null (agento11y-cl::build-traces-auth-headers cfg))))
 
     ;; Extra headers merge: appended to auth-derived headers
     (let* ((cfg (make-config :auth-mode :bearer :auth-password "tok"
                              :extra-headers '(("X-Custom" . "hello")
                                               ("X-Trace" . "abc"))))
-           (headers (sigil-cl::build-auth-headers cfg)))
+           (headers (agento11y-cl::build-auth-headers cfg)))
       (check "extra-headers: keeps Authorization"
              (equal (cdr (assoc "Authorization" headers :test #'equal))
                     "Bearer tok"))
@@ -316,7 +316,7 @@ experiment-runs branch, whose prefix they share."
     ;; Extra headers wins on case-insensitive Authorization collision
     (let* ((cfg (make-config :auth-mode :bearer :auth-password "tok"
                              :extra-headers '(("authorization" . "Bearer override"))))
-           (headers (sigil-cl::build-auth-headers cfg))
+           (headers (agento11y-cl::build-auth-headers cfg))
            (auth-vals (mapcar #'cdr
                               (remove-if-not (lambda (kv)
                                                (string-equal (car kv) "authorization"))
@@ -330,7 +330,7 @@ experiment-runs branch, whose prefix they share."
                              :extra-headers '(("Authorization" . "first")
                                               ("authorization" . "second")
                                               ("X-Custom" . "keep"))))
-           (headers (sigil-cl::build-auth-headers cfg))
+           (headers (agento11y-cl::build-auth-headers cfg))
            (auth-vals (mapcar #'cdr
                               (remove-if-not (lambda (kv)
                                                (string-equal (car kv) "authorization"))
@@ -348,68 +348,68 @@ experiment-runs branch, whose prefix they share."
                (lambda (name)
                  (cdr (assoc name alist :test #'string=))))
              (resolve (env-alist &rest config-args)
-               (sigil-cl::resolve-config-from-env
+               (agento11y-cl::resolve-config-from-env
                 (apply #'make-config config-args)
                 :env-fn (env-from-alist env-alist))))
       ;; --- env-trimmed ---
       (let ((env (env-from-alist '(("A" . "  hi  ") ("B" . "")))))
         (check "env-trimmed strips whitespace"
-               (equal (sigil-cl::env-trimmed env "A") "hi"))
+               (equal (agento11y-cl::env-trimmed env "A") "hi"))
         (check "env-trimmed nil for empty"
-               (null (sigil-cl::env-trimmed env "B")))
+               (null (agento11y-cl::env-trimmed env "B")))
         (check "env-trimmed nil for missing"
-               (null (sigil-cl::env-trimmed env "C"))))
+               (null (agento11y-cl::env-trimmed env "C"))))
 
       ;; --- parse-bool ---
-      (check "parse-bool 1"   (sigil-cl::parse-bool "1"))
-      (check "parse-bool true"   (sigil-cl::parse-bool "TRUE"))
-      (check "parse-bool yes"  (sigil-cl::parse-bool "yes"))
-      (check "parse-bool on"   (sigil-cl::parse-bool "on"))
-      (check "parse-bool no"   (null (sigil-cl::parse-bool "no")))
-      (check "parse-bool empty"(null (sigil-cl::parse-bool "")))
-      (check "parse-bool nil"  (null (sigil-cl::parse-bool nil)))
+      (check "parse-bool 1"   (agento11y-cl::parse-bool "1"))
+      (check "parse-bool true"   (agento11y-cl::parse-bool "TRUE"))
+      (check "parse-bool yes"  (agento11y-cl::parse-bool "yes"))
+      (check "parse-bool on"   (agento11y-cl::parse-bool "on"))
+      (check "parse-bool no"   (null (agento11y-cl::parse-bool "no")))
+      (check "parse-bool empty"(null (agento11y-cl::parse-bool "")))
+      (check "parse-bool nil"  (null (agento11y-cl::parse-bool nil)))
 
       ;; --- parse-csv-kv ---
-      (let ((kvs (sigil-cl::parse-csv-kv "k=v,k2=v2")))
+      (let ((kvs (agento11y-cl::parse-csv-kv "k=v,k2=v2")))
         (check "parse-csv-kv simple count" (= (length kvs) 2))
         (check "parse-csv-kv first" (equal (assoc "k" kvs :test #'equal) '("k" . "v")))
         (check "parse-csv-kv second" (equal (assoc "k2" kvs :test #'equal) '("k2" . "v2"))))
-      (let ((kvs (sigil-cl::parse-csv-kv "  a = 1 , b=2 ,, c=3")))
+      (let ((kvs (agento11y-cl::parse-csv-kv "  a = 1 , b=2 ,, c=3")))
         (check "parse-csv-kv whitespace trimmed (a)"
                (equal (cdr (assoc "a" kvs :test #'equal)) "1"))
         (check "parse-csv-kv empty entries skipped"
                (= (length kvs) 3))
         (check "parse-csv-kv trailing entry" (equal (cdr (assoc "c" kvs :test #'equal)) "3")))
-      (let ((kvs (sigil-cl::parse-csv-kv "noequals,k=v")))
+      (let ((kvs (agento11y-cl::parse-csv-kv "noequals,k=v")))
         (check "parse-csv-kv missing = skipped"
                (and (= (length kvs) 1)
                     (equal (assoc "k" kvs :test #'equal) '("k" . "v")))))
-      (check "parse-csv-kv nil input" (null (sigil-cl::parse-csv-kv nil)))
-      (check "parse-csv-kv empty string" (null (sigil-cl::parse-csv-kv "")))
+      (check "parse-csv-kv nil input" (null (agento11y-cl::parse-csv-kv nil)))
+      (check "parse-csv-kv empty string" (null (agento11y-cl::parse-csv-kv "")))
 
-      ;; --- SIGIL_ENDPOINT ---
-      (let ((cfg (resolve '(("SIGIL_ENDPOINT" . "https://example/api/v1/generations:export")))))
-        (check "SIGIL_ENDPOINT sets generation-endpoint"
-               (equal (sigil-cl::config-generation-endpoint cfg)
+      ;; --- AGENTO11Y_ENDPOINT ---
+      (let ((cfg (resolve '(("AGENTO11Y_ENDPOINT" . "https://example/api/v1/generations:export")))))
+        (check "AGENTO11Y_ENDPOINT sets generation-endpoint"
+               (equal (agento11y-cl::config-generation-endpoint cfg)
                       "https://example/api/v1/generations:export")))
 
-      ;; --- SIGIL_EVAL_* ---
-      (let ((cfg (resolve '(("SIGIL_EVAL_ENDPOINT" . "https://eval.example/api")
-                            ("SIGIL_EVAL_PATH_PREFIX" . "/custom/v1")
-                            ("SIGIL_EVAL_AUTH_TOKEN" . "env-eval-token")
-                            ("SIGIL_EXPERIMENT_URL_TEMPLATE" . "https://ui/runs/{run_id}")))))
-        (check "SIGIL_EVAL_ENDPOINT -> eval-endpoint"
+      ;; --- AGENTO11Y_EVAL_* ---
+      (let ((cfg (resolve '(("AGENTO11Y_EVAL_ENDPOINT" . "https://eval.example/api")
+                            ("AGENTO11Y_EVAL_PATH_PREFIX" . "/custom/v1")
+                            ("AGENTO11Y_EVAL_AUTH_TOKEN" . "env-eval-token")
+                            ("AGENTO11Y_EXPERIMENT_URL_TEMPLATE" . "https://ui/runs/{run_id}")))))
+        (check "AGENTO11Y_EVAL_ENDPOINT -> eval-endpoint"
                (equal (config-eval-endpoint cfg) "https://eval.example/api"))
-        (check "SIGIL_EVAL_PATH_PREFIX -> eval-path-prefix"
+        (check "AGENTO11Y_EVAL_PATH_PREFIX -> eval-path-prefix"
                (equal (config-eval-path-prefix cfg) "/custom/v1"))
-        (check "SIGIL_EVAL_AUTH_TOKEN -> eval-auth-token"
+        (check "AGENTO11Y_EVAL_AUTH_TOKEN -> eval-auth-token"
                (equal (config-eval-auth-token cfg) "env-eval-token"))
-        (check "SIGIL_EXPERIMENT_URL_TEMPLATE -> experiment-url-template"
+        (check "AGENTO11Y_EXPERIMENT_URL_TEMPLATE -> experiment-url-template"
                (equal (config-experiment-url-template cfg) "https://ui/runs/{run_id}")))
-      (let ((cfg (resolve '(("SIGIL_EVAL_ENDPOINT" . "https://env.example")
-                            ("SIGIL_EVAL_PATH_PREFIX" . "/env")
-                            ("SIGIL_EVAL_AUTH_TOKEN" . "env-eval-token")
-                            ("SIGIL_EXPERIMENT_URL_TEMPLATE" . "https://env/{run_id}"))
+      (let ((cfg (resolve '(("AGENTO11Y_EVAL_ENDPOINT" . "https://env.example")
+                            ("AGENTO11Y_EVAL_PATH_PREFIX" . "/env")
+                            ("AGENTO11Y_EVAL_AUTH_TOKEN" . "env-eval-token")
+                            ("AGENTO11Y_EXPERIMENT_URL_TEMPLATE" . "https://env/{run_id}"))
                           :eval-endpoint "https://caller.example/path"
                           :eval-path-prefix "/caller"
                           :eval-auth-token "caller-eval-token"
@@ -422,8 +422,8 @@ experiment-runs branch, whose prefix they share."
                (equal (config-eval-auth-token cfg) "caller-eval-token"))
         (check "caller experiment-url-template beats env"
                (equal (config-experiment-url-template cfg) "https://caller/{run_id}")))
-      (let ((cfg (resolve '(("SIGIL_EVAL_PATH_PREFIX" . "/env")
-                            ("SIGIL_EXPERIMENT_URL_TEMPLATE" . "https://env/{run_id}"))
+      (let ((cfg (resolve '(("AGENTO11Y_EVAL_PATH_PREFIX" . "/env")
+                            ("AGENTO11Y_EXPERIMENT_URL_TEMPLATE" . "https://env/{run_id}"))
                           :eval-endpoint "https://caller.example")))
         (check "env still fills unset eval-path-prefix"
                (equal (config-eval-path-prefix cfg) "/env"))
@@ -431,7 +431,7 @@ experiment-runs branch, whose prefix they share."
                (equal (config-experiment-url-template cfg) "https://env/{run_id}")))
       ;; An explicit value equal to the default must survive env. The slot has
       ;; no initform, so "supplied" is distinguishable from "left at default".
-      (let ((cfg (resolve '(("SIGIL_EVAL_PATH_PREFIX" . "/env"))
+      (let ((cfg (resolve '(("AGENTO11Y_EVAL_PATH_PREFIX" . "/env"))
                           :eval-path-prefix "/api/v1")))
         (check "explicit default-valued eval-path-prefix beats env"
                (equal (config-eval-path-prefix cfg) "/api/v1")))
@@ -448,77 +448,77 @@ experiment-runs branch, whose prefix they share."
                (equal (config-eval-path-prefix cfg) "/api/v1"))
         (check "explicit nil ingest-actor falls back to the default"
                (equal (config-ingest-actor cfg) "ingest:sdk/lisp")))
-      (let ((cfg (resolve '(("SIGIL_EVAL_PATH_PREFIX" . "/env/v1"))
+      (let ((cfg (resolve '(("AGENTO11Y_EVAL_PATH_PREFIX" . "/env/v1"))
                           :eval-path-prefix nil)))
         (check "env still fills an explicitly nil eval-path-prefix"
                (equal (config-eval-path-prefix cfg) "/env/v1")))
-      (let ((cfg (resolve '(("SIGIL_INGEST_ACTOR" . "ingest:runner/harbor")))))
-        (check "SIGIL_INGEST_ACTOR -> ingest-actor"
+      (let ((cfg (resolve '(("AGENTO11Y_INGEST_ACTOR" . "ingest:runner/harbor")))))
+        (check "AGENTO11Y_INGEST_ACTOR -> ingest-actor"
                (equal (config-ingest-actor cfg) "ingest:runner/harbor")))
-      (let ((cfg (resolve '(("SIGIL_INGEST_ACTOR" . "ingest:env"))
+      (let ((cfg (resolve '(("AGENTO11Y_INGEST_ACTOR" . "ingest:env"))
                           :ingest-actor "ingest:sdk/lisp")))
         (check "explicit default-valued ingest-actor beats env"
                (equal (config-ingest-actor cfg) "ingest:sdk/lisp")))
 
-      ;; --- SIGIL_AUTH_* (env layered when caller does not set) ---
-      (let ((cfg (resolve '(("SIGIL_AUTH_MODE" . "basic")
-                            ("SIGIL_AUTH_TENANT_ID" . "t1")
-                            ("SIGIL_AUTH_TOKEN" . "tok")))))
-        (check "SIGIL_AUTH_MODE -> :basic"
-               (eq (sigil-cl::config-auth-mode cfg) :basic))
-        (check "SIGIL_AUTH_TENANT_ID -> tenant-id"
-               (equal (sigil-cl::config-tenant-id cfg) "t1"))
-        (check "SIGIL_AUTH_TOKEN -> auth-password"
-               (equal (sigil-cl::config-auth-password cfg) "tok"))
+      ;; --- AGENTO11Y_AUTH_* (env layered when caller does not set) ---
+      (let ((cfg (resolve '(("AGENTO11Y_AUTH_MODE" . "basic")
+                            ("AGENTO11Y_AUTH_TENANT_ID" . "t1")
+                            ("AGENTO11Y_AUTH_TOKEN" . "tok")))))
+        (check "AGENTO11Y_AUTH_MODE -> :basic"
+               (eq (agento11y-cl::config-auth-mode cfg) :basic))
+        (check "AGENTO11Y_AUTH_TENANT_ID -> tenant-id"
+               (equal (agento11y-cl::config-tenant-id cfg) "t1"))
+        (check "AGENTO11Y_AUTH_TOKEN -> auth-password"
+               (equal (agento11y-cl::config-auth-password cfg) "tok"))
         ;; And basic Authorization header is built downstream
-        (let ((headers (sigil-cl::build-auth-headers cfg)))
+        (let ((headers (agento11y-cl::build-auth-headers cfg)))
           (check "Authorization built from env"
                  (search "Basic " (cdr (assoc "Authorization" headers :test #'equal))))))
 
       ;; --- Caller value beats env ---
-      (let ((cfg (resolve '(("SIGIL_AUTH_MODE" . "basic"))
+      (let ((cfg (resolve '(("AGENTO11Y_AUTH_MODE" . "basic"))
                           :auth-mode :bearer :auth-password "explicit")))
         (check "caller auth-mode beats env"
-               (eq (sigil-cl::config-auth-mode cfg) :bearer))
+               (eq (agento11y-cl::config-auth-mode cfg) :bearer))
         (check "caller auth-password beats env"
-               (equal (sigil-cl::config-auth-password cfg) "explicit")))
+               (equal (agento11y-cl::config-auth-password cfg) "explicit")))
 
-      ;; --- Unknown SIGIL_AUTH_MODE warns and falls through ---
+      ;; --- Unknown AGENTO11Y_AUTH_MODE warns and falls through ---
       (let* ((warn-count 0)
-             (cfg (sigil-cl::resolve-config-from-env
+             (cfg (agento11y-cl::resolve-config-from-env
                    (make-config :log-fn (lambda (level component message &rest kvs)
                                           (declare (ignore component message kvs))
                                           (when (eq level :warn) (incf warn-count))))
-                   :env-fn (env-from-alist '(("SIGIL_AUTH_MODE" . "garbage")
-                                             ("SIGIL_AUTH_TOKEN" . "tok"))))))
-        (check "unknown SIGIL_AUTH_MODE keeps default"
-               (eq (sigil-cl::config-auth-mode cfg) :none))
-        (check "unknown SIGIL_AUTH_MODE warned"
+                   :env-fn (env-from-alist '(("AGENTO11Y_AUTH_MODE" . "garbage")
+                                             ("AGENTO11Y_AUTH_TOKEN" . "tok"))))))
+        (check "unknown AGENTO11Y_AUTH_MODE keeps default"
+               (eq (agento11y-cl::config-auth-mode cfg) :none))
+        (check "unknown AGENTO11Y_AUTH_MODE warned"
                (>= warn-count 1))
         (check "other env vars still applied alongside bad auth-mode"
-               (equal (sigil-cl::config-auth-password cfg) "tok")))
+               (equal (agento11y-cl::config-auth-password cfg) "tok")))
 
-      ;; --- SIGIL_TAGS merges with caller tags, caller wins on collision ---
-      (let ((cfg (resolve '(("SIGIL_TAGS" . "env=prod,layer=router"))
+      ;; --- AGENTO11Y_TAGS merges with caller tags, caller wins on collision ---
+      (let ((cfg (resolve '(("AGENTO11Y_TAGS" . "env=prod,layer=router"))
                           :tags '(("layer" . "agent")))))
-        (let ((tags (sigil-cl::config-tags cfg)))
-          (check "SIGIL_TAGS contributes env tag"
+        (let ((tags (agento11y-cl::config-tags cfg)))
+          (check "AGENTO11Y_TAGS contributes env tag"
                  (equal (cdr (assoc "env" tags :test #'equal)) "prod"))
           (check "caller tags win on collision"
                  (equal (cdr (assoc "layer" tags :test #'equal)) "agent"))))
-      (let ((cfg (resolve '(("SIGIL_TAGS" . "env=prod")))))
-        (check "SIGIL_TAGS with no caller tags -> env tags only"
-               (equal (cdr (assoc "env" (sigil-cl::config-tags cfg) :test #'equal)) "prod")))
+      (let ((cfg (resolve '(("AGENTO11Y_TAGS" . "env=prod")))))
+        (check "AGENTO11Y_TAGS with no caller tags -> env tags only"
+               (equal (cdr (assoc "env" (agento11y-cl::config-tags cfg) :test #'equal)) "prod")))
 
-      ;; --- SIGIL_HEADERS -> extra-headers, merged into auth ---
-      (let ((cfg (resolve '(("SIGIL_HEADERS" . "X-Foo=bar,X-Baz=qux")))))
+      ;; --- AGENTO11Y_HEADERS -> extra-headers, merged into auth ---
+      (let ((cfg (resolve '(("AGENTO11Y_HEADERS" . "X-Foo=bar,X-Baz=qux")))))
         (let ((extras (config-extra-headers cfg)))
-          (check "SIGIL_HEADERS parsed into extra-headers"
+          (check "AGENTO11Y_HEADERS parsed into extra-headers"
                  (and (equal (cdr (assoc "X-Foo" extras :test #'equal)) "bar")
                       (equal (cdr (assoc "X-Baz" extras :test #'equal)) "qux")))))
 
-      ;; SIGIL_HEADERS + caller extra-headers collide case-insensitively.
-      (let* ((cfg (resolve '(("SIGIL_HEADERS" . "authorization=env"))
+      ;; AGENTO11Y_HEADERS + caller extra-headers collide case-insensitively.
+      (let* ((cfg (resolve '(("AGENTO11Y_HEADERS" . "authorization=env"))
                            :extra-headers '(("Authorization" . "caller"))))
              (extras (config-extra-headers cfg))
              (auth-entries (remove-if-not (lambda (kv)
@@ -529,54 +529,54 @@ experiment-runs branch, whose prefix they share."
         (check "caller header wins case-insensitively over env"
                (equal (cdr (first auth-entries)) "caller")))
 
-      ;; --- SIGIL_AGENT_NAME / VERSION ---
-      (let ((cfg (resolve '(("SIGIL_AGENT_NAME" . "router")
-                            ("SIGIL_AGENT_VERSION" . "1.2.3")))))
-        (check "SIGIL_AGENT_NAME -> agent-name"
+      ;; --- AGENTO11Y_AGENT_NAME / VERSION ---
+      (let ((cfg (resolve '(("AGENTO11Y_AGENT_NAME" . "router")
+                            ("AGENTO11Y_AGENT_VERSION" . "1.2.3")))))
+        (check "AGENTO11Y_AGENT_NAME -> agent-name"
                (equal (config-agent-name cfg) "router"))
-        (check "SIGIL_AGENT_VERSION -> agent-version"
+        (check "AGENTO11Y_AGENT_VERSION -> agent-version"
                (equal (config-agent-version cfg) "1.2.3")))
 
       ;; --- Caller agent fields beat env ---
-      (let ((cfg (resolve '(("SIGIL_AGENT_NAME" . "from-env"))
+      (let ((cfg (resolve '(("AGENTO11Y_AGENT_NAME" . "from-env"))
                           :agent-name "explicit")))
         (check "caller agent-name beats env"
                (equal (config-agent-name cfg) "explicit")))
 
-      ;; --- SIGIL_USER_ID ---
-      (let ((cfg (resolve '(("SIGIL_USER_ID" . "u-42")))))
-        (check "SIGIL_USER_ID -> user-id"
-               (equal (sigil-cl::config-user-id cfg) "u-42")))
+      ;; --- AGENTO11Y_USER_ID ---
+      (let ((cfg (resolve '(("AGENTO11Y_USER_ID" . "u-42")))))
+        (check "AGENTO11Y_USER_ID -> user-id"
+               (equal (agento11y-cl::config-user-id cfg) "u-42")))
 
-      ;; --- SIGIL_CONTENT_CAPTURE_MODE ---
-      (let ((cfg (resolve '(("SIGIL_CONTENT_CAPTURE_MODE" . "full")))))
-        (check "SIGIL_CONTENT_CAPTURE_MODE=full"
-               (eq (sigil-cl::config-content-capture-mode cfg) :full)))
-      (let ((cfg (resolve '(("SIGIL_CONTENT_CAPTURE_MODE" . "no_tool_content")))))
-        (check "SIGIL_CONTENT_CAPTURE_MODE=no_tool_content"
-               (eq (sigil-cl::config-content-capture-mode cfg) :no-tool-content)))
+      ;; --- AGENTO11Y_CONTENT_CAPTURE_MODE ---
+      (let ((cfg (resolve '(("AGENTO11Y_CONTENT_CAPTURE_MODE" . "full")))))
+        (check "AGENTO11Y_CONTENT_CAPTURE_MODE=full"
+               (eq (agento11y-cl::config-content-capture-mode cfg) :full)))
+      (let ((cfg (resolve '(("AGENTO11Y_CONTENT_CAPTURE_MODE" . "no_tool_content")))))
+        (check "AGENTO11Y_CONTENT_CAPTURE_MODE=no_tool_content"
+               (eq (agento11y-cl::config-content-capture-mode cfg) :no-tool-content)))
       (let* ((warns 0)
-             (cfg (sigil-cl::resolve-config-from-env
+             (cfg (agento11y-cl::resolve-config-from-env
                    (make-config :log-fn (lambda (l c m &rest kvs)
                                           (declare (ignore c m kvs))
                                           (when (eq l :warn) (incf warns))))
                    :env-fn (env-from-alist
-                            '(("SIGIL_CONTENT_CAPTURE_MODE" . "garbage"))))))
-        (check "bad SIGIL_CONTENT_CAPTURE_MODE keeps default"
-               (eq (sigil-cl::config-content-capture-mode cfg) :metadata-only))
-        (check "bad SIGIL_CONTENT_CAPTURE_MODE warns"
+                            '(("AGENTO11Y_CONTENT_CAPTURE_MODE" . "garbage"))))))
+        (check "bad AGENTO11Y_CONTENT_CAPTURE_MODE keeps default"
+               (eq (agento11y-cl::config-content-capture-mode cfg) :metadata-only))
+        (check "bad AGENTO11Y_CONTENT_CAPTURE_MODE warns"
                (>= warns 1)))
 
       ;; --- Unsupported caller :content-capture-mode falls back to :metadata-only ---
       (let* ((messages nil)
-             (cfg (sigil-cl::resolve-config-from-env
+             (cfg (agento11y-cl::resolve-config-from-env
                    (make-config :content-capture-mode :metadata
                                 :log-fn (lambda (l c m &rest kvs)
                                           (declare (ignore c kvs))
                                           (when (eq l :warn) (push m messages))))
                    :env-fn (env-from-alist nil))))
         (check "unsupported caller capture mode falls back to :metadata-only"
-               (eq (sigil-cl::config-content-capture-mode cfg) :metadata-only))
+               (eq (agento11y-cl::config-content-capture-mode cfg) :metadata-only))
         (check "unsupported caller capture mode warns"
                (= (length messages) 1))
         (check "unsupported caller capture mode warning names the value"
@@ -584,98 +584,163 @@ experiment-runs branch, whose prefix they share."
 
       ;; A supported caller mode neither warns nor gets rewritten.
       (let* ((warns 0)
-             (cfg (sigil-cl::resolve-config-from-env
+             (cfg (agento11y-cl::resolve-config-from-env
                    (make-config :content-capture-mode :full
                                 :log-fn (lambda (l c m &rest kvs)
                                           (declare (ignore c m kvs))
                                           (when (eq l :warn) (incf warns))))
                    :env-fn (env-from-alist nil))))
         (check "supported caller capture mode kept"
-               (eq (sigil-cl::config-content-capture-mode cfg) :full))
+               (eq (agento11y-cl::config-content-capture-mode cfg) :full))
         (check "supported caller capture mode does not warn" (zerop warns)))
 
-      ;; --- SIGIL_DEBUG ---
-      (let ((cfg (resolve '(("SIGIL_DEBUG" . "1")))))
-        (check "SIGIL_DEBUG=1 -> t" (config-debug cfg)))
-      (let ((cfg (resolve '(("SIGIL_DEBUG" . "false")))))
-        (check "SIGIL_DEBUG=false -> nil" (null (config-debug cfg))))
+      ;; --- AGENTO11Y_DEBUG ---
+      (let ((cfg (resolve '(("AGENTO11Y_DEBUG" . "1")))))
+        (check "AGENTO11Y_DEBUG=1 -> t" (config-debug cfg)))
+      (let ((cfg (resolve '(("AGENTO11Y_DEBUG" . "false")))))
+        (check "AGENTO11Y_DEBUG=false -> nil" (null (config-debug cfg))))
 
-      ;; --- SIGIL_REDACT_SECRETS ---
-      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "true")))))
-        (check "SIGIL_REDACT_SECRETS=true -> t"
-               (sigil-cl::config-redact-secrets cfg)))
-      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "0")))))
-        (check "SIGIL_REDACT_SECRETS=0 -> nil"
-               (null (sigil-cl::config-redact-secrets cfg))))
-      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "t")))))
-        (check "SIGIL_REDACT_SECRETS=t -> t"
-               (sigil-cl::config-redact-secrets cfg)))
-      (let ((cfg (resolve '(("SIGIL_REDACT_SECRETS" . "NIL")))))
-        (check "SIGIL_REDACT_SECRETS=NIL -> nil"
-               (null (sigil-cl::config-redact-secrets cfg))))
+      ;; --- AGENTO11Y_REDACT_SECRETS ---
+      (let ((cfg (resolve '(("AGENTO11Y_REDACT_SECRETS" . "true")))))
+        (check "AGENTO11Y_REDACT_SECRETS=true -> t"
+               (agento11y-cl::config-redact-secrets cfg)))
+      (let ((cfg (resolve '(("AGENTO11Y_REDACT_SECRETS" . "0")))))
+        (check "AGENTO11Y_REDACT_SECRETS=0 -> nil"
+               (null (agento11y-cl::config-redact-secrets cfg))))
+      (let ((cfg (resolve '(("AGENTO11Y_REDACT_SECRETS" . "t")))))
+        (check "AGENTO11Y_REDACT_SECRETS=t -> t"
+               (agento11y-cl::config-redact-secrets cfg)))
+      (let ((cfg (resolve '(("AGENTO11Y_REDACT_SECRETS" . "NIL")))))
+        (check "AGENTO11Y_REDACT_SECRETS=NIL -> nil"
+               (null (agento11y-cl::config-redact-secrets cfg))))
 
-      ;; --- SIGIL_REDACT_INPUT_MESSAGES ---
-      (let ((cfg (resolve '(("SIGIL_REDACT_INPUT_MESSAGES" . "yes")))))
-        (check "SIGIL_REDACT_INPUT_MESSAGES=yes -> t"
-               (sigil-cl::config-redact-input-messages cfg)))
+      ;; --- AGENTO11Y_REDACT_INPUT_MESSAGES ---
+      (let ((cfg (resolve '(("AGENTO11Y_REDACT_INPUT_MESSAGES" . "yes")))))
+        (check "AGENTO11Y_REDACT_INPUT_MESSAGES=yes -> t"
+               (agento11y-cl::config-redact-input-messages cfg)))
 
-      ;; --- Invalid SIGIL_REDACT_INPUT_MESSAGES warns and stays disabled ---
+      ;; --- Invalid AGENTO11Y_REDACT_INPUT_MESSAGES warns and stays disabled ---
       (let* ((warns 0)
              (messages nil)
-             (cfg (sigil-cl::resolve-config-from-env
+             (cfg (agento11y-cl::resolve-config-from-env
                    (make-config :log-fn (lambda (l c m &rest kvs)
                                           (declare (ignore c kvs))
                                           (when (eq l :warn)
                                             (incf warns)
                                             (push m messages))))
                    :env-fn (env-from-alist
-                            '(("SIGIL_REDACT_INPUT_MESSAGES" . "glc_notabool"))))))
-        (check "bad SIGIL_REDACT_INPUT_MESSAGES stays disabled"
-               (null (sigil-cl::config-redact-input-messages cfg)))
-        (check "bad SIGIL_REDACT_INPUT_MESSAGES warns"
+                            '(("AGENTO11Y_REDACT_INPUT_MESSAGES" . "glc_notabool"))))))
+        (check "bad AGENTO11Y_REDACT_INPUT_MESSAGES stays disabled"
+               (null (agento11y-cl::config-redact-input-messages cfg)))
+        (check "bad AGENTO11Y_REDACT_INPUT_MESSAGES warns"
                (>= warns 1))
-        (check "bad SIGIL_REDACT_INPUT_MESSAGES warning omits the value"
+        (check "bad AGENTO11Y_REDACT_INPUT_MESSAGES warning omits the value"
                (notany (lambda (m) (search "glc_notabool" m)) messages)))
 
       ;; --- Experimental gate ---
       (check "gate is off when unset"
              (null (config-experimental-features (resolve nil))))
-      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "true")))))
-        (check "SIGIL_ENABLE_EXPERIMENTAL_FEATURES=true -> t"
+      (let ((cfg (resolve '(("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "true")))))
+        (check "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=true -> t"
                (config-experimental-features cfg)))
-      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "on")))))
+      (let ((cfg (resolve '(("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "on")))))
         (check "the gate accepts on" (config-experimental-features cfg)))
-      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "no")))))
-        (check "SIGIL_ENABLE_EXPERIMENTAL_FEATURES=no -> nil"
+      (let ((cfg (resolve '(("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "no")))))
+        (check "AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES=no -> nil"
                (null (config-experimental-features cfg))))
-      ;; A polyglot harness exporting the Go gate unlocks this SDK too.
-      (let ((cfg (resolve '(("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "1")))))
-        (check "the agento11y spelling sets the gate"
-               (config-experimental-features cfg)))
-      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "true")
-                            ("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "no")))))
-        (check "the SIGIL spelling wins over the agento11y one"
-               (config-experimental-features cfg)))
-      (let ((cfg (resolve '(("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "no"))
+      (let ((cfg (resolve '(("AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES" . "no"))
                           :experimental-features t)))
         (check "a caller-set gate survives env resolution"
                (config-experimental-features cfg)))
 
-      ;; --- SIGIL_PROTOCOL warning when non-http ---
+      ;; --- Legacy SIGIL_* fallback ---
+      ;;
+      ;; Every variable is read as AGENTO11Y_<SUFFIX> first, then
+      ;; SIGIL_<SUFFIX>. Selection happens before parsing, so a stale legacy
+      ;; value cannot resurface when the preferred one fails validation. This
+      ;; mirrors envPair/envTrimmed in go/agento11y/env.go.
+      (let ((cfg (resolve '(("SIGIL_ENDPOINT" . "https://legacy/api/v1/generations:export")
+                            ("SIGIL_AGENT_NAME" . "legacy-agent")
+                            ("SIGIL_TAGS" . "env=legacy")
+                            ("SIGIL_CONTENT_CAPTURE_MODE" . "full")
+                            ("SIGIL_ENABLE_EXPERIMENTAL_FEATURES" . "1")))))
+        (check "legacy SIGIL_ENDPOINT still resolves"
+               (equal (agento11y-cl::config-generation-endpoint cfg)
+                      "https://legacy/api/v1/generations:export"))
+        (check "legacy SIGIL_AGENT_NAME still resolves"
+               (equal (config-agent-name cfg) "legacy-agent"))
+        (check "legacy SIGIL_TAGS still resolves"
+               (equal (cdr (assoc "env" (agento11y-cl::config-tags cfg) :test #'equal))
+                      "legacy"))
+        (check "legacy SIGIL_CONTENT_CAPTURE_MODE still resolves"
+               (eq (agento11y-cl::config-content-capture-mode cfg) :full))
+        (check "legacy SIGIL_ENABLE_EXPERIMENTAL_FEATURES still resolves"
+               (config-experimental-features cfg)))
+      (let ((cfg (resolve '(("SIGIL_ENDPOINT" . "https://legacy/api")
+                            ("AGENTO11Y_ENDPOINT" . "https://preferred/api")
+                            ("SIGIL_AGENT_NAME" . "legacy-agent")
+                            ("AGENTO11Y_AGENT_NAME" . "preferred-agent")))))
+        (check "AGENTO11Y_ENDPOINT wins over SIGIL_ENDPOINT"
+               (equal (agento11y-cl::config-generation-endpoint cfg)
+                      "https://preferred/api"))
+        (check "AGENTO11Y_AGENT_NAME wins over SIGIL_AGENT_NAME"
+               (equal (config-agent-name cfg) "preferred-agent")))
+      ;; Selection before parsing: the preferred name is chosen even when its
+      ;; value is unparseable, so the legacy value is not silently used.
       (let* ((warns 0)
-             (cfg (sigil-cl::resolve-config-from-env
+             (cfg (agento11y-cl::resolve-config-from-env
                    (make-config :log-fn (lambda (l c m &rest kvs)
                                           (declare (ignore c m kvs))
                                           (when (eq l :warn) (incf warns))))
-                   :env-fn (env-from-alist '(("SIGIL_PROTOCOL" . "grpc"))))))
+                   :env-fn (env-from-alist
+                            '(("SIGIL_AUTH_MODE" . "basic")
+                              ("AGENTO11Y_AUTH_MODE" . "garbage"))))))
+        (check "an unparseable preferred value does not fall back to legacy"
+               (eq (agento11y-cl::config-auth-mode cfg) :none))
+        (check "the unparseable preferred value warns" (>= warns 1)))
+      ;; A blank preferred value is treated as unset, so legacy still applies.
+      (let ((cfg (resolve '(("AGENTO11Y_AGENT_NAME" . "   ")
+                            ("SIGIL_AGENT_NAME" . "legacy-agent")))))
+        (check "a blank preferred value falls through to legacy"
+               (equal (config-agent-name cfg) "legacy-agent")))
+      ;; The two spellings are never merged: the selected value is used whole.
+      (let ((cfg (resolve '(("SIGIL_TAGS" . "legacy=1,shared=legacy")
+                            ("AGENTO11Y_TAGS" . "preferred=1")))))
+        (check "tags are not merged across spellings"
+               (and (equal (cdr (assoc "preferred" (agento11y-cl::config-tags cfg)
+                                       :test #'equal))
+                           "1")
+                    (null (assoc "legacy" (agento11y-cl::config-tags cfg)
+                                 :test #'equal))
+                    (null (assoc "shared" (agento11y-cl::config-tags cfg)
+                                 :test #'equal)))))
+      ;; Warnings name the spelling the caller actually set.
+      (let* ((messages nil)
+             (cfg (agento11y-cl::resolve-config-from-env
+                   (make-config :log-fn (lambda (l c m &rest kvs)
+                                          (declare (ignore c kvs))
+                                          (when (eq l :warn) (push m messages))))
+                   :env-fn (env-from-alist
+                            '(("SIGIL_CONTENT_CAPTURE_MODE" . "garbage"))))))
         (declare (ignore cfg))
-        (check "non-http SIGIL_PROTOCOL warns" (>= warns 1)))
+        (check "the warning names the legacy variable the caller set"
+               (some (lambda (m) (search "SIGIL_CONTENT_CAPTURE_MODE" m)) messages)))
+
+      ;; --- AGENTO11Y_PROTOCOL warning when non-http ---
+      (let* ((warns 0)
+             (cfg (agento11y-cl::resolve-config-from-env
+                   (make-config :log-fn (lambda (l c m &rest kvs)
+                                          (declare (ignore c m kvs))
+                                          (when (eq l :warn) (incf warns))))
+                   :env-fn (env-from-alist '(("AGENTO11Y_PROTOCOL" . "grpc"))))))
+        (declare (ignore cfg))
+        (check "non-http AGENTO11Y_PROTOCOL warns" (>= warns 1)))
 
       ;; --- make-client honours :env-fn so deployments and tests can stub the env ---
-      (let* ((env (env-from-alist '(("SIGIL_AGENT_NAME" . "auto"))))
+      (let* ((env (env-from-alist '(("AGENTO11Y_AGENT_NAME" . "auto"))))
              (client (make-client (make-config) :env-fn env)))
         (check "make-client :env-fn layers env into resolved config"
-               (equal (config-agent-name (sigil-cl::client-config client)) "auto")))
+               (equal (config-agent-name (agento11y-cl::client-config client)) "auto")))
 
       ;; --- Resolver preserves slots it doesn't touch ---
       ;; Regression guard: the MOP-based copy means new slots Just Work; this
@@ -686,50 +751,50 @@ experiment-runs branch, whose prefix they share."
                                :max-retries 11
                                :http-fn http-fn
                                :traces-forward-auth nil))
-             (resolved (sigil-cl::resolve-config-from-env
-                        cfg :env-fn (env-from-alist '(("SIGIL_AGENT_NAME" . "x"))))))
+             (resolved (agento11y-cl::resolve-config-from-env
+                        cfg :env-fn (env-from-alist '(("AGENTO11Y_AGENT_NAME" . "x"))))))
         (check "resolver preserves batch-size"
-               (= (sigil-cl::config-batch-size resolved) 7))
+               (= (agento11y-cl::config-batch-size resolved) 7))
         (check "resolver preserves max-retries"
-               (= (sigil-cl::config-max-retries resolved) 11))
+               (= (agento11y-cl::config-max-retries resolved) 11))
         (check "resolver preserves http-fn"
-               (eq (sigil-cl::config-http-fn resolved) http-fn))
+               (eq (agento11y-cl::config-http-fn resolved) http-fn))
         (check "resolver preserves traces-forward-auth=nil"
-               (null (sigil-cl::config-traces-forward-auth resolved)))))))
+               (null (agento11y-cl::config-traces-forward-auth resolved)))))))
 
 (defun run-queue-tests ()
   (with-test-suite ("Queue")
     ;; Basic enqueue/drain
-    (let ((q (sigil-cl::make-bounded-queue :max-size 10)))
-      (sigil-cl::queue-enqueue q :a)
-      (sigil-cl::queue-enqueue q :b)
-      (sigil-cl::queue-enqueue q :c)
-      (check "queue length" (= (sigil-cl::queue-length q) 3))
-      (let ((batch (sigil-cl::queue-drain-batch q 2)))
+    (let ((q (agento11y-cl::make-bounded-queue :max-size 10)))
+      (agento11y-cl::queue-enqueue q :a)
+      (agento11y-cl::queue-enqueue q :b)
+      (agento11y-cl::queue-enqueue q :c)
+      (check "queue length" (= (agento11y-cl::queue-length q) 3))
+      (let ((batch (agento11y-cl::queue-drain-batch q 2)))
         (check "drain-batch returns 2" (= (length batch) 2))
         (check "drain-batch FIFO" (equal batch '(:a :b))))
-      (check "remaining after drain" (= (sigil-cl::queue-length q) 1)))
+      (check "remaining after drain" (= (agento11y-cl::queue-length q) 1)))
 
     ;; Drain all
-    (let ((q (sigil-cl::make-bounded-queue :max-size 10)))
-      (sigil-cl::queue-enqueue q 1)
-      (sigil-cl::queue-enqueue q 2)
-      (let ((all (sigil-cl::queue-drain-all q)))
+    (let ((q (agento11y-cl::make-bounded-queue :max-size 10)))
+      (agento11y-cl::queue-enqueue q 1)
+      (agento11y-cl::queue-enqueue q 2)
+      (let ((all (agento11y-cl::queue-drain-all q)))
         (check "drain-all returns all" (= (length all) 2))
         (check "drain-all FIFO" (equal all '(1 2))))
-      (check "empty after drain-all" (sigil-cl::queue-empty-p q)))
+      (check "empty after drain-all" (agento11y-cl::queue-empty-p q)))
 
     ;; Overflow drops oldest
-    (let ((q (sigil-cl::make-bounded-queue :max-size 3)))
-      (dotimes (i 5) (sigil-cl::queue-enqueue q i))
-      (check "overflow caps at max" (= (sigil-cl::queue-length q) 3))
-      (let ((items (sigil-cl::queue-drain-all q)))
+    (let ((q (agento11y-cl::make-bounded-queue :max-size 3)))
+      (dotimes (i 5) (agento11y-cl::queue-enqueue q i))
+      (check "overflow caps at max" (= (agento11y-cl::queue-length q) 3))
+      (let ((items (agento11y-cl::queue-drain-all q)))
         (check "overflow keeps newest" (= (first items) 2))))
 
     ;; Empty queue
-    (let ((q (sigil-cl::make-bounded-queue)))
-      (check "drain-batch on empty" (null (sigil-cl::queue-drain-batch q 10)))
-      (check "drain-all on empty" (null (sigil-cl::queue-drain-all q))))))
+    (let ((q (agento11y-cl::make-bounded-queue)))
+      (check "drain-batch on empty" (null (agento11y-cl::queue-drain-batch q 10)))
+      (check "drain-all on empty" (null (agento11y-cl::queue-drain-all q))))))
 
 (defun run-otel-tests ()
   (with-test-suite ("OTel")
@@ -747,7 +812,7 @@ experiment-runs branch, whose prefix they share."
       (check "bool-attr false" (eq (jget* attr "value" "boolValue") nil)))
 
     ;; Span building
-    (let ((span (sigil-cl::build-span :trace-id "abc" :span-id "def" :name "test"
+    (let ((span (agento11y-cl::build-span :trace-id "abc" :span-id "def" :name "test"
                                        :kind 1 :start-time-unix-nano "100"
                                        :end-time-unix-nano "200")))
       (check "span traceId" (equal (jget span "traceId") "abc"))
@@ -755,42 +820,42 @@ experiment-runs branch, whose prefix they share."
       (check "span kind" (= (jget span "kind") 1))
       (check "span no parentSpanId" (null (jget span "parentSpanId"))))
 
-    (let ((span (sigil-cl::build-span :trace-id "a" :span-id "b"
+    (let ((span (agento11y-cl::build-span :trace-id "a" :span-id "b"
                                        :parent-span-id "p" :name "child" :kind 1)))
       (check "span has parentSpanId" (equal (jget span "parentSpanId") "p")))
 
     ;; OTLP payload
-    (let* ((span (sigil-cl::build-span :trace-id "t" :span-id "s" :name "x" :kind 1))
-           (payload (sigil-cl::build-otlp-payload (list span) "my-svc" "1.0")))
+    (let* ((span (agento11y-cl::build-span :trace-id "t" :span-id "s" :name "x" :kind 1))
+           (payload (agento11y-cl::build-otlp-payload (list span) "my-svc" "1.0")))
       (check "payload has resourceSpans" (jget payload "resourceSpans"))
       (let* ((rs (aref (jget payload "resourceSpans") 0))
              (svc-name (jget* (aref (jget* rs "resource" "attributes") 0) "value" "stringValue")))
         (check "payload service.name" (equal svc-name "my-svc"))))
 
     ;; Error classification
-    (check "classify 429" (equal (sigil-cl::classify-error "status=429") "rate_limit"))
-    (check "classify 500" (equal (sigil-cl::classify-error "status=500") "server_error"))
-    (check "classify timeout" (equal (sigil-cl::classify-error "Connection timed out") "timeout"))
-    (check "classify nil" (null (sigil-cl::classify-error nil)))
+    (check "classify 429" (equal (agento11y-cl::classify-error "status=429") "rate_limit"))
+    (check "classify 500" (equal (agento11y-cl::classify-error "status=500") "server_error"))
+    (check "classify timeout" (equal (agento11y-cl::classify-error "Connection timed out") "timeout"))
+    (check "classify nil" (null (agento11y-cl::classify-error nil)))
     ;; A caller passing a condition object instead of a string must not take the
     ;; payload and span down with it.
     (check "classify condition object"
-           (equal (sigil-cl::classify-error
+           (equal (agento11y-cl::classify-error
                    (make-condition 'simple-error
                                    :format-control "provider returned status=429"))
                   "rate_limit"))
     (check "classify unclassifiable condition object"
-           (equal (sigil-cl::classify-error
+           (equal (agento11y-cl::classify-error
                    (make-condition 'simple-error :format-control "socket closed"))
                   "sdk_error"))
 
     ;; Withheld error text keeps the classification
     (check "redacted-error-text 429"
-           (equal (sigil-cl::redacted-error-text "status=429") "rate_limit"))
+           (equal (agento11y-cl::redacted-error-text "status=429") "rate_limit"))
     (check "redacted-error-text unclassified"
-           (equal (sigil-cl::redacted-error-text "socket closed") "sdk_error"))
+           (equal (agento11y-cl::redacted-error-text "socket closed") "sdk_error"))
     (check "redacted-error-text nil"
-           (equal (sigil-cl::redacted-error-text nil) "sdk_error"))))
+           (equal (agento11y-cl::redacted-error-text nil) "sdk_error"))))
 
 (defun run-recorder-tests ()
   (with-test-suite ("Recorder")
@@ -808,11 +873,11 @@ experiment-runs branch, whose prefix they share."
                         :response-id "resp-1"
                         :response-model "gpt-4-0125")
         (recorder-end rec)
-        (check "recorder ended" (sigil-cl::recorder-ended-p rec))
+        (check "recorder ended" (agento11y-cl::recorder-ended-p rec))
 
         ;; Check generation queue
-        (let ((gen-items (sigil-cl::queue-drain-all
-                          (sigil-cl::client-generation-queue client))))
+        (let ((gen-items (agento11y-cl::queue-drain-all
+                          (agento11y-cl::client-generation-queue client))))
           (check "generation enqueued" (= (length gen-items) 1))
           (let ((gen (first gen-items)))
             (check "gen has id" (search "gen_" (jget gen "id")))
@@ -827,8 +892,8 @@ experiment-runs branch, whose prefix they share."
                    (null (jget gen "conversation_title"))))))
 
         ;; Check trace queue
-        (let ((trace-items (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client))))
+        (let ((trace-items (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client))))
           (check "span enqueued" (= (length trace-items) 1))
           (let ((span (first trace-items)))
             (check "span has traceId" (plusp (length (jget span "traceId"))))
@@ -851,8 +916,8 @@ experiment-runs branch, whose prefix they share."
                                           :model-name "gpt-4")))
         (set-call-error rec "Connection refused")
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "call error -> category (metadata-only)"
                  (equal (jget gen "call_error") "sdk_error"))
           (check "stop_reason error" (equal (jget gen "stop_reason") "error")))))
@@ -871,8 +936,8 @@ experiment-runs branch, whose prefix they share."
                                                 :parts (list (make-text-part "Hi there")))))
         (set-call-error rec "test error")
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "full capture: system prompt included"
                  (equal (jget gen "system_prompt") "Be helpful"))
           (check "full capture: input messages included"
@@ -904,8 +969,8 @@ experiment-runs branch, whose prefix they share."
                                                                :url "https://example.test/i.png"
                                                                :provider-type :image)))))))
         (recorder-end rec)
-        (let* ((gen (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-generation-queue client))))
+        (let* ((gen (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-generation-queue client))))
                (parts (jget (aref (jget gen "input") 0) "parts"))
                (with-meta (aref parts 0))
                (no-meta (aref parts 1))
@@ -941,8 +1006,8 @@ experiment-runs branch, whose prefix they share."
                                                                  :mime-type "image/png"
                                                                  :name "i.png")))))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (part (aref (jget (aref (jget gen "input") 0) "parts") 0)))
             (check (format nil "media ~a: url cleared" mode)
                    (equal (jget* part "media" "url") ""))
@@ -965,8 +1030,8 @@ experiment-runs branch, whose prefix they share."
                                                 :role :assistant
                                                 :parts (list (make-text-part "Also secret")))))
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "metadata-only: input present" (jget gen "input"))
           (check "metadata-only: output present" (jget gen "output"))
           (let ((input-msg (aref (jget gen "input") 0)))
@@ -989,7 +1054,7 @@ experiment-runs branch, whose prefix they share."
                                                               (make-thinking-part "Secret thought")))))))
         ;; build-generation-payload directly, so the unsupported mode never
         ;; passes through resolve-config-from-env.
-        (let* ((gen (sigil-cl::build-generation-payload
+        (let* ((gen (agento11y-cl::build-generation-payload
                      rec (make-config :content-capture-mode :typo-mode)))
                (parts (jget (aref (jget gen "input") 0) "parts")))
           (check "unsupported mode: text redacted"
@@ -999,7 +1064,7 @@ experiment-runs branch, whose prefix they share."
           (check "unsupported mode: system prompt omitted"
                  (null (jget gen "system_prompt")))
           (check "unsupported mode: conversation title omitted"
-                 (null (jget* gen "metadata" "sigil.conversation.title")))
+                 (null (jget* gen "metadata" "agento11y.conversation.title")))
           (check "unsupported mode: capture tag reports metadata_only"
                  (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
                         "metadata_only")))))
@@ -1031,8 +1096,8 @@ experiment-runs branch, whose prefix they share."
                                                 :role :assistant
                                                 :parts (list (make-text-part "Also secret")))))
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "metadata-with-system-prompt: system_prompt populated"
                  (equal (jget gen "system_prompt") "Be helpful"))
           (check "metadata-with-system-prompt: input present" (jget gen "input"))
@@ -1076,8 +1141,8 @@ experiment-runs branch, whose prefix they share."
                                                 :parts (list (make-text-part "Hi")))))
         (set-call-error rec "rate limit")
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "no-tool-content: system prompt included"
                  (equal (jget gen "system_prompt") "Be helpful"))
           (check "no-tool-content: input text kept"
@@ -1102,8 +1167,8 @@ experiment-runs branch, whose prefix they share."
                           :result "found something private"
                           :duration-seconds 0.5d0)
           (recorder-end rec)
-          (let* ((span (first (sigil-cl::queue-drain-all
-                               (sigil-cl::client-trace-queue client))))
+          (let* ((span (first (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-trace-queue client))))
                  (attrs (jget span "attributes"))
                  (args-attr (find "gen_ai.tool.call.arguments" (coerce attrs 'list)
                                   :key (lambda (a) (jget a "key")) :test #'equal))
@@ -1127,14 +1192,14 @@ experiment-runs branch, whose prefix they share."
                                           :metadata '(("my.key" . "my-value")
                                                       ("framework" . "my-framework")))))
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "caller metadata: my.key present"
                  (equal (jget* gen "metadata" "my.key") "my-value"))
           (check "caller metadata: framework present"
                  (equal (jget* gen "metadata" "framework") "my-framework"))
           (check "caller metadata: sdk.name still present"
-                 (equal (jget* gen "metadata" "sigil.sdk.name") "sigil-cl")))))
+                 (equal (jget* gen "metadata" "agento11y.sdk.name") "agento11y-cl")))))
 
     ;; Conversation title in metadata: kept by the content-keeping modes only
     (dolist (mode '(:full :no-tool-content))
@@ -1144,10 +1209,10 @@ experiment-runs branch, whose prefix they share."
                                             :model-provider "test" :model-name "m"
                                             :conversation-title "My Chat")))
           (recorder-end rec)
-          (let ((gen (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-generation-queue client)))))
+          (let ((gen (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-generation-queue client)))))
             (check (format nil "~a: conversation title in metadata" mode)
-                   (equal (jget* gen "metadata" "sigil.conversation.title") "My Chat"))
+                   (equal (jget* gen "metadata" "agento11y.conversation.title") "My Chat"))
             (check (format nil "~a: no top-level conversation_title" mode)
                    (null (jget gen "conversation_title")))))))
 
@@ -1158,13 +1223,13 @@ experiment-runs branch, whose prefix they share."
                                             :model-provider "test" :model-name "m"
                                             :conversation-title "My Chat")))
           (recorder-end rec)
-          (let ((gen (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-generation-queue client)))))
+          (let ((gen (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-generation-queue client)))))
             (check (format nil "~a: conversation title withheld" mode)
-                   (null (nth-value 1 (gethash "sigil.conversation.title"
+                   (null (nth-value 1 (gethash "agento11y.conversation.title"
                                                (jget gen "metadata")))))
             (check (format nil "~a: sdk.name metadata still present" mode)
-                   (equal (jget* gen "metadata" "sigil.sdk.name") "sigil-cl"))))))
+                   (equal (jget* gen "metadata" "agento11y.sdk.name") "agento11y-cl"))))))
 
     ;; A retained conversation title still goes through the secret redactor
     (multiple-value-bind (client get-requests)
@@ -1175,9 +1240,9 @@ experiment-runs branch, whose prefix they share."
                                           :conversation-title
                                           "chat about glc_abcdefghijklmnopqrstuvwxyz")))
         (recorder-end rec)
-        (let ((title (jget* (first (sigil-cl::queue-drain-all
-                                    (sigil-cl::client-generation-queue client)))
-                            "metadata" "sigil.conversation.title")))
+        (let ((title (jget* (first (agento11y-cl::queue-drain-all
+                                    (agento11y-cl::client-generation-queue client)))
+                            "metadata" "agento11y.conversation.title")))
           (check "conversation title secret redacted"
                  (and (search "[REDACTED:grafana-cloud-token]" title)
                       (not (search "glc_abcdefghijklmnopqrstuvwxyz" title)))))))
@@ -1193,8 +1258,8 @@ experiment-runs branch, whose prefix they share."
                                              :parameters (jobj "type" "object")
                                              :deferred t)))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (tool (aref (jget gen "tools") 0))
                  (keep (member mode '(:full :no-tool-content))))
             (check (format nil "~a: tool name kept" mode)
@@ -1223,8 +1288,8 @@ experiment-runs branch, whose prefix they share."
                      :tool-call-id "tc-1"
                      :tool-description "Search the private wiki")))
           (recorder-end rec)
-          (let* ((span (first (sigil-cl::queue-drain-all
-                               (sigil-cl::client-trace-queue client))))
+          (let* ((span (first (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-trace-queue client))))
                  (desc (find "gen_ai.tool.description"
                              (coerce (jget span "attributes") 'list)
                              :key (lambda (a) (jget a "key")) :test #'equal)))
@@ -1248,8 +1313,8 @@ experiment-runs branch, whose prefix they share."
         (let ((rec (start-generation client :mode :sync
                                             :model-provider "test" :model-name "m")))
           (recorder-end rec)
-          (let ((gen (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-generation-queue client)))))
+          (let ((gen (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-generation-queue client)))))
             (check (format nil "~a: capture tag present with no caller tags" (car pair))
                    (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
                           (cdr pair)))))))
@@ -1263,8 +1328,8 @@ experiment-runs branch, whose prefix they share."
                                                   ("agento11y.sdk.content_capture_mode"
                                                    . "metadata_only")))))
         (recorder-end rec)
-        (let ((tags (jget (first (sigil-cl::queue-drain-all
-                                  (sigil-cl::client-generation-queue client)))
+        (let ((tags (jget (first (agento11y-cl::queue-drain-all
+                                  (agento11y-cl::client-generation-queue client)))
                           "tags")))
           (check "caller tag preserved" (equal (jget tags "env") "prod"))
           (check "caller cannot override the capture tag"
@@ -1283,8 +1348,8 @@ experiment-runs branch, whose prefix they share."
                              :role :assistant
                              :parts (list (make-thinking-part "Secret reasoning")))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (parts (jget (aref (jget gen "output") 0) "parts")))
             (check (format nil "~a: thinking part kept" mode) (= (length parts) 1))
             (check (format nil "~a: thinking text emptied" mode)
@@ -1302,8 +1367,8 @@ experiment-runs branch, whose prefix they share."
                            :role :assistant
                            :parts (list (make-thinking-part "Visible reasoning")))))
         (recorder-end rec)
-        (let* ((gen (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-generation-queue client))))
+        (let* ((gen (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-generation-queue client))))
                (parts (jget (aref (jget gen "output") 0) "parts")))
           (check "full: thinking text kept"
                  (equal (jget (aref parts 0) "thinking") "Visible reasoning")))))
@@ -1316,10 +1381,10 @@ experiment-runs branch, whose prefix they share."
                                           :model-provider "test" :model-name "m")))
         (set-call-error rec "provider returned status=429 too many requests")
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client))))
-              (span (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client))))
+              (span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
           (check "metadata-only: call_error is the category"
                  (equal (jget gen "call_error") "rate_limit"))
           (check "metadata-only: generation span status is the category"
@@ -1331,8 +1396,8 @@ experiment-runs branch, whose prefix they share."
       (let ((rec (start-tool-execution client :tool-name "search")))
         (set-result rec :error-message "provider returned status=429 too many requests")
         (recorder-end rec)
-        (let ((span (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client)))))
+        (let ((span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
           (check "metadata-only: tool span status is the category"
                  (equal (jget* span "status" "message") "rate_limit")))))
 
@@ -1346,8 +1411,8 @@ experiment-runs branch, whose prefix they share."
           (set-result rec :arguments "{\"q\":\"secret\"}"
                           :error-message "provider returned status=429 too many requests")
           (recorder-end rec)
-          (let* ((span (first (sigil-cl::queue-drain-all
-                               (sigil-cl::client-trace-queue client))))
+          (let* ((span (first (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-trace-queue client))))
                  (args (find "gen_ai.tool.call.arguments"
                              (coerce (jget span "attributes") 'list)
                              :key (lambda (a) (jget a "key")) :test #'equal)))
@@ -1364,8 +1429,8 @@ experiment-runs branch, whose prefix they share."
       (let ((rec (start-embedding client :model-provider "openai" :model-name "e")))
         (set-call-error rec "provider returned status=429 too many requests")
         (recorder-end rec)
-        (let ((span (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client)))))
+        (let ((span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
           (check "metadata-only: embedding span status is the category"
                  (equal (jget* span "status" "message") "rate_limit")))))
 
@@ -1377,8 +1442,8 @@ experiment-runs branch, whose prefix they share."
                                           :model-provider "test" :model-name "m")))
         (set-call-error rec "socket closed by peer")
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "metadata-only: unclassified error -> sdk_error"
                  (equal (jget gen "call_error") "sdk_error")))))
 
@@ -1390,8 +1455,8 @@ experiment-runs branch, whose prefix they share."
                                           :model-provider "test" :model-name "m"
                                           :parent-generation-ids '("gen-aaa" "gen-bbb"))))
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "parent_generation_ids present"
                  (= (length (jget gen "parent_generation_ids")) 2))
           (check "parent_generation_ids first"
@@ -1406,8 +1471,8 @@ experiment-runs branch, whose prefix they share."
                                           :model-provider "test" :model-name "m")))
         (set-result rec :parent-generation-ids '("gen-ccc"))
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "parent_generation_ids via set-result"
                  (= (length (jget gen "parent_generation_ids")) 1))
           (check "parent_generation_ids set-result value"
@@ -1419,8 +1484,8 @@ experiment-runs branch, whose prefix they share."
       (let ((rec (start-generation client :mode :sync
                                           :model-provider "test" :model-name "m")))
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "no parent_generation_ids when omitted"
                  (null (jget gen "parent_generation_ids"))))))
 
@@ -1431,8 +1496,8 @@ experiment-runs branch, whose prefix they share."
                                           :model-provider "test" :model-name "m")))
         (set-result rec :usage (make-token-usage :input 100 :output 50 :total 200))
         (recorder-end rec)
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
           (check "total_tokens preserves explicit value"
                  (= (jget* gen "usage" "total_tokens") 200)))))
 
@@ -1448,8 +1513,8 @@ experiment-runs branch, whose prefix they share."
                                                                                :name "search"
                                                                                :input-json "{\"q\":\"test\"}")))))))
         (recorder-end rec)
-        (let* ((gen (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-generation-queue client))))
+        (let* ((gen (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-generation-queue client))))
                (input-msg (aref (jget gen "input") 0))
                (tc-part (aref (jget input-msg "parts") 0))
                (input-json (jget* tc-part "tool_call" "input_json")))
@@ -1469,8 +1534,8 @@ experiment-runs branch, whose prefix they share."
                           :result "found it"
                           :duration-seconds 0.5d0)
           (recorder-end rec)
-          (let ((span (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-trace-queue client)))))
+          (let ((span (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-trace-queue client)))))
             (check "tool span enqueued" (not (null span)))
             (check "tool span parent" (equal (jget span "parentSpanId") "parent-span"))
             (check "tool span trace" (equal (jget span "traceId") "parent-trace"))
@@ -1487,8 +1552,8 @@ experiment-runs branch, whose prefix they share."
         (set-result rec :input-count 5 :input-tokens 100 :dimensions 1536
                         :duration-seconds 0.2d0)
         (recorder-end rec)
-        (let ((span (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client)))))
+        (let ((span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
           (check "embedding span enqueued" (not (null span)))
           (check "embedding span name"
                  (search "embeddings" (jget span "name")))
@@ -1510,8 +1575,8 @@ experiment-runs branch, whose prefix they share."
                    :model-name "text-embedding-3-small")))
         (set-result rec :input-count 5 :input-tokens 100)
         (recorder-end rec)
-        (let ((span (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client)))))
+        (let ((span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
           (check "embedding span omits dimension.count when unset"
                  (loop for a across (jget span "attributes")
                        never (equal (jget a "key")
@@ -1530,8 +1595,8 @@ experiment-runs branch, whose prefix they share."
         (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc-1")))
           (set-result rec :error-message "request timed out")
           (recorder-end rec)
-          (let ((span (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-trace-queue client)))))
+          (let ((span (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-trace-queue client)))))
             (check "tool error span: error.type"
                    (equal (span-attr span "error.type") "tool_execution_error"))
             (check "tool error span: error.category"
@@ -1542,8 +1607,8 @@ experiment-runs branch, whose prefix they share."
         (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc-1")))
           (set-result rec :result "ok")
           (recorder-end rec)
-          (let ((span (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-trace-queue client)))))
+          (let ((span (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-trace-queue client)))))
             (check "tool success span: no error.type"
                    (null (span-attr span "error.type")))
             (check "tool success span: no error.category"
@@ -1555,8 +1620,8 @@ experiment-runs branch, whose prefix they share."
                                            :model-name "text-embedding-3-small")))
           (set-call-error rec "provider returned status=429 too many requests")
           (recorder-end rec)
-          (let ((span (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-trace-queue client)))))
+          (let ((span (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-trace-queue client)))))
             (check "embedding error span: error.type"
                    (equal (span-attr span "error.type") "provider_call_error"))
             (check "embedding error span: error.category"
@@ -1568,8 +1633,8 @@ experiment-runs branch, whose prefix they share."
                                            :model-name "text-embedding-3-small")))
           (set-result rec :input-count 1 :input-tokens 10)
           (recorder-end rec)
-          (let ((span (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-trace-queue client)))))
+          (let ((span (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-trace-queue client)))))
             (check "embedding success span: no error.category"
                    (null (span-attr span "error.category")))))))
 
@@ -1615,8 +1680,8 @@ experiment-runs branch, whose prefix they share."
                                    :input-texts input-texts
                                    :duration-seconds 0.1d0)
                    (recorder-end rec)
-                   (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-trace-queue client)))))))
+                   (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-trace-queue client)))))))
 
       ;; Capture gating
       (check "embedding input_texts absent when capture disabled"
@@ -1709,7 +1774,7 @@ experiment-runs branch, whose prefix they share."
                     "3072"))
       (check "embedding source attribute preserved"
              (equal (string-attr (embedding-span :source "openai")
-                                 "sigil.embeddings.source")
+                                 "agento11y.embeddings.source")
                     "openai")))))
 
 (defun run-redaction-tests ()
@@ -1717,11 +1782,11 @@ experiment-runs branch, whose prefix they share."
     (let* ((anthropic-key (format nil "sk-ant-api03-~aAA"
                                   (make-string 93 :initial-element #\a)))
            (conn-string "postgres://user:pw@db.example.com:5432/app")
-           (redactor   (sigil-cl::make-secret-redactor))
-           (no-email   (sigil-cl::make-secret-redactor :include-emails nil)))
+           (redactor   (agento11y-cl::make-secret-redactor))
+           (no-email   (agento11y-cl::make-secret-redactor :include-emails nil)))
 
       ;; --- Direct engine: redact-light ---
-      (let ((out (sigil-cl::redact-light redactor
+      (let ((out (agento11y-cl::redact-light redactor
                                          (format nil "key is ~a done" anthropic-key))))
         (check "redact-light: anthropic key redacted"
                (search "[REDACTED:anthropic-api-key]" out))
@@ -1730,12 +1795,12 @@ experiment-runs branch, whose prefix they share."
                (and (search "key is " out) (search " done" out))))
 
       ;; --- Direct engine: redact-light does NOT apply tier-2 env heuristic ---
-      (let ((out (sigil-cl::redact-light redactor "API_KEY=hunter2plaintextvalue")))
+      (let ((out (agento11y-cl::redact-light redactor "API_KEY=hunter2plaintextvalue")))
         (check "redact-light: tier-2 env value left untouched"
                (equal out "API_KEY=hunter2plaintextvalue")))
 
       ;; --- Direct engine: redact-full applies tier-2 env heuristic ---
-      (let ((out (sigil-cl::redact-full redactor "API_KEY=hunter2plaintextvalue")))
+      (let ((out (agento11y-cl::redact-full redactor "API_KEY=hunter2plaintextvalue")))
         (check "redact-full: env value redacted"
                (search "[REDACTED:env-secret-value]" out))
         (check "redact-full: env assignment prefix preserved"
@@ -1746,22 +1811,22 @@ experiment-runs branch, whose prefix they share."
       ;; --- Direct engine: email opt-out ---
       (check "redact-light: email redacted by default"
              (search "[REDACTED:email]"
-                     (sigil-cl::redact-light redactor "ping alice@example.com now")))
+                     (agento11y-cl::redact-light redactor "ping alice@example.com now")))
       (check "redact-light: email preserved when opted out"
              (search "alice@example.com"
-                     (sigil-cl::redact-light no-email "ping alice@example.com now")))
+                     (agento11y-cl::redact-light no-email "ping alice@example.com now")))
 
       ;; --- apply-secret-redaction guards ---
       (check "apply-secret-redaction: nil redactor is a no-op"
-             (equal (sigil-cl::apply-secret-redaction nil :full anthropic-key)
+             (equal (agento11y-cl::apply-secret-redaction nil :full anthropic-key)
                     anthropic-key))
       (check "apply-secret-redaction: :none mode is a no-op"
-             (equal (sigil-cl::apply-secret-redaction redactor :none anthropic-key)
+             (equal (agento11y-cl::apply-secret-redaction redactor :none anthropic-key)
                     anthropic-key))
       (check "apply-secret-redaction: empty string is a no-op"
-             (equal (sigil-cl::apply-secret-redaction redactor :full "") ""))
+             (equal (agento11y-cl::apply-secret-redaction redactor :full "") ""))
       (check "apply-secret-redaction: fails closed to a marker on engine error"
-             (equal (sigil-cl::apply-secret-redaction redactor :bogus-mode "leak me")
+             (equal (agento11y-cl::apply-secret-redaction redactor :bogus-mode "leak me")
                     "[REDACTED]"))
 
       ;; --- Serialization: system prompt redacted under :full ---
@@ -1773,8 +1838,8 @@ experiment-runs branch, whose prefix they share."
                                             :system-prompt
                                             (format nil "Connect via ~a please" conn-string))))
           (recorder-end rec)
-          (let ((gen (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-generation-queue client)))))
+          (let ((gen (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-generation-queue client)))))
             (check "full: system prompt connection string redacted"
                    (search "[REDACTED:connection-string]" (jget gen "system_prompt")))
             (check "full: system prompt non-secret text preserved"
@@ -1795,8 +1860,8 @@ experiment-runs branch, whose prefix they share."
                                                    :role :user
                                                    :parts (list (make-text-part anthropic-key)))))))
           (recorder-end rec)
-          (let ((gen (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-generation-queue client)))))
+          (let ((gen (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-generation-queue client)))))
             (check "mws: system prompt redacted"
                    (search "[REDACTED:connection-string]" (jget gen "system_prompt")))
             (check "mws: message text still blanked by capture mode"
@@ -1815,8 +1880,8 @@ experiment-runs branch, whose prefix they share."
                                  :parts (list (make-text-part
                                                (format nil "here: ~a" anthropic-key))))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (text (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")))
             (check "full: assistant output secret redacted"
                    (search "[REDACTED:anthropic-api-key]" text))
@@ -1837,8 +1902,8 @@ experiment-runs branch, whose prefix they share."
                                                :name "env"
                                                :content "API_KEY=hunter2plaintextvalue")))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (content (jget* (aref (jget (aref (jget gen "output") 0) "parts") 0)
                                  "tool_result" "content")))
             (check "full: tool result env value redacted"
@@ -1863,8 +1928,8 @@ experiment-runs branch, whose prefix they share."
                                  :role :assistant
                                  :parts (list (make-text-part anthropic-key)))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (in-text (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text"))
                  (out-text (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")))
             (check "gating off: input secret NOT redacted"
@@ -1884,8 +1949,8 @@ experiment-runs branch, whose prefix they share."
                                                    :parts (list (make-text-part
                                                                  (format nil "use ~a ok" anthropic-key))))))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (in-text (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text")))
             (check "gating on: input secret redacted"
                    (search "[REDACTED:anthropic-api-key]" in-text))
@@ -1904,8 +1969,8 @@ experiment-runs branch, whose prefix they share."
                                  :role :assistant
                                  :parts (list (make-text-part anthropic-key)))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (text (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")))
             (check "disabled: system prompt untouched"
                    (search conn-string (jget gen "system_prompt")))
@@ -1928,8 +1993,8 @@ experiment-runs branch, whose prefix they share."
                                                :name "env"
                                                :content "API_KEY=hunter2plaintextvalue")))))
           (recorder-end rec)
-          (let* ((gen (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-generation-queue client))))
+          (let* ((gen (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-generation-queue client))))
                  (content (jget* (aref (jget (aref (jget gen "output") 0) "parts") 0)
                                  "tool_result" "content")))
             (check "blanked mode: tool result blanked, not redacted"
@@ -1938,39 +2003,39 @@ experiment-runs branch, whose prefix they share."
 (defun run-workflow-step-tests ()
   (with-test-suite ("WorkflowStep")
     ;; Util: generate-workflow-step-id
-    (let ((id (sigil-cl::generate-workflow-step-id)))
+    (let ((id (agento11y-cl::generate-workflow-step-id)))
       (check "wfs id starts with wfs_"
              (and (stringp id) (eql 0 (search "wfs_" id))))
       (check "wfs id unique"
-             (not (equal id (sigil-cl::generate-workflow-step-id)))))
+             (not (equal id (agento11y-cl::generate-workflow-step-id)))))
 
     ;; Auto-generated IDs and started-at
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled t)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client
+      (let ((rec (agento11y-cl::start-workflow-step client
                    :conversation-id "conv-1"
                    :step-name "classify")))
-        (check "wfs has step-id" (search "wfs_" (sigil-cl::wfs-rec-step-id rec)))
+        (check "wfs has step-id" (search "wfs_" (agento11y-cl::wfs-rec-step-id rec)))
         (check "wfs has 32-hex trace-id"
-               (= (length (sigil-cl::wfs-rec-trace-id rec)) 32))
+               (= (length (agento11y-cl::wfs-rec-trace-id rec)) 32))
         (check "wfs has 16-hex span-id"
-               (= (length (sigil-cl::wfs-rec-span-id rec)) 16))
+               (= (length (agento11y-cl::wfs-rec-span-id rec)) 16))
         (check "wfs has started-at"
-               (and (stringp (sigil-cl::recorder-started-at rec))
-                    (plusp (length (sigil-cl::recorder-started-at rec)))))))
+               (and (stringp (agento11y-cl::recorder-started-at rec))
+                    (plusp (length (agento11y-cl::recorder-started-at rec)))))))
 
     ;; set-result mutates slots
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled t)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client
+      (let ((rec (agento11y-cl::start-workflow-step client
                    :conversation-id "conv-1"
                    :step-name "classify")))
         (let ((in (jobj "x" 1))
               (out (jobj "y" 2))
               (md (jobj "k" "v")))
-          (sigil-cl::set-result rec
+          (agento11y-cl::set-result rec
                                 :input-state in
                                 :output-state out
                                 :metadata md
@@ -1978,24 +2043,24 @@ experiment-runs branch, whose prefix they share."
                                 :linked-generation-ids '("gen_a" "gen_b")
                                 :parent-step-ids '("wfs_prev")
                                 :duration-seconds 0.25d0)
-          (check "set-result: input-state" (eq (sigil-cl::wfs-rec-input-state rec) in))
-          (check "set-result: output-state" (eq (sigil-cl::wfs-rec-output-state rec) out))
-          (check "set-result: metadata" (eq (sigil-cl::wfs-rec-metadata rec) md))
+          (check "set-result: input-state" (eq (agento11y-cl::wfs-rec-input-state rec) in))
+          (check "set-result: output-state" (eq (agento11y-cl::wfs-rec-output-state rec) out))
+          (check "set-result: metadata" (eq (agento11y-cl::wfs-rec-metadata rec) md))
           (check "set-result: tags"
-                 (equal (sigil-cl::wfs-rec-tags rec) '(("env" . "prod"))))
+                 (equal (agento11y-cl::wfs-rec-tags rec) '(("env" . "prod"))))
           (check "set-result: linked-generation-ids"
-                 (equal (sigil-cl::wfs-rec-linked-generation-ids rec)
+                 (equal (agento11y-cl::wfs-rec-linked-generation-ids rec)
                         '("gen_a" "gen_b")))
           (check "set-result: parent-step-ids"
-                 (equal (sigil-cl::wfs-rec-parent-step-ids rec) '("wfs_prev")))
+                 (equal (agento11y-cl::wfs-rec-parent-step-ids rec) '("wfs_prev")))
           (check "set-result: duration-seconds"
-                 (= (sigil-cl::wfs-rec-duration-seconds rec) 0.25d0)))))
+                 (= (agento11y-cl::wfs-rec-duration-seconds rec) 0.25d0)))))
 
     ;; recorder-end enqueues to both queues
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled t)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client
+      (let ((rec (agento11y-cl::start-workflow-step client
                    :conversation-id "conv-1"
                    :step-name "classify"
                    :framework "custom"
@@ -2003,10 +2068,10 @@ experiment-runs branch, whose prefix they share."
                    :agent-version "v1"
                    :parent-step-ids '("wfs_prev")
                    :linked-generation-ids '("gen_a"))))
-        (sigil-cl::recorder-end rec)
+        (agento11y-cl::recorder-end rec)
         ;; Workflow queue payload
-        (let ((wfs (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-workflow-queue client)))))
+        (let ((wfs (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-workflow-queue client)))))
           (check "wfs payload enqueued" (not (null wfs)))
           (check "wfs payload id non-empty"
                  (and (stringp (jget wfs "id")) (plusp (length (jget wfs "id")))))
@@ -2037,8 +2102,8 @@ experiment-runs branch, whose prefix they share."
                  (and (vectorp (jget wfs "linked_generation_ids"))
                       (equal (aref (jget wfs "linked_generation_ids") 0) "gen_a"))))
         ;; Trace queue span
-        (let ((span (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-trace-queue client)))))
+        (let ((span (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-trace-queue client)))))
           (check "wfs span enqueued" (not (null span)))
           (check "wfs span name"
                  (equal (jget span "name") "workflow_step classify"))
@@ -2048,11 +2113,11 @@ experiment-runs branch, whose prefix they share."
           (let* ((attrs (coerce (jget span "attributes") 'list))
                  (op (find "gen_ai.operation.name" attrs
                            :key (lambda (a) (jget a "key")) :test #'equal))
-                 (sname (find "sigil.workflow.step.name" attrs
+                 (sname (find "agento11y.workflow.step.name" attrs
                               :key (lambda (a) (jget a "key")) :test #'equal))
-                 (sid (find "sigil.workflow.step.id" attrs
+                 (sid (find "agento11y.workflow.step.id" attrs
                             :key (lambda (a) (jget a "key")) :test #'equal))
-                 (fw (find "sigil.workflow.framework" attrs
+                 (fw (find "agento11y.workflow.framework" attrs
                            :key (lambda (a) (jget a "key")) :test #'equal)))
             (check "wfs span op-name=workflow_step"
                    (equal (jget* op "value" "stringValue") "workflow_step"))
@@ -2068,41 +2133,41 @@ experiment-runs branch, whose prefix they share."
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled nil :traces-enabled t)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client
+      (let ((rec (agento11y-cl::start-workflow-step client
                    :conversation-id "c"
                    :step-name "noop")))
-        (sigil-cl::recorder-end rec)
+        (agento11y-cl::recorder-end rec)
         (check "disabled: no workflow payload"
-               (sigil-cl::queue-empty-p (sigil-cl::client-workflow-queue client)))
+               (agento11y-cl::queue-empty-p (agento11y-cl::client-workflow-queue client)))
         (check "disabled: traces still emitted"
-               (not (sigil-cl::queue-empty-p (sigil-cl::client-trace-queue client))))))
+               (not (agento11y-cl::queue-empty-p (agento11y-cl::client-trace-queue client))))))
 
     ;; Both disabled: nothing enqueued
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled nil :traces-enabled nil)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client
+      (let ((rec (agento11y-cl::start-workflow-step client
                    :conversation-id "c"
                    :step-name "noop")))
-        (sigil-cl::recorder-end rec)
+        (agento11y-cl::recorder-end rec)
         (check "both disabled: no workflow payload"
-               (sigil-cl::queue-empty-p (sigil-cl::client-workflow-queue client)))
+               (agento11y-cl::queue-empty-p (agento11y-cl::client-workflow-queue client)))
         (check "both disabled: no trace span"
-               (sigil-cl::queue-empty-p (sigil-cl::client-trace-queue client)))))
+               (agento11y-cl::queue-empty-p (agento11y-cl::client-trace-queue client)))))
 
     ;; Error path: error-message via set-call-error
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled t :capture :full)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client
+      (let ((rec (agento11y-cl::start-workflow-step client
                    :conversation-id "c"
                    :step-name "boom")))
-        (sigil-cl::set-call-error rec "kaboom")
-        (sigil-cl::recorder-end rec)
-        (let ((wfs (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-workflow-queue client))))
-              (span (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-trace-queue client)))))
+        (agento11y-cl::set-call-error rec "kaboom")
+        (agento11y-cl::recorder-end rec)
+        (let ((wfs (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-workflow-queue client))))
+              (span (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-trace-queue client)))))
           (check "error path: wfs error field"
                  (equal (jget wfs "error") "kaboom"))
           (check "error path: span status code = 2 (ERROR)"
@@ -2113,15 +2178,15 @@ experiment-runs branch, whose prefix they share."
       (multiple-value-bind (client get-requests)
           (make-test-client :workflow-steps-enabled t :capture mode)
         (declare (ignore get-requests))
-        (let ((rec (sigil-cl::start-workflow-step client
+        (let ((rec (agento11y-cl::start-workflow-step client
                      :conversation-id "c"
                      :step-name "s"
                      :input-state (jobj "secret" "in")
                      :output-state (jobj "secret" "out"))))
-          (sigil-cl::set-call-error rec "boom")
-          (sigil-cl::recorder-end rec)
-          (let ((wfs (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-workflow-queue client)))))
+          (agento11y-cl::set-call-error rec "boom")
+          (agento11y-cl::recorder-end rec)
+          (let ((wfs (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-workflow-queue client)))))
             (check (format nil "~a: error reduced to its category" mode)
                    (equal (jget wfs "error") "sdk_error"))
             (check (format nil "~a: input_state omitted" mode)
@@ -2133,15 +2198,15 @@ experiment-runs branch, whose prefix they share."
     (multiple-value-bind (client get-requests)
         (make-test-client :workflow-steps-enabled t :capture :metadata-only)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client
+      (let ((rec (agento11y-cl::start-workflow-step client
                    :conversation-id "c" :step-name "s")))
-        (sigil-cl::set-result rec
+        (agento11y-cl::set-result rec
                               :error-message "provider returned status=429 slow down")
-        (sigil-cl::recorder-end rec)
-        (let ((wfs (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-workflow-queue client))))
-              (span (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-trace-queue client)))))
+        (agento11y-cl::recorder-end rec)
+        (let ((wfs (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-workflow-queue client))))
+              (span (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-trace-queue client)))))
           (check "metadata-only: workflow error is the category"
                  (equal (jget wfs "error") "rate_limit"))
           (check "metadata-only: workflow span status is the category"
@@ -2153,15 +2218,15 @@ experiment-runs branch, whose prefix they share."
       (declare (ignore get-requests))
       (let ((in (jobj "x" 1))
             (out (jobj "y" 2)))
-        (let ((rec (sigil-cl::start-workflow-step client
+        (let ((rec (agento11y-cl::start-workflow-step client
                      :conversation-id "c"
                      :step-name "s"
                      :input-state in
                      :output-state out)))
-          (sigil-cl::set-call-error rec "boom")
-          (sigil-cl::recorder-end rec)
-          (let ((wfs (first (sigil-cl::queue-drain-all
-                              (sigil-cl::client-workflow-queue client)))))
+          (agento11y-cl::set-call-error rec "boom")
+          (agento11y-cl::recorder-end rec)
+          (let ((wfs (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-workflow-queue client)))))
             (check ":full: error verbatim" (equal (jget wfs "error") "boom"))
             (check ":full: input_state present" (eq (jget wfs "input_state") in))
             (check ":full: output_state present" (eq (jget wfs "output_state") out))))))
@@ -2175,13 +2240,13 @@ experiment-runs branch, whose prefix they share."
             (wfs-trace-id nil))
         (with-workflow-step (wfs client :conversation-id "conv-1"
                                          :step-name "wrapper")
-          (setf wfs-span-id (sigil-cl::wfs-rec-span-id wfs))
-          (setf wfs-trace-id (sigil-cl::wfs-rec-trace-id wfs))
+          (setf wfs-span-id (agento11y-cl::wfs-rec-span-id wfs))
+          (setf wfs-trace-id (agento11y-cl::wfs-rec-trace-id wfs))
           (with-generation (gen client :mode :sync :model-provider "p" :model-name "m")
-            (sigil-cl::set-result gen :usage (make-token-usage :input 1 :output 1))))
+            (agento11y-cl::set-result gen :usage (make-token-usage :input 1 :output 1))))
         ;; Drain trace queue: we expect at least 2 spans (gen + wfs)
-        (let* ((spans (sigil-cl::queue-drain-all
-                        (sigil-cl::client-trace-queue client)))
+        (let* ((spans (agento11y-cl::queue-drain-all
+                        (agento11y-cl::client-trace-queue client)))
                (gen-span (find-if (lambda (s)
                                     (search "generateText" (jget s "name")))
                                   spans))
@@ -2201,12 +2266,12 @@ experiment-runs branch, whose prefix they share."
     (multiple-value-bind (client get-requests)
         (make-test-client :traces-enabled t :generation-enabled nil)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-generation client :mode :sync
+      (let ((rec (agento11y-cl::start-generation client :mode :sync
                                               :model-provider "p"
                                               :model-name "m")))
-        (sigil-cl::recorder-end rec)
-        (let ((span (first (sigil-cl::queue-drain-all
-                             (sigil-cl::client-trace-queue client)))))
+        (agento11y-cl::recorder-end rec)
+        (let ((span (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-trace-queue client)))))
           (check "standalone: gen span has no parent"
                  (null (jget span "parentSpanId")))
           (check "standalone: gen trace-id is fresh 32-hex"
@@ -2226,7 +2291,7 @@ experiment-runs branch, whose prefix they share."
                (not (null wfs-req)))
         (check "HTTP: URL exact match"
                (equal (first wfs-req)
-                      "http://test-sigil:4318/api/v1/workflow-steps:export"))
+                      "http://test-agento11y:4318/api/v1/workflow-steps:export"))
         (let ((parsed (jzon:parse (second wfs-req))))
           (check "HTTP: body has workflow_steps array"
                  (vectorp (jget parsed "workflow_steps")))
@@ -2318,7 +2383,7 @@ experiment-runs branch, whose prefix they share."
       (let ((rec (start-generation client :mode :sync)))
         (recorder-end rec)
         (check "noop: generation queue empty"
-               (sigil-cl::queue-empty-p (sigil-cl::client-generation-queue client)))))
+               (agento11y-cl::queue-empty-p (agento11y-cl::client-generation-queue client)))))
 
     ;; Flush drains queues
     (multiple-value-bind (client get-requests) (make-test-client)
@@ -2328,9 +2393,9 @@ experiment-runs branch, whose prefix they share."
         (recorder-end rec))
       (client-flush client)
       (check "flush: generation queue empty"
-             (sigil-cl::queue-empty-p (sigil-cl::client-generation-queue client)))
+             (agento11y-cl::queue-empty-p (agento11y-cl::client-generation-queue client)))
       (check "flush: trace queue empty"
-             (sigil-cl::queue-empty-p (sigil-cl::client-trace-queue client)))
+             (agento11y-cl::queue-empty-p (agento11y-cl::client-trace-queue client)))
       (check "flush: HTTP requests made" (plusp (length (funcall get-requests)))))
 
     ;; Endpoint URL not doubled
@@ -2342,25 +2407,25 @@ experiment-runs branch, whose prefix they share."
       (let* ((reqs (funcall get-requests))
              (gen-req (find "generations:export" reqs :key #'first :test #'search)))
         (check "endpoint URL uses configured URL directly"
-               (equal (first gen-req) "http://test-sigil:4318/api/v1/generations:export"))))
+               (equal (first gen-req) "http://test-agento11y:4318/api/v1/generations:export"))))
 
     ;; Start/shutdown lifecycle
     (multiple-value-bind (client get-requests) (make-test-client)
       (declare (ignore get-requests))
       (client-start client)
-      (check "client started" (sigil-cl::client-running-p client))
+      (check "client started" (agento11y-cl::client-running-p client))
       (check "worker thread alive"
-             (bt2:thread-alive-p (sigil-cl::client-worker-thread client)))
+             (bt2:thread-alive-p (agento11y-cl::client-worker-thread client)))
       ;; Double start should be a no-op
-      (let ((thread1 (sigil-cl::client-worker-thread client)))
+      (let ((thread1 (agento11y-cl::client-worker-thread client)))
         (client-start client)
         (check "double start: same thread"
-               (eq thread1 (sigil-cl::client-worker-thread client))))
+               (eq thread1 (agento11y-cl::client-worker-thread client))))
       (client-shutdown client :timeout-sec 2)
-      (check "client stopped" (not (sigil-cl::client-running-p client)))
-      (check "worker thread nil" (null (sigil-cl::client-worker-thread client))))
+      (check "client stopped" (not (agento11y-cl::client-running-p client)))
+      (check "worker thread nil" (null (agento11y-cl::client-worker-thread client))))
 
-    ;; Client config tags promoted onto the generation span as sigil.tag.*
+    ;; Client config tags promoted onto the generation span as agento11y.tag.*
     (flet ((span-attr (span key)
              (let ((found nil))
                (loop for a across (jget span "attributes")
@@ -2376,14 +2441,14 @@ experiment-runs branch, whose prefix they share."
                                             :model-provider "openai" :model-name "gpt-4")))
           (set-result rec :usage (make-token-usage :input 10 :output 5))
           (recorder-end rec))
-        (let ((span (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client)))))
-          (check "span: sigil.tag.env present"
-                 (equal (span-attr span "sigil.tag.env") "prod"))
-          (check "span: sigil.tag.team present"
-                 (equal (span-attr span "sigil.tag.team") "ai"))
+        (let ((span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
+          (check "span: agento11y.tag.env present"
+                 (equal (span-attr span "agento11y.tag.env") "prod"))
+          (check "span: agento11y.tag.team present"
+                 (equal (span-attr span "agento11y.tag.team") "ai"))
           (check "span: invalid tag cons skipped"
-                 (null (span-attr span "sigil.tag.1"))))))
+                 (null (span-attr span "agento11y.tag.1"))))))
 
     ;; Cache-write span attr renamed; JSON payload keeps cache_creation_input_tokens
     (flet ((span-int-attr (span key)
@@ -2398,10 +2463,10 @@ experiment-runs branch, whose prefix they share."
                                             :model-provider "anthropic" :model-name "claude")))
           (set-result rec :usage (make-token-usage :input 10 :output 5 :cache-creation 7))
           (recorder-end rec))
-        (let ((gen (first (sigil-cl::queue-drain-all
-                           (sigil-cl::client-generation-queue client))))
-              (span (first (sigil-cl::queue-drain-all
-                            (sigil-cl::client-trace-queue client)))))
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client))))
+              (span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
           (check "span: cache_write_input_tokens set"
                  (equal (span-int-attr span "gen_ai.usage.cache_write_input_tokens") "7"))
           (check "span: no cache_creation_input_tokens attr"
@@ -2418,7 +2483,7 @@ experiment-runs branch, whose prefix they share."
         (with-generation (r client :mode :sync :model-provider "t" :model-name "m")
           (setf rec r)
           (set-result r :usage (make-token-usage :input 1 :output 1)))
-        (check "with-generation: ended" (sigil-cl::recorder-ended-p rec))))
+        (check "with-generation: ended" (agento11y-cl::recorder-ended-p rec))))
 
     ;; with-generation on error still ends
     (multiple-value-bind (client get-requests) (make-test-client)
@@ -2429,7 +2494,7 @@ experiment-runs branch, whose prefix they share."
               (setf rec r)
               (error "boom"))
           (error () nil))
-        (check "with-generation: ended on error" (sigil-cl::recorder-ended-p rec))))
+        (check "with-generation: ended on error" (agento11y-cl::recorder-ended-p rec))))
 
     ;; with-generation binds *trace-context*
     (multiple-value-bind (client get-requests) (make-test-client)
@@ -2458,7 +2523,7 @@ experiment-runs branch, whose prefix they share."
                                  :env-fn (constantly nil))))
         (with-span (client "test-op")
           nil)
-        (let* ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client)))
+        (let* ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client)))
                (span (first spans)))
           (check "with-span: agent-name wins over service-name"
                  (equal (span-attr span "gen_ai.agent.name") "router"))
@@ -2472,7 +2537,7 @@ experiment-runs branch, whose prefix they share."
                                  :env-fn (constantly nil))))
         (with-span (client "test-op")
           nil)
-        (let* ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client)))
+        (let* ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client)))
                (span (first spans)))
           (check "with-span: falls back to service-name"
                  (equal (span-attr span "gen_ai.agent.name") "legacy-app"))
@@ -2497,10 +2562,10 @@ experiment-runs branch, whose prefix they share."
           w)
         (with-span (client "rerank")
           nil)
-        (let ((spans (sigil-cl::queue-drain-all (sigil-cl::client-trace-queue client))))
+        (let ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
           (check "all span kinds enqueued" (= (length spans) 5))
-          (check "every span carries sigil.tag.env"
-                 (every (lambda (s) (equal (span-attr s "sigil.tag.env") "prod"))
+          (check "every span carries agento11y.tag.env"
+                 (every (lambda (s) (equal (span-attr s "agento11y.tag.env") "prod"))
                         spans)))))
 
     ;; --- Telemetry context: capture and rebind ---
@@ -2575,7 +2640,7 @@ experiment-runs branch, whose prefix they share."
              (eq (second seen) wrap-trace))
       ;; And on a child thread, which starts at the global NIL values.
       (let ((from-child (bt2:join-thread
-                         (bt2:make-thread thunk :name "sigil-test-wrap-time"))))
+                         (bt2:make-thread thunk :name "agento11y-test-wrap-time"))))
         (check "telemetry-context-thunk carries the wrap-time run onto a child thread"
                (eq (first from-child) wrap-run))
         (check "telemetry-context-thunk carries the wrap-time trace onto a child thread"
@@ -2597,7 +2662,7 @@ experiment-runs branch, whose prefix they share."
             (conversation-id nil)
             (child-rec nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :traces-enabled nil
                               :http-fn (routed-http calls "exp-threads"))
           (declare (ignore get-requests))
@@ -2619,7 +2684,7 @@ experiment-runs branch, whose prefix they share."
                                         :model-name "gpt-4")))
                               (recorder-end rec)
                               rec)))
-                        :name "sigil-test-child-generation")))
+                        :name "agento11y-test-child-generation")))
                 ;; Control: same thread constructor, no context carried.
                 (bt2:join-thread
                  (bt2:make-thread
@@ -2629,7 +2694,7 @@ experiment-runs branch, whose prefix they share."
                                                     :generation-id "generation-orphan"
                                                     :model-provider "openai"
                                                     :model-name "gpt-4")))
-                  :name "sigil-test-orphan-generation"))))
+                  :name "agento11y-test-orphan-generation"))))
             (setf conversation-id (experiment-run-active-conversation-id run)))
           (client-flush client))
         (check "child-thread generation is tracked by the run"
@@ -2642,7 +2707,7 @@ experiment-runs branch, whose prefix they share."
         (check "child-thread generation inherits the captured trace id"
                (equal (gen-rec-trace-id child-rec) "trace-parent"))
         (check "child-thread generation parents to the captured span"
-               (equal (sigil-cl::gen-rec-parent-span-id child-rec) "span-parent"))
+               (equal (agento11y-cl::gen-rec-parent-span-id child-rec) "span-parent"))
         (let ((carried (exported-generation calls "generation-child"))
               (orphan (exported-generation calls "generation-orphan")))
           (check "child-thread generation carries the run-id tag"
@@ -2659,7 +2724,7 @@ experiment-runs branch, whose prefix they share."
             (run-object nil)
             (child-id nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :traces-enabled nil
                               :http-fn (routed-http calls "exp-thunk"))
           (declare (ignore get-requests))
@@ -2679,7 +2744,7 @@ experiment-runs branch, whose prefix they share."
                     (*trace-context* nil))
                 (setf child-id
                       (bt2:join-thread
-                       (bt2:make-thread wrapped :name "sigil-test-wrapped"))))))
+                       (bt2:make-thread wrapped :name "agento11y-test-wrapped"))))))
           (client-flush client))
         (check "a wrapped thunk records the generation it was asked to"
                (equal child-id "generation-wrapped"))
@@ -2701,7 +2766,7 @@ experiment-runs branch, whose prefix they share."
             (wrapped nil)
             (run-object nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :traces-enabled nil
                               :http-fn (routed-http calls "exp-late")
                               :log-fn (lambda (level component message &rest kvs)
@@ -2720,7 +2785,7 @@ experiment-runs branch, whose prefix they share."
                                                      :model-name "gpt-4"))))))
           ;; Only what the late generation emits is counted.
           (setf logged nil)
-          (bt2:join-thread (bt2:make-thread wrapped :name "sigil-test-late"))
+          (bt2:join-thread (bt2:make-thread wrapped :name "agento11y-test-late"))
           (client-flush client))
         (check "a generation recorded after the run finalized is still tracked"
                (member "generation-late"
@@ -2736,7 +2801,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil))
             (logged nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :traces-enabled nil
                               :http-fn (routed-http calls "exp-in-time")
                               :log-fn (lambda (level component message &rest kvs)
@@ -2841,7 +2906,7 @@ experiment-runs branch, whose prefix they share."
     ;; media symbols are external
     (check "media symbols exported"
            (every (lambda (name)
-                    (multiple-value-bind (sym status) (find-symbol name :sigil-cl)
+                    (multiple-value-bind (sym status) (find-symbol name :agento11y-cl)
                       (and sym (eq status :external))))
                   '("MEDIA-PART" "MAKE-MEDIA-PART" "MEDIA-PART-KIND" "MEDIA-PART-URL"
                     "MEDIA-PART-MIME-TYPE" "MEDIA-PART-NAME" "MEDIA-PART-PROVIDER-TYPE")))
@@ -2962,7 +3027,7 @@ experiment-runs branch, whose prefix they share."
                                log-fn
                                (api-endpoint nil)
                                (generation-endpoint
-                                "https://sigil.example.com/api/v1/generations:export")
+                                "https://agento11y.example.com/api/v1/generations:export")
                                (hooks-config (make-hooks-config :enabled t))
                                (extra-headers nil)
                                (auth-mode :bearer)
@@ -3015,22 +3080,22 @@ experiment-runs branch, whose prefix they share."
 
     ;; --- Condition shape ---
     (handler-case
-        (error 'sigil-hook-denied-error
+        (error 'agento11y-hook-denied-error
                :message "denied"
                :rule-id "r1"
                :reason "PII"
                :evaluations nil)
-      (sigil-hook-denied-error (c)
+      (agento11y-hook-denied-error (c)
         (check "denied error rule-id"
-               (equal (sigil-hook-denied-error-rule-id c) "r1"))
+               (equal (agento11y-hook-denied-error-rule-id c) "r1"))
         (check "denied error reason"
-               (equal (sigil-hook-denied-error-reason c) "PII"))))
+               (equal (agento11y-hook-denied-error-reason c) "PII"))))
 
     (handler-case
-        (error 'sigil-hook-transport-error :message "boom")
-      (sigil-hook-transport-error (c)
+        (error 'agento11y-hook-transport-error :message "boom")
+      (agento11y-hook-transport-error (c)
         (check "transport error message"
-               (search "boom" (sigil-error-message c)))))
+               (search "boom" (agento11y-error-message c)))))
 
     ;; --- Disabled hooks short-circuit to allow ---
     (let* ((called 0)
@@ -3073,7 +3138,7 @@ experiment-runs branch, whose prefix they share."
     (let* ((captured-url nil)
            (client (%make-hook-client
                     :generation-endpoint
-                    "https://sigil.example.com/api/v1/generations:export"
+                    "https://agento11y.example.com/api/v1/generations:export"
                     :api-endpoint nil
                     :http-fn (lambda (url &key headers content)
                                (declare (ignore headers content))
@@ -3083,7 +3148,7 @@ experiment-runs branch, whose prefix they share."
       (declare (ignore resp))
       (check "URL falls back to host root + /api/v1/hooks:evaluate"
              (equal captured-url
-                    "https://sigil.example.com/api/v1/hooks:evaluate")))
+                    "https://agento11y.example.com/api/v1/hooks:evaluate")))
 
     ;; --- API endpoint takes precedence over generation-endpoint ---
     (let* ((captured-url nil)
@@ -3100,7 +3165,7 @@ experiment-runs branch, whose prefix they share."
              (equal captured-url
                     "https://hooks.example.com/api/v1/hooks:evaluate")))
 
-    ;; --- X-Sigil-Hook-Timeout-Ms header is sent ---
+    ;; --- X-Agento11y-Hook-Timeout-Ms header is sent ---
     (let* ((captured-headers nil)
            (client (%make-hook-client
                     :hooks-config (make-hooks-config :enabled t
@@ -3110,9 +3175,9 @@ experiment-runs branch, whose prefix they share."
                                (setf captured-headers headers)
                                (values "{\"action\":\"allow\"}" 200)))))
       (evaluate-hook client :phase :preflight)
-      (let ((hdr (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+      (let ((hdr (cdr (assoc "X-Agento11y-Hook-Timeout-Ms" captured-headers
                              :test #'string-equal))))
-        (check "X-Sigil-Hook-Timeout-Ms present"
+        (check "X-Agento11y-Hook-Timeout-Ms present"
                (and hdr (stringp hdr)))
         (check "timeout header value derived from timeout-sec (2.5s -> 2500)"
                (equal hdr "2500"))))
@@ -3127,7 +3192,7 @@ experiment-runs branch, whose prefix they share."
                                (setf captured-headers headers)
                                (values "{\"action\":\"allow\"}" 200)))))
       (evaluate-hook client :phase :preflight :timeout-sec 7.5)
-      (let ((hdr (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+      (let ((hdr (cdr (assoc "X-Agento11y-Hook-Timeout-Ms" captured-headers
                              :test #'string-equal))))
         (check ":timeout-sec keyword overrides config"
                (equal hdr "7500"))))
@@ -3152,7 +3217,7 @@ experiment-runs branch, whose prefix they share."
              (equal (cdr (assoc "Content-Type" captured-headers :test #'equal))
                     "application/json")))
 
-    ;; --- Deny response signals sigil-hook-denied-error ---
+    ;; --- Deny response signals agento11y-hook-denied-error ---
     (let ((client (%make-hook-client
                    :http-fn (lambda (&rest _) (declare (ignore _))
                               (values "{\"action\":\"deny\",\"rule_id\":\"r1\",\"reason\":\"PII\"}"
@@ -3160,11 +3225,11 @@ experiment-runs branch, whose prefix they share."
       (handler-case
           (progn (evaluate-hook client :phase :preflight)
                  (check "deny: signalled an error" nil))
-        (sigil-hook-denied-error (c)
+        (agento11y-hook-denied-error (c)
           (check "deny: rule-id surfaced"
-                 (equal (sigil-hook-denied-error-rule-id c) "r1"))
+                 (equal (agento11y-hook-denied-error-rule-id c) "r1"))
           (check "deny: reason surfaced"
-                 (equal (sigil-hook-denied-error-reason c) "PII")))))
+                 (equal (agento11y-hook-denied-error-reason c) "PII")))))
 
     ;; --- transformed_input parsed into hook-input ---
     (let* ((client (%make-hook-client
@@ -3186,7 +3251,7 @@ experiment-runs branch, whose prefix they share."
       (check "fail-open=t transport error -> allow"
              (eq (response-action resp) :allow)))
 
-    ;; --- Transport error + fail-open=nil -> sigil-hook-transport-error ---
+    ;; --- Transport error + fail-open=nil -> agento11y-hook-transport-error ---
     (let ((client (%make-hook-client
                    :hooks-config (make-hooks-config :enabled t :fail-open nil)
                    :http-fn (lambda (&rest _) (declare (ignore _))
@@ -3194,9 +3259,9 @@ experiment-runs branch, whose prefix they share."
       (handler-case
           (progn (evaluate-hook client :phase :preflight)
                  (check "fail-open=nil: signalled an error" nil))
-        (sigil-hook-transport-error (c)
+        (agento11y-hook-transport-error (c)
           (check "fail-open=nil: transport error signalled"
-                 (search "boom" (sigil-error-message c))))))
+                 (search "boom" (agento11y-error-message c))))))
 
     ;; --- 5xx status + fail-open=t -> allow ---
     (let* ((client (%make-hook-client
@@ -3207,7 +3272,7 @@ experiment-runs branch, whose prefix they share."
       (check "fail-open=t 5xx -> allow"
              (eq (response-action resp) :allow)))
 
-    ;; --- 5xx status + fail-open=nil -> sigil-hook-transport-error ---
+    ;; --- 5xx status + fail-open=nil -> agento11y-hook-transport-error ---
     (let ((client (%make-hook-client
                    :hooks-config (make-hooks-config :enabled t :fail-open nil)
                    :http-fn (lambda (&rest _) (declare (ignore _))
@@ -3215,7 +3280,7 @@ experiment-runs branch, whose prefix they share."
       (handler-case
           (progn (evaluate-hook client :phase :preflight)
                  (check "fail-open=nil 5xx: signalled an error" nil))
-        (sigil-hook-transport-error (c)
+        (agento11y-hook-transport-error (c)
           (declare (ignore c))
           (check "fail-open=nil 5xx: transport error signalled" t))))
 
@@ -3452,7 +3517,7 @@ experiment-runs branch, whose prefix they share."
                                (values "{\"action\":\"allow\"}" 200)))))
       (evaluate-hook client :phase :preflight)
       (check "zero configured timeout falls back to 15s"
-             (equal (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+             (equal (cdr (assoc "X-Agento11y-Hook-Timeout-Ms" captured-headers
                                 :test #'string-equal))
                     "15000")))
 
@@ -3465,7 +3530,7 @@ experiment-runs branch, whose prefix they share."
                                (values "{\"action\":\"allow\"}" 200)))))
       (evaluate-hook client :phase :preflight :timeout-sec -1)
       (check "negative :timeout-sec keyword falls back to the config value"
-             (equal (cdr (assoc "X-Sigil-Hook-Timeout-Ms" captured-headers
+             (equal (cdr (assoc "X-Agento11y-Hook-Timeout-Ms" captured-headers
                                 :test #'string-equal))
                     "2500")))
 
@@ -3523,15 +3588,15 @@ experiment-runs branch, whose prefix they share."
 
       ;; --- The thread-propagation API is public ---
       (check "*experiment-run* is exported"
-             (eq :external (nth-value 1 (find-symbol "*EXPERIMENT-RUN*" :sigil-cl))))
+             (eq :external (nth-value 1 (find-symbol "*EXPERIMENT-RUN*" :agento11y-cl))))
       (check "the telemetry context helpers are exported"
              (every (lambda (name)
-                      (eq :external (nth-value 1 (find-symbol name :sigil-cl))))
+                      (eq :external (nth-value 1 (find-symbol name :agento11y-cl))))
                     '("CAPTURE-TELEMETRY-CONTEXT"
                       "WITH-TELEMETRY-CONTEXT"
                       "TELEMETRY-CONTEXT-THUNK")))
       (check "*experiment-run* documents that a spawned thread sees NIL"
-             (let ((doc (documentation (find-symbol "*EXPERIMENT-RUN*" :sigil-cl)
+             (let ((doc (documentation (find-symbol "*EXPERIMENT-RUN*" :agento11y-cl)
                                        'variable)))
                (and doc
                     (search "spawned thread" doc)
@@ -3539,29 +3604,29 @@ experiment-runs branch, whose prefix they share."
 
       ;; --- Eval base derivation and URL generation ---
       (let ((cfg (make-config
-                  :generation-endpoint "https://sigil.example.test/api/v1/generations:export")))
+                  :generation-endpoint "https://agento11y.example.test/api/v1/generations:export")))
         (check "eval-base-url derives scheme and host from generation-endpoint"
-               (equal (sigil-cl::eval-base-url cfg) "https://sigil.example.test")))
+               (equal (agento11y-cl::eval-base-url cfg) "https://agento11y.example.test")))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test/ignored/path"
+          (make-test-client :eval-endpoint "https://agento11y.example.test/ignored/path"
                             :generation-enabled nil
                             :traces-enabled nil)
         (declare (ignore get-requests))
         (check "experiment-url default uses eval base"
                (equal (experiment-url client "exp-prompt-a")
-                      "https://sigil.example.test/a/grafana-sigil-app/evaluation/experiments/exp-prompt-a")))
+                      "https://agento11y.example.test/a/grafana-agento11y-app/evaluation/experiments/exp-prompt-a")))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :experiment-url-template "{base}/custom/{run_id}"
                             :generation-enabled nil
                             :traces-enabled nil)
         (declare (ignore get-requests))
         (check "experiment-url template replaces base and run_id"
                (equal (experiment-url client "exp-prompt-a")
-                      "https://sigil.example.test/custom/exp-prompt-a")))
-      (let* ((array (sigil-cl::%jsonify '("good" "bad")))
-             (object (sigil-cl::%jsonify '(("good" . "bad"))))
-             (nested (sigil-cl::%jsonify '(("tags" . ("good" "bad"))))))
+                      "https://agento11y.example.test/custom/exp-prompt-a")))
+      (let* ((array (agento11y-cl::%jsonify '("good" "bad")))
+             (object (agento11y-cl::%jsonify '(("good" . "bad"))))
+             (nested (agento11y-cl::%jsonify '(("tags" . ("good" "bad"))))))
         (check "%jsonify keeps plain string lists as arrays"
                (and (vectorp array)
                     (= (length array) 2)
@@ -3575,15 +3640,15 @@ experiment-runs branch, whose prefix they share."
                  (and (vectorp tags)
                       (equal (aref tags 0) "good")
                       (equal (aref tags 1) "bad")))))
-      (let ((plist (sigil-cl::%jsonify '(:question "what?" :n 2))))
+      (let ((plist (agento11y-cl::%jsonify '(:question "what?" :n 2))))
         (check "%jsonify turns a plist into an object"
                (and (hash-table-p plist)
                     (equal (jget plist "question") "what?")
                     (eql (jget plist "n") 2))))
       (check "%jsonify keeps an odd-length keyword list an array"
-             (vectorp (sigil-cl::%jsonify '(:a :b :c))))
+             (vectorp (agento11y-cl::%jsonify '(:a :b :c))))
       (check "%jsonify keeps a keyword-free list an array"
-             (vectorp (sigil-cl::%jsonify '("a" "b"))))
+             (vectorp (agento11y-cl::%jsonify '("a" "b"))))
 
       ;; stable-id matches the SHA-1-based StableID in the Go/Python SDKs.
       (check "stable-id matches reference SDKs"
@@ -3599,17 +3664,17 @@ experiment-runs branch, whose prefix they share."
       (let ((cfg (make-config :auth-mode :bearer :auth-password "gen-token"
                               :eval-auth-token "eval-token")))
         (check "eval auth token becomes bearer header"
-               (equal (cdr (assoc "Authorization" (sigil-cl::build-eval-auth-headers cfg)
+               (equal (cdr (assoc "Authorization" (agento11y-cl::build-eval-auth-headers cfg)
                                   :test #'equal))
                       "Bearer eval-token")))
       (let ((cfg (make-config :eval-auth-token "Bearer already")))
         (check "eval auth token keeps existing bearer prefix"
-               (equal (cdr (assoc "Authorization" (sigil-cl::build-eval-auth-headers cfg)
+               (equal (cdr (assoc "Authorization" (agento11y-cl::build-eval-auth-headers cfg)
                                   :test #'equal))
                       "Bearer already")))
       (let ((cfg (make-config :auth-mode :bearer :auth-password "gen-token")))
         (check "eval auth falls back to generation auth"
-               (equal (cdr (assoc "Authorization" (sigil-cl::build-eval-auth-headers cfg)
+               (equal (cdr (assoc "Authorization" (agento11y-cl::build-eval-auth-headers cfg)
                                   :test #'equal))
                       "Bearer gen-token")))
       (let ((cfg (make-config :auth-mode :none)))
@@ -3617,27 +3682,27 @@ experiment-runs branch, whose prefix they share."
                (equal (config-ingest-actor cfg) "ingest:sdk/lisp"))
         (check "eval auth headers carry the ingest actor"
                (equal (cdr (assoc "X-Agento11y-Ingest-Actor"
-                                  (sigil-cl::build-eval-auth-headers cfg) :test #'equal))
+                                  (agento11y-cl::build-eval-auth-headers cfg) :test #'equal))
                       "ingest:sdk/lisp"))
         (check "score export headers carry the ingest actor"
                (equal (cdr (assoc "X-Agento11y-Ingest-Actor"
-                                  (sigil-cl::build-score-export-headers cfg) :test #'equal))
+                                  (agento11y-cl::build-score-export-headers cfg) :test #'equal))
                       "ingest:sdk/lisp"))
         (check "no request uses the alternate actor header spelling"
                (and (null (assoc "X-Sigil-Ingest-Actor"
-                                 (sigil-cl::build-eval-auth-headers cfg) :test #'string-equal))
+                                 (agento11y-cl::build-eval-auth-headers cfg) :test #'string-equal))
                     (null (assoc "X-Sigil-Ingest-Actor"
-                                 (sigil-cl::build-score-export-headers cfg)
+                                 (agento11y-cl::build-score-export-headers cfg)
                                  :test #'string-equal)))))
       (let ((cfg (make-config :auth-mode :none :ingest-actor "")))
         (check "blank ingest actor sends no actor header"
                (null (assoc "X-Agento11y-Ingest-Actor"
-                            (sigil-cl::build-eval-auth-headers cfg) :test #'equal))))
+                            (agento11y-cl::build-eval-auth-headers cfg) :test #'equal))))
       ;; Every lifecycle request carries the configured actor value.
       (let ((actor-headers nil))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test"
+             :eval-endpoint "https://agento11y.example.test"
              :generation-enabled nil
              :traces-enabled nil
              :ingest-actor "ingest:sdk/custom"
@@ -3688,7 +3753,7 @@ experiment-runs branch, whose prefix they share."
                           (t (values "{}" 200)))))
           (declare (ignore get-requests))
           (upsert-experiment-run client :experiment-id "exp-auth" :name "auth")
-          (let ((run (sigil-cl::%make-experiment-run :client client
+          (let ((run (agento11y-cl::%make-experiment-run :client client
                                                     :run-id "exp-auth"
                                                     :name "auth")))
             (experiment-run-add-scores
@@ -3705,7 +3770,7 @@ experiment-runs branch, whose prefix they share."
                  (equal (cdr (assoc "Authorization" (second score-call) :test #'equal))
                         "Bearer test-token"))
           (check "score export uses generation host"
-                 (eql 0 (search "http://test-sigil:4318/api/v1/scores:export"
+                 (eql 0 (search "http://test-agento11y:4318/api/v1/scores:export"
                                 (first score-call))))))
 
       ;; --- Transport parsing, typed errors, and retry ---
@@ -3715,7 +3780,7 @@ experiment-runs branch, whose prefix they share."
                                          (declare (ignore url method headers content))
                                          (values "{\"ok\":true}" 200)))))
         (check "request-eval-json parses 2xx JSON body"
-               (eq (jget (sigil-cl::request-eval-json cfg :get "https://x" nil "ok")
+               (eq (jget (agento11y-cl::request-eval-json cfg :get "https://x" nil "ok")
                          "ok")
                    t)))
       (let ((cfg (make-config :auth-mode :none
@@ -3724,11 +3789,11 @@ experiment-runs branch, whose prefix they share."
                                          (declare (ignore url method headers content))
                                          (values "" 204)))))
         (check "request-eval-json returns empty object for empty 2xx"
-               (empty-jobj-p (sigil-cl::request-eval-json cfg :get "https://x" nil "empty"))))
-      (dolist (case '((400 sigil-validation-error)
-                      (422 sigil-validation-error)
-                      (404 sigil-not-found-error)
-                      (409 sigil-conflict-error)))
+               (empty-jobj-p (agento11y-cl::request-eval-json cfg :get "https://x" nil "empty"))))
+      (dolist (case '((400 agento11y-validation-error)
+                      (422 agento11y-validation-error)
+                      (404 agento11y-not-found-error)
+                      (409 agento11y-conflict-error)))
         (destructuring-bind (status condition-type) case
           (let ((cfg (make-config :auth-mode :none
                                   :max-retries 1
@@ -3738,7 +3803,7 @@ experiment-runs branch, whose prefix they share."
             (check (format nil "request-eval-json maps ~d to ~a" status condition-type)
                    (signals-condition-p
                     (lambda ()
-                      (sigil-cl::request-eval-json cfg :get "https://x" nil "status"))
+                      (agento11y-cl::request-eval-json cfg :get "https://x" nil "status"))
                     condition-type)))))
       (let ((attempts 0)
             (cfg nil))
@@ -3753,7 +3818,7 @@ experiment-runs branch, whose prefix they share."
                                               (values "rate limited" 429)
                                               (values "{\"ok\":true}" 200)))))
         (check "request-eval-json retries 429"
-               (and (eq (jget (sigil-cl::request-eval-json cfg :get "https://x" nil "retry")
+               (and (eq (jget (agento11y-cl::request-eval-json cfg :get "https://x" nil "retry")
                               "ok")
                         t)
                     (= attempts 2))))
@@ -3770,7 +3835,7 @@ experiment-runs branch, whose prefix they share."
                                               (values "server error" 500)
                                               (values "{\"ok\":true}" 200)))))
         (check "request-eval-json retries 5xx"
-               (and (eq (jget (sigil-cl::request-eval-json cfg :get "https://x" nil "retry")
+               (and (eq (jget (agento11y-cl::request-eval-json cfg :get "https://x" nil "retry")
                               "ok")
                         t)
                     (= attempts 2))))
@@ -3788,8 +3853,8 @@ experiment-runs branch, whose prefix they share."
                                           (values "experiment is owned by another actor" 401))))
         (check "401 actor ownership signals a mismatch condition"
                (signals-condition-p
-                (lambda () (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "trial create"))
-                'sigil-actor-mismatch-error))
+                (lambda () (agento11y-cl::request-eval-json cfg :post "https://x" (jobj) "trial create"))
+                'agento11y-actor-mismatch-error))
         (check "401 actor ownership is not retried" (= attempts 1)))
       (let ((cfg (make-config :auth-mode :none
                               :max-retries 1
@@ -3798,10 +3863,10 @@ experiment-runs branch, whose prefix they share."
                                          (values "experiment is owned by another actor" 401)))))
         (check "actor mismatch message names the mismatch"
                (handler-case
-                   (progn (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "trial create")
+                   (progn (agento11y-cl::request-eval-json cfg :post "https://x" (jobj) "trial create")
                           nil)
-                 (sigil-actor-mismatch-error (e)
-                   (and (search "owned by another ingest actor" (sigil-error-message e)) t)))))
+                 (agento11y-actor-mismatch-error (e)
+                   (and (search "owned by another ingest actor" (agento11y-error-message e)) t)))))
       (let ((cfg (make-config :auth-mode :none
                               :max-retries 1
                               :http-fn (lambda (url &key method headers content &allow-other-keys)
@@ -3809,8 +3874,8 @@ experiment-runs branch, whose prefix they share."
                                          (values "token expired" 401)))))
         (check "an unrelated 401 stays an export error"
                (signals-condition-p
-                (lambda () (sigil-cl::request-eval-json cfg :get "https://x" nil "get"))
-                'sigil-export-error)))
+                (lambda () (agento11y-cl::request-eval-json cfg :get "https://x" nil "get"))
+                'agento11y-export-error)))
 
       ;; --- 409 conflict classification (ported from errors.py) ---
       (dolist (case '(("expected 12 scores, found 11" :score-count-mismatch)
@@ -3842,11 +3907,11 @@ experiment-runs branch, whose prefix they share."
                                          (values "expected 12 scores, found 11" 409)))))
         (check "409 score-count conflict carries kind and backend text"
                (handler-case
-                   (progn (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "finalize")
+                   (progn (agento11y-cl::request-eval-json cfg :post "https://x" (jobj) "finalize")
                           nil)
-                 (sigil-conflict-error (e)
-                   (and (eq (sigil-conflict-error-kind e) :score-count-mismatch)
-                        (search "expected 12 scores, found 11" (sigil-error-message e))
+                 (agento11y-conflict-error (e)
+                   (and (eq (agento11y-conflict-error-kind e) :score-count-mismatch)
+                        (search "expected 12 scores, found 11" (agento11y-error-message e))
                         t)))))
       (let ((cfg (make-config :auth-mode :none
                               :max-retries 1
@@ -3855,16 +3920,16 @@ experiment-runs branch, whose prefix they share."
                                          (values "experiment \"run_1\" is already finalized as completed" 409)))))
         (check "409 terminal-run conflict carries the terminal kind"
                (handler-case
-                   (progn (sigil-cl::request-eval-json cfg :post "https://x" (jobj) "finalize")
+                   (progn (agento11y-cl::request-eval-json cfg :post "https://x" (jobj) "finalize")
                           nil)
-                 (sigil-conflict-error (e)
-                   (eq (sigil-conflict-error-kind e) :terminal)))))
+                 (agento11y-conflict-error (e)
+                   (eq (agento11y-conflict-error-kind e) :terminal)))))
 
       ;; --- Run upsert ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test/ignored/path"
+             :eval-endpoint "https://agento11y.example.test/ignored/path"
              :generation-enabled nil
              :traces-enabled nil
              :http-fn (routed-http calls "exp-prompt-a"))
@@ -3885,7 +3950,7 @@ experiment-runs branch, whose prefix they share."
               (check "run create POSTs to experiment-runs:upsert"
                      (and (eq (first call) :post)
                           (equal (second call)
-                                 "https://sigil.example.test/api/v1/experiment-runs:upsert")))
+                                 "https://agento11y.example.test/api/v1/experiment-runs:upsert")))
               (check "run payload has experiment_id"
                      (equal (jget posted "experiment_id") "exp-prompt-a"))
               (check "run payload has no run_id"
@@ -3907,26 +3972,26 @@ experiment-runs branch, whose prefix they share."
                           (null (nth-value 1 (gethash "evaluators" posted)))))))))
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-x"))
           (declare (ignore get-requests))
           (check "upsert rejects a blank name before any request"
                  (and (signals-condition-p
                        (lambda () (upsert-experiment-run client :experiment-id "x" :name "  "))
-                       'sigil-validation-error)
+                       'agento11y-validation-error)
                       (null (cdr calls))))
           (check "upsert rejects a negative planned_trial_count before any request"
                  (and (signals-condition-p
                        (lambda () (upsert-experiment-run client :name "x"
                                                          :planned-trial-count -1))
-                       'sigil-validation-error)
+                       'agento11y-validation-error)
                       (null (cdr calls))))))
 
       ;; --- Run finalization ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-fin"))
           (declare (ignore get-requests))
@@ -3936,7 +4001,7 @@ experiment-runs branch, whose prefix they share."
             (check "finalize POSTs the finalize route"
                    (and (eq (first call) :post)
                         (equal (second call)
-                               "https://sigil.example.test/api/v1/experiment-runs/exp-fin:finalize")))
+                               "https://agento11y.example.test/api/v1/experiment-runs/exp-fin:finalize")))
             (check "finalize normalizes succeeded to completed"
                    (equal (jget posted "status") "completed"))
             (check "finalize payload carries source and score_count"
@@ -3944,7 +4009,7 @@ experiment-runs branch, whose prefix they share."
                         (eql (jget posted "score_count") 3))))))
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-fin"))
           (declare (ignore get-requests))
@@ -3956,19 +4021,19 @@ experiment-runs branch, whose prefix they share."
           (check "finalize rejects an unknown status before any request"
                  (and (signals-condition-p
                        (lambda () (finalize-experiment-run client "exp-fin" :status "canceled"))
-                       'sigil-validation-error)
+                       'agento11y-validation-error)
                       (null (cdr calls))))
           (check "finalize rejects running before any request"
                  (and (signals-condition-p
                        (lambda () (finalize-experiment-run client "exp-fin" :status "running"))
-                       'sigil-validation-error)
+                       'agento11y-validation-error)
                       (null (cdr calls))))))
 
       ;; --- Read plane stays on /eval/experiments ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test"
+             :eval-endpoint "https://agento11y.example.test"
              :generation-enabled nil :traces-enabled nil
              :http-fn (lambda (url &key method headers content &allow-other-keys)
                         (declare (ignore headers))
@@ -3982,12 +4047,12 @@ experiment-runs branch, whose prefix they share."
                 (methods (mapcar #'first (reverse (cdr calls)))))
             (check "get-experiment reads /eval/experiments/{id}"
                    (equal (first urls)
-                          "https://sigil.example.test/api/v1/eval/experiments/exp-read"))
+                          "https://agento11y.example.test/api/v1/eval/experiments/exp-read"))
             (check "report reads /eval/experiments/{id}/report"
                    (equal (second urls)
-                          "https://sigil.example.test/api/v1/eval/experiments/exp-read/report"))
+                          "https://agento11y.example.test/api/v1/eval/experiments/exp-read/report"))
             (check "scores list reads /eval/experiments/{id}/scores"
-                   (eql 0 (search "https://sigil.example.test/api/v1/eval/experiments/exp-read/scores"
+                   (eql 0 (search "https://agento11y.example.test/api/v1/eval/experiments/exp-read/scores"
                                   (third urls))))
             (check "all three readers use GET" (every (lambda (m) (eq m :get)) methods))
             (check "reads are not redirected to experiment-runs"
@@ -3997,7 +4062,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test"
+             :eval-endpoint "https://agento11y.example.test"
              :generation-enabled nil :traces-enabled nil
              :http-fn (routed-http calls "exp-score"))
           (declare (ignore get-requests))
@@ -4015,7 +4080,7 @@ experiment-runs branch, whose prefix they share."
                    (posted (payload call))
                    (score (aref (jget posted "scores") 0)))
               (check "export-scores POSTs scores path on the generation host"
-                     (equal (second call) "http://test-sigil:4318/api/v1/scores:export"))
+                     (equal (second call) "http://test-agento11y:4318/api/v1/scores:export"))
               (check "numeric score value serializes as number"
                      (let ((value (jget* score "value" "number")))
                        (and (numberp value)
@@ -4028,7 +4093,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test"
+             :eval-endpoint "https://agento11y.example.test"
              :generation-enabled nil :traces-enabled nil
              :http-fn (routed-http calls "exp-score"))
           (declare (ignore get-requests))
@@ -4059,7 +4124,7 @@ experiment-runs branch, whose prefix they share."
                           (equal (jget score "grader_generation_id") "ggen")
                           (equal (jget score "grader_trace_id") "gtrace")))))))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil)
         (declare (ignore get-requests))
         (check "score without a generation or trial signals validation"
@@ -4071,7 +4136,7 @@ experiment-runs branch, whose prefix they share."
                                              "evaluator_version" "1"
                                              "score_key" "quality"
                                              "value" 1))))
-                'sigil-validation-error))
+                'agento11y-validation-error))
         (check "export-scores without value signals validation"
                (signals-condition-p
                 (lambda ()
@@ -4081,11 +4146,11 @@ experiment-runs branch, whose prefix they share."
                                              "evaluator_id" "judge"
                                              "evaluator_version" "1"
                                              "score_key" "quality"))))
-                'sigil-validation-error)))
+                'agento11y-validation-error)))
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test"
+             :eval-endpoint "https://agento11y.example.test"
              :generation-enabled nil :traces-enabled nil
              :http-fn (routed-http calls "exp-rej"
                                    :score-body "{\"results\":[{\"score_id\":\"score-bad\",\"accepted\":false,\"error\":\"bad\"}]}"))
@@ -4100,16 +4165,16 @@ experiment-runs branch, whose prefix they share."
                                                "evaluator_version" "1"
                                                "score_key" "quality"
                                                "value" 0.9))))
-                  'sigil-export-error))))
+                  'agento11y-export-error))))
 
       ;; --- Score metadata and identity on a run ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-meta"))
           (declare (ignore get-requests))
-          (let ((run (sigil-cl::%make-experiment-run :client client
+          (let ((run (agento11y-cl::%make-experiment-run :client client
                                                     :run-id "exp-prompt-a"
                                                     :name "prompt A")))
             (experiment-run-add-scores
@@ -4134,10 +4199,10 @@ experiment-runs branch, whose prefix they share."
               (check "score metadata omits trial_id, which is top level now"
                      (null (jget metadata "trial_id")))))))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil)
         (declare (ignore get-requests))
-        (let ((run (sigil-cl::%make-experiment-run :client client
+        (let ((run (agento11y-cl::%make-experiment-run :client client
                                                   :run-id "exp-prompt-a"
                                                   :name "prompt A")))
           (check "make-score without value signals validation"
@@ -4149,7 +4214,7 @@ experiment-runs branch, whose prefix they share."
                                        :evaluator-version "1"
                                        :score-key "quality"))
                      :generation-ids '("gen-1")))
-                  'sigil-validation-error))))
+                  'agento11y-validation-error))))
 
       ;; --- Upload mode validation ---
       (let ((create-count 0))
@@ -4158,7 +4223,7 @@ experiment-runs branch, whose prefix they share."
                  (incf create-count)
                  (values "{}" 200)))
           (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
+              (make-test-client :eval-endpoint "https://agento11y.example.test"
                                 :generation-enabled nil
                                 :traces-enabled nil
                                 :http-fn #'http)
@@ -4170,14 +4235,14 @@ experiment-runs branch, whose prefix they share."
                                              :name "prompt A"
                                              :upload :weird)
                          (declare (ignore run))))
-                     'sigil-validation-error)))
+                     'agento11y-validation-error)))
               (check "with-experiment rejects unknown upload mode before create"
                      (and signaled (zerop create-count)))))))
 
       ;; --- :bulk buffers during the body and publishes on exit ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-bulk"))
           (declare (ignore get-requests))
@@ -4218,7 +4283,7 @@ experiment-runs branch, whose prefix they share."
             (signaled nil))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test"
+             :eval-endpoint "https://agento11y.example.test"
              :generation-enabled nil :traces-enabled nil
              :http-fn (routed-http calls "exp-pubfail"
                                    :score-body "{\"results\":[{\"score_id\":\"sc1\",\"accepted\":false,\"error\":\"bad score\"}]}"))
@@ -4232,7 +4297,7 @@ experiment-runs branch, whose prefix they share."
                  (list (make-score :evaluator-id "judge" :evaluator-version "1"
                                    :score-key "quality" :value 1))
                  :generation-ids '("gen-pubfail")))
-            (sigil-error () (setf signaled t)))
+            (agento11y-error () (setf signaled t)))
           (check "publish failure propagates from with-experiment" signaled)
           (check "publish failure finalizes failed"
                  (member "failed" (finalize-statuses (reverse (cdr calls))) :test #'equal))
@@ -4245,7 +4310,7 @@ experiment-runs branch, whose prefix they share."
       ;; --- :manual leaves the run open ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-manual"))
           (declare (ignore get-requests))
@@ -4275,7 +4340,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil))
             (conversation-ids nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :traces-enabled nil
                               :http-fn (routed-http calls "exp-runner"))
           (declare (ignore get-requests))
@@ -4362,7 +4427,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil))
             (signaled nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-dup"))
           (declare (ignore get-requests))
@@ -4373,7 +4438,7 @@ experiment-runs branch, whose prefix they share."
                               (lambda (item run) (declare (ignore item run)) nil)
                               nil
                               :run-id "exp-dup" :name "dupes" :fetch-report nil)
-            (sigil-validation-error () (setf signaled t)))
+            (agento11y-validation-error () (setf signaled t)))
           (check "run-experiment rejects duplicate item ids" signaled)
           (check "run-experiment creates only the first trial"
                  (= 1 (count-if #'trial-create-call-p (cdr calls))))
@@ -4391,7 +4456,7 @@ experiment-runs branch, whose prefix they share."
       ;; the drift this check exists to catch.
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-stable"))
           (declare (ignore get-requests))
@@ -4436,7 +4501,7 @@ experiment-runs branch, whose prefix they share."
             (recorded-id nil)
             (run-object nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :traces-enabled nil
                               :http-fn (routed-http calls "exp-prompt-a"))
           (declare (ignore get-requests))
@@ -4531,7 +4596,7 @@ experiment-runs branch, whose prefix they share."
                     (values "an open draft already exists for this experiment" 409))
                    (t (values "{}" 200)))))
           (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
+              (make-test-client :eval-endpoint "https://agento11y.example.test"
                                 :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
@@ -4555,15 +4620,15 @@ experiment-runs branch, whose prefix they share."
                     (values "experiment \"exp-terminal\" is already finalized as completed" 409))
                    (t (values "{}" 200)))))
           (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
+              (make-test-client :eval-endpoint "https://agento11y.example.test"
                                 :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
             (handler-case
                 (with-experiment (run client :run-id "exp-terminal" :name "prompt A")
                   (declare (ignore run)))
-              (sigil-conflict-error (e)
-                (setf signaled (sigil-conflict-error-kind e))))
+              (agento11y-conflict-error (e)
+                (setf signaled (agento11y-conflict-error-kind e))))
             (check "a terminal conflict propagates even under :reopen"
                    (eq signaled :terminal))
             (check "a terminal conflict writes nothing into the refused run"
@@ -4580,7 +4645,7 @@ experiment-runs branch, whose prefix they share."
                      (values "conflict" 409)
                      (values "{}" 200))))
           (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
+              (make-test-client :eval-endpoint "https://agento11y.example.test"
                                 :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
@@ -4588,13 +4653,13 @@ experiment-runs branch, whose prefix they share."
                 (with-experiment (run client :run-id "exp-conflict2" :name "prompt A"
                                       :on-conflict :error)
                   (declare (ignore run)))
-              (sigil-conflict-error () (setf signaled t)))
+              (agento11y-conflict-error () (setf signaled t)))
             (check "on-conflict :error propagates the conflict" signaled))))
 
       ;; --- Error and non-local exits both finalize failed ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-fail"))
           (declare (ignore get-requests))
@@ -4607,7 +4672,7 @@ experiment-runs branch, whose prefix they share."
                  (member "failed" (finalize-statuses (reverse (cdr calls))) :test #'equal))))
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-abort"))
           (declare (ignore get-requests))
@@ -4632,7 +4697,7 @@ experiment-runs branch, whose prefix they share."
                             202))
                    (t (values (jzon:stringify (jobj "experiment_id" "exp-partial")) 200)))))
           (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
+              (make-test-client :eval-endpoint "https://agento11y.example.test"
                                 :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
@@ -4667,7 +4732,7 @@ experiment-runs branch, whose prefix they share."
                      (values "trial gone" 404)
                      (values (jzon:stringify (jobj "experiment_id" "exp-manual")) 200))))
           (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
+              (make-test-client :eval-endpoint "https://agento11y.example.test"
                                 :generation-enabled nil :traces-enabled nil
                                 :http-fn #'http)
             (declare (ignore get-requests))
@@ -4712,7 +4777,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil))
             (buffered nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-multi"))
           (declare (ignore get-requests))
@@ -4737,7 +4802,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil))
             (second-score nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-carry"))
           (declare (ignore get-requests))
@@ -4763,7 +4828,7 @@ experiment-runs branch, whose prefix they share."
             (first-id nil)
             (second-id nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-ws"))
           (declare (ignore get-requests))
@@ -4773,7 +4838,7 @@ experiment-runs branch, whose prefix they share."
             (check "a whitespace-only variant of a used id is rejected"
                    (signals-condition-p
                     (lambda () (experiment-run-open-trial run (make-dataset-item :id " a ")))
-                    'sigil-validation-error))
+                    'agento11y-validation-error))
             (setf second-id (trial-id (experiment-run-open-trial
                                        run (make-dataset-item :id " b ")))))
           (check "a trimmed id mints the trimmed trial"
@@ -4794,7 +4859,7 @@ experiment-runs branch, whose prefix they share."
                      (values "boom" 500)
                      (values (jzon:stringify (jobj "experiment_id" "exp-retry")) 200))))
           (multiple-value-bind (client get-requests)
-              (make-test-client :eval-endpoint "https://sigil.example.test"
+              (make-test-client :eval-endpoint "https://agento11y.example.test"
                                 :generation-enabled nil :traces-enabled nil
                                 :max-retries 1
                                 :http-fn #'http)
@@ -4802,7 +4867,7 @@ experiment-runs branch, whose prefix they share."
             (with-experiment (run client :run-id "exp-retry" :name "retry")
               (handler-case
                   (experiment-run-open-trial run "case-1")
-                (sigil-error () nil))
+                (agento11y-error () nil))
               (setf fail-create nil)
               (setf retried (experiment-run-open-trial run "case-1")))
             (check "a trial create that failed can be retried at the same attempt"
@@ -4811,7 +4876,7 @@ experiment-runs branch, whose prefix they share."
       ;; --- A closed trial refuses further scores ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-closed"))
           (declare (ignore get-requests))
@@ -4826,13 +4891,13 @@ experiment-runs branch, whose prefix they share."
                                                             :evaluator-version "1"
                                                             :score-key "final"
                                                             :value 1))))
-                      'sigil-validation-error))))))
+                      'agento11y-validation-error))))))
 
       ;; --- A rejected batch does not consume score ids ---
       (let ((calls (cons :calls nil))
             (trial-id nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-ids"))
           (declare (ignore get-requests))
@@ -4851,7 +4916,7 @@ experiment-runs branch, whose prefix they share."
                                                 (list :evaluator-id "judge"
                                                       :evaluator-version "1"
                                                       :score-key "final"))))
-                      'sigil-validation-error))
+                      'agento11y-validation-error))
               (trial-add-scores trial
                                 (list (make-score :evaluator-id "judge"
                                                   :evaluator-version "1"
@@ -4885,7 +4950,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Trial create request body ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -4904,7 +4969,7 @@ experiment-runs branch, whose prefix they share."
             (check "trial create POSTs the trials route"
                    (and (eq (first call) :post)
                         (equal (second call)
-                               "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials")))
+                               "https://agento11y.example.test/api/v1/experiment-runs/exp-1/trials")))
             (check "trial create sends status running"
                    (equal (jget posted "status") "running"))
             (check "trial create sends the deterministic trial id"
@@ -4935,7 +5000,7 @@ experiment-runs branch, whose prefix they share."
             (check "trial close PATCHes the trial route"
                    (and (eq (first call) :patch)
                         (equal (second call)
-                               (format nil "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials/~a"
+                               (format nil "https://agento11y.example.test/api/v1/experiment-runs/exp-1/trials/~a"
                                        (trial-id trial)))))
             (check "clean close sends status completed"
                    (equal (jget posted "status") "completed"))
@@ -4949,7 +5014,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Error close ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -4966,7 +5031,7 @@ experiment-runs branch, whose prefix they share."
     ;; verdict rides on the final score's `passed`, not the trial status.
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -4978,7 +5043,7 @@ experiment-runs branch, whose prefix they share."
                         "completed")))))
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -4992,7 +5057,7 @@ experiment-runs branch, whose prefix they share."
     ;; assertion is completed, so it counts as executed in the report.
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5006,7 +5071,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Bind helpers are local only ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5031,7 +5096,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Scores flush before the closing PATCH ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5068,7 +5133,7 @@ experiment-runs branch, whose prefix they share."
     (let ((calls (cons :calls nil))
           (buffered-after-close nil))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5094,7 +5159,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Deterministic score ids and occurrence counters ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5133,7 +5198,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Duplicate (test-case-id, attempt) is rejected locally ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5143,15 +5208,15 @@ experiment-runs branch, whose prefix they share."
           (check "a duplicate attempt signals a validation error"
                  (signals-condition-p
                   (lambda () (experiment-run-open-trial run "case-dup"))
-                  'sigil-validation-error))
+                  'agento11y-validation-error))
           (check "a duplicate attempt records no second trial-create request"
                  (null (cdr calls)))
           (check "the collision error names the test case and attempt"
                  (handler-case
                      (progn (experiment-run-open-trial run "case-dup") nil)
-                   (sigil-validation-error (e)
-                     (and (search "case-dup" (sigil-error-message e))
-                          (search "already exists" (sigil-error-message e))
+                   (agento11y-validation-error (e)
+                     (and (search "case-dup" (agento11y-error-message e))
+                          (search "already exists" (agento11y-error-message e))
                           t))))
           (check "a second attempt of the same case is allowed"
                  (let ((trial (experiment-run-open-trial run "case-dup" :attempt 2)))
@@ -5161,7 +5226,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- with-trial ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5181,7 +5246,7 @@ experiment-runs branch, whose prefix they share."
     (let ((calls (cons :calls nil))
           (signaled nil))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5211,7 +5276,7 @@ experiment-runs branch, whose prefix they share."
                            202)
                    (values (jzon:stringify (jobj "experiment_id" "exp-1")) 200))))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn #'http)
           (declare (ignore get-requests))
@@ -5233,7 +5298,7 @@ experiment-runs branch, whose prefix they share."
     ;; rather than completed.
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5263,7 +5328,7 @@ experiment-runs branch, whose prefix they share."
           (open-logs nil)
           (signaled nil))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-overlap")
                             :log-fn (lambda (level component message &rest kvs)
@@ -5308,10 +5373,10 @@ experiment-runs branch, whose prefix they share."
     ;; shape two worker threads produce. Trial A's create blocks until trial
     ;; B's create starts, which puts B's claim strictly inside A's round trip.
     (let* ((calls (cons :calls nil))
-           (http-lock (bt2:make-lock :name "sigil-test-race-http"))
-           (log-lock (bt2:make-lock :name "sigil-test-race-log"))
-           (a-creating (bt2:make-semaphore :name "sigil-test-a-creating"))
-           (b-creating (bt2:make-semaphore :name "sigil-test-b-creating"))
+           (http-lock (bt2:make-lock :name "agento11y-test-race-http"))
+           (log-lock (bt2:make-lock :name "agento11y-test-race-log"))
+           (a-creating (bt2:make-semaphore :name "agento11y-test-a-creating"))
+           (b-creating (bt2:make-semaphore :name "agento11y-test-b-creating"))
            (logged nil)
            (overlap-logs nil)
            (trial-a nil)
@@ -5319,7 +5384,7 @@ experiment-runs branch, whose prefix they share."
            (open-ids nil))
       (multiple-value-bind (client get-requests)
           (make-test-client
-           :eval-endpoint "https://sigil.example.test"
+           :eval-endpoint "https://agento11y.example.test"
            :generation-enabled nil :traces-enabled nil
            :log-fn (lambda (level component message &rest kvs)
                      (declare (ignore component kvs))
@@ -5339,7 +5404,7 @@ experiment-runs branch, whose prefix they share."
           (bt2:with-lock-held (log-lock) (setf logged nil))
           (let ((opener (bt2:make-thread
                          (lambda () (setf trial-a (experiment-run-open-trial run "case-a")))
-                         :name "sigil-test-trial-a")))
+                         :name "agento11y-test-trial-a")))
             (bt2:wait-on-semaphore a-creating :timeout 5)
             (setf trial-b (experiment-run-open-trial run "case-b"))
             (bt2:join-thread opener))
@@ -5377,7 +5442,7 @@ experiment-runs branch, whose prefix they share."
            (retry-error nil)
            (retried nil))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-logfn")
                             :log-fn (lambda (level component message &rest kvs)
@@ -5402,25 +5467,25 @@ experiment-runs branch, whose prefix they share."
 
     ;; --- Transport validation ---
     (multiple-value-bind (client get-requests)
-        (make-test-client :eval-endpoint "https://sigil.example.test"
+        (make-test-client :eval-endpoint "https://agento11y.example.test"
                           :generation-enabled nil :traces-enabled nil)
       (declare (ignore get-requests))
       (check "create-trial requires a trial id"
              (signals-condition-p
               (lambda () (create-trial client "exp-1" :test-case-id "c"))
-              'sigil-validation-error))
+              'agento11y-validation-error))
       (check "create-trial requires a test case id"
              (signals-condition-p
               (lambda () (create-trial client "exp-1" :trial-id "t"))
-              'sigil-validation-error))
+              'agento11y-validation-error))
       (check "finalize-trial requires a trial id"
              (signals-condition-p
               (lambda () (finalize-trial client "exp-1" "" :status "completed"))
-              'sigil-validation-error))
+              'agento11y-validation-error))
       (check "trial routes require an experiment id"
              (signals-condition-p
               (lambda () (create-trial client "" :trial-id "t" :test-case-id "c"))
-              'sigil-validation-error)))))
+              'agento11y-validation-error)))))
 
 ;;; ================================================================
 ;;; Local suite tests
@@ -5429,7 +5494,7 @@ experiment-runs branch, whose prefix they share."
 (defun run-trial-evaluation-tests ()
   (with-test-suite ("Cloud trial evaluation")
     (flet ((eval-client (calls &rest routed-args)
-             (make-test-client :eval-endpoint "https://sigil.example.test"
+             (make-test-client :eval-endpoint "https://agento11y.example.test"
                                :generation-enabled nil :traces-enabled nil
                                :experimental-features t
                                :http-fn (apply #'routed-http calls "exp-1" routed-args))))
@@ -5437,7 +5502,7 @@ experiment-runs branch, whose prefix they share."
       ;; --- The gate blocks every route, and blocks it before any request ---
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :http-fn (routed-http calls "exp-1"))
           (declare (ignore get-requests))
@@ -5445,17 +5510,17 @@ experiment-runs branch, whose prefix they share."
                  (signals-condition-p
                   (lambda () (trigger-trial-evaluation client "exp-1" "trial-1"
                                                        :evaluator-id "ev-1"))
-                  'sigil-experimental-disabled-error))
+                  'agento11y-experimental-disabled-error))
           (check "status read signals when the gate is off"
                  (signals-condition-p
                   (lambda () (get-trial-evaluation client "exp-1" "trial-1" "eval-1"))
-                  'sigil-experimental-disabled-error))
+                  'agento11y-experimental-disabled-error))
           (let ((trial (trial-open client "exp-1" "case-gate")))
             (trial-bind-conversation trial "conv-1")
             (setf (cdr calls) nil)
             (check "trial-evaluate signals when the gate is off"
                    (signals-condition-p (lambda () (trial-evaluate trial "ev-1"))
-                                        'sigil-experimental-disabled-error))
+                                        'agento11y-experimental-disabled-error))
             (check "a blocked call issues no request" (null (cdr calls))))))
 
       ;; --- Trigger request ---
@@ -5470,7 +5535,7 @@ experiment-runs branch, whose prefix they share."
             (check "trigger POSTs the :evaluate route with the colon escaped"
                    (and (eq (first call) :post)
                         (equal (second call)
-                               "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials/trial%3A1:evaluate")))
+                               "https://agento11y.example.test/api/v1/experiment-runs/exp-1/trials/trial%3A1:evaluate")))
             (check "trigger sends the trimmed evaluator id"
                    (equal (jget posted "evaluator_id") "ev-9"))
             (check "trigger omits evaluator_version when it is blank"
@@ -5484,7 +5549,7 @@ experiment-runs branch, whose prefix they share."
                  (signals-condition-p
                   (lambda () (trigger-trial-evaluation client "exp-1" "trial-1"
                                                        :evaluator-id "  "))
-                  'sigil-validation-error))))
+                  'agento11y-validation-error))))
 
       ;; --- Status route ---
       (let ((calls (cons :calls nil)))
@@ -5497,12 +5562,12 @@ experiment-runs branch, whose prefix they share."
             (check "the status route GETs with both ids escaped"
                    (and (eq (first call) :get)
                         (equal (second call)
-                               "https://sigil.example.test/api/v1/experiment-runs/exp-1/trials/trial%3A1/evaluations/eval%3A2")))
+                               "https://agento11y.example.test/api/v1/experiment-runs/exp-1/trials/trial%3A1/evaluations/eval%3A2")))
             (check "the status read sends no body" (null (third call))))
           (check "a blank evaluation id signals before any request"
                  (signals-condition-p
                   (lambda () (get-trial-evaluation client "exp-1" "trial-1" ""))
-                  'sigil-validation-error))))
+                  'agento11y-validation-error))))
 
       ;; --- Response validation ---
       (dolist (case '(("queued" "eval-1" :ok)
@@ -5522,7 +5587,7 @@ experiment-runs branch, whose prefix they share."
               (let ((rejected (signals-condition-p
                                (lambda () (trigger-trial-evaluation
                                            client "exp-1" "trial-1" :evaluator-id "ev-1"))
-                               'sigil-export-error)))
+                               'agento11y-export-error)))
                 (check (format nil "status ~s with id ~s is ~(~a~)"
                                status evaluation-id expectation)
                        (if (eq expectation :ok) (not rejected) rejected)))))))
@@ -5537,7 +5602,7 @@ experiment-runs branch, whose prefix they share."
           (check "an unknown status from the status route signals"
                  (signals-condition-p
                   (lambda () (get-trial-evaluation client "exp-1" "trial-1" "eval-1"))
-                  'sigil-export-error))))
+                  'agento11y-export-error))))
       (let ((calls (cons :calls nil)))
         (multiple-value-bind (client get-requests)
             (eval-client calls :evaluation-fn
@@ -5550,7 +5615,7 @@ experiment-runs branch, whose prefix they share."
                    (signals-condition-p
                     (lambda () (trial-evaluate trial "ev-1" :timeout-sec 5
                                                             :poll-interval-sec 0))
-                    'sigil-export-error)))))
+                    'agento11y-export-error)))))
 
       (check "terminal-p is true only for success and failed"
              (and (trial-evaluation-terminal-p (jobj "status" "success"))
@@ -5566,17 +5631,17 @@ experiment-runs branch, whose prefix they share."
             (setf (cdr calls) nil)
             (check "an unbound conversation signals"
                    (signals-condition-p (lambda () (trial-evaluate trial "ev-1"))
-                                        'sigil-validation-error))
+                                        'agento11y-validation-error))
             (check "an unbound conversation issues no request" (null (cdr calls)))
             (trial-bind-conversation trial "conv-1")
             (check "a negative timeout signals"
                    (signals-condition-p
                     (lambda () (trial-evaluate trial "ev-1" :timeout-sec -1))
-                    'sigil-validation-error))
+                    'agento11y-validation-error))
             (check "a negative poll interval signals"
                    (signals-condition-p
                     (lambda () (trial-evaluate trial "ev-1" :poll-interval-sec -1))
-                    'sigil-validation-error))
+                    'agento11y-validation-error))
             (check "argument validation issues no request" (null (cdr calls))))))
 
       ;; --- trial-evaluate sequences the conversation PATCH before the trigger ---
@@ -5632,9 +5697,9 @@ experiment-runs branch, whose prefix they share."
                     (handler-case (progn (trial-evaluate trial "ev-1" :timeout-sec 0
                                                                       :poll-interval-sec 0)
                                          nil)
-                      (sigil-trial-evaluation-failed-error (e)
-                        (list (sigil-trial-evaluation-error-id e)
-                              (sigil-trial-evaluation-error-detail e))))))
+                      (agento11y-trial-evaluation-failed-error (e)
+                        (list (agento11y-trial-evaluation-error-id e)
+                              (agento11y-trial-evaluation-error-detail e))))))
               (check "a failed evaluation signals the failure condition" (and carried t))
               (check "the failure carries the evaluation id and the detail"
                      (equal carried (list "eval-7" "worker exploded")))))))
@@ -5643,7 +5708,7 @@ experiment-runs branch, whose prefix they share."
       (let ((calls (cons :calls nil))
             (captured nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :experimental-features t
                               :http-fn (routed-http calls "exp-cloud"
@@ -5659,7 +5724,7 @@ experiment-runs branch, whose prefix they share."
               (trial-evaluate trial "ev-1" :timeout-sec 0 :poll-interval-sec 0)
               (trial-close trial)))
           (check "a queued evaluation marks the run cloud-evaluated"
-                 (sigil-cl::experiment-run-cloud-evaluated-p captured))
+                 (agento11y-cl::experiment-run-cloud-evaluated-p captured))
           (let ((finalize (find-if (lambda (c) (search ":finalize" (second c)))
                                    (cdr calls))))
             (check "the run finalizes" (and finalize t))
@@ -5673,7 +5738,7 @@ experiment-runs branch, whose prefix they share."
             (captured nil)
             (timed-out nil))
         (multiple-value-bind (client get-requests)
-            (make-test-client :eval-endpoint "https://sigil.example.test"
+            (make-test-client :eval-endpoint "https://agento11y.example.test"
                               :generation-enabled nil :traces-enabled nil
                               :experimental-features t
                               :http-fn (routed-http calls "exp-slow"
@@ -5688,12 +5753,12 @@ experiment-runs branch, whose prefix they share."
                 (let ((trial (experiment-run-open-trial run "case-1")))
                   (trial-bind-conversation trial "conv-1")
                   (trial-evaluate trial "ev-1" :timeout-sec 0 :poll-interval-sec 0)))
-            (sigil-trial-evaluation-timeout-error (e)
-              (setf timed-out (sigil-trial-evaluation-error-id e))))
+            (agento11y-trial-evaluation-timeout-error (e)
+              (setf timed-out (agento11y-trial-evaluation-error-id e))))
           (check "an expired deadline signals the timeout condition with the id"
                  (equal timed-out "eval-5"))
           (check "a timed-out wait still marks the run cloud-evaluated"
-                 (sigil-cl::experiment-run-cloud-evaluated-p captured))
+                 (agento11y-cl::experiment-run-cloud-evaluated-p captured))
           (let ((finalize (find-if (lambda (c) (search ":finalize" (second c)))
                                    (cdr calls))))
             (check "the run finalized after the timeout omits score_count"
@@ -5717,12 +5782,12 @@ experiment-runs branch, whose prefix they share."
                     ("application/octet-stream" . "binary")
                     ("" . "binary")))
       (check (format nil "kind for ~s is ~a" (car case) (cdr case))
-             (equal (sigil-cl::%artifact-kind-from-mime (car case)) (cdr case))))
+             (equal (agento11y-cl::%artifact-kind-from-mime (car case)) (cdr case))))
 
     ;; --- Upload wire format ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5737,19 +5802,19 @@ experiment-runs branch, whose prefix they share."
                  (and (eq (first call) :post)
                       (equal (second call)
                              (concatenate 'string
-                                          "https://sigil.example.test/api/v1/experiment-runs/exp-1"
+                                          "https://agento11y.example.test/api/v1/experiment-runs/exp-1"
                                           "/trials/trial%3A1/artifacts:upload"
                                           "?name=details&kind=json&mime=application%2Fjson"))))
           (check "Content-Type comes from the MIME"
                  (equal (call-header call "Content-Type") "application/json"))
           (check "the body is the raw bytes, unmodified"
                  (equalp (third call)
-                         (sigil-cl::string-to-utf8-octets "{\"ok\":true}"))))
+                         (agento11y-cl::string-to-utf8-octets "{\"ok\":true}"))))
         ;; A blank MIME still emits mime= and falls back to octet-stream.
         (setf (cdr calls) nil)
         (upload-trial-artifact client "exp-1" "trial-1"
                                :name "blob" :kind "binary"
-                               :content (sigil-cl::string-to-utf8-octets "raw"))
+                               :content (agento11y-cl::string-to-utf8-octets "raw"))
         (let ((call (first (cdr calls))))
           (check "a blank MIME still emits the mime query key"
                  (search "&mime=" (second call)))
@@ -5766,18 +5831,18 @@ experiment-runs branch, whose prefix they share."
             (check (format nil "~a signals" label)
                    (signals-condition-p
                     (lambda () (apply #'upload-trial-artifact client "exp-1" "trial-1" args))
-                    'sigil-validation-error))
+                    'agento11y-validation-error))
             (check (format nil "~a issues no request" label) (null (cdr calls)))))
         (check "a blank trial id signals"
                (signals-condition-p
                 (lambda () (upload-trial-artifact client "exp-1" "  "
                                                   :name "n" :kind "json" :content "x"))
-                'sigil-validation-error))))
+                'agento11y-validation-error))))
 
     ;; --- Trial wrapper ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-1"))
         (declare (ignore get-requests))
@@ -5788,7 +5853,7 @@ experiment-runs branch, whose prefix they share."
             (check "text defaults to kind text and MIME text/plain"
                    (search "name=notes&kind=text&mime=text%2Fplain" (second call)))
             (check "text uploads as UTF-8 bytes"
-                   (equalp (third call) (sigil-cl::string-to-utf8-octets "hello"))))
+                   (equalp (third call) (agento11y-cl::string-to-utf8-octets "hello"))))
           (setf (cdr calls) nil)
           (trial-artifact trial :name "payload" :mime "application/json"
                                 :content "{\"a\":1}")
@@ -5797,14 +5862,14 @@ experiment-runs branch, whose prefix they share."
           (setf (cdr calls) nil)
           (check "supplying no content source signals"
                  (signals-condition-p (lambda () (trial-artifact trial :name "n"))
-                                      'sigil-validation-error))
+                                      'agento11y-validation-error))
           (check "supplying two content sources signals"
                  (signals-condition-p
                   (lambda () (trial-artifact trial :name "n" :text "a" :content "b"))
-                  'sigil-validation-error))
+                  'agento11y-validation-error))
           (check "resolving the content source issues no request" (null (cdr calls)))
           ;; A file source infers its MIME from the extension.
-          (let ((path (merge-pathnames "sigil-artifact-test.md"
+          (let ((path (merge-pathnames "agento11y-artifact-test.md"
                                        (uiop:temporary-directory))))
             (unwind-protect
                  (progn
@@ -5818,14 +5883,14 @@ experiment-runs branch, whose prefix they share."
                                     (second call)))
                      (check "a file uploads its bytes"
                             (equalp (third call)
-                                    (sigil-cl::string-to-utf8-octets "# title")))))
+                                    (agento11y-cl::string-to-utf8-octets "# title")))))
               (ignore-errors (delete-file path)))))))))
 
 (defun run-evaluator-tests ()
   (with-test-suite ("Evaluators")
 
     ;; --- Top-level object scanning ---
-    (let ((objects (sigil-cl::%top-level-json-objects
+    (let ((objects (agento11y-cl::%top-level-json-objects
                     "prose {\"score\":0.9,\"passed\":true} tail {\"nested\":{\"score\":0.1}}")))
       (check "two top-level objects are collected" (= (length objects) 2))
       (check "a nested object is never collected on its own"
@@ -5833,49 +5898,49 @@ experiment-runs branch, whose prefix they share."
                   (nth-value 1 (gethash "nested" (second objects)))
                   (null (nth-value 1 (gethash "score" (second objects)))))))
     (check "text with no object yields nothing"
-           (null (sigil-cl::%top-level-json-objects "no json at all")))
+           (null (agento11y-cl::%top-level-json-objects "no json at all")))
     ;; An object that does not parse is stepped over one character at a time,
     ;; so the scan recovers at the next brace instead of stopping.
     (check "the scan recovers past an object that does not parse"
-           (equal 2 (length (sigil-cl::%top-level-json-objects
+           (equal 2 (length (agento11y-cl::%top-level-json-objects
                              "{\"broken\": {\"a\":1} tail {\"b\":2}"))))
 
     ;; --- Judge response parsing ---
     (multiple-value-bind (score passed explanation)
-        (sigil-cl::%parse-judge-response
+        (agento11y-cl::%parse-judge-response
          "Here is my grade: {\"score\": 0.9, \"passed\": true, \"explanation\": \"good\"} Hope that helps."
          0.5)
       (check "a score wrapped in prose is read" (= score 0.9d0))
       (check "the response's passed wins" passed)
       (check "the explanation is read" (equal explanation "good")))
-    (multiple-value-bind (score) (sigil-cl::%parse-judge-response "{\"score\": 1.7}" 0.5)
+    (multiple-value-bind (score) (agento11y-cl::%parse-judge-response "{\"score\": 1.7}" 0.5)
       (check "a score above 1 clamps to 1.0" (= score 1.0d0)))
-    (multiple-value-bind (score passed) (sigil-cl::%parse-judge-response "{\"score\": -0.2}" 0.5)
+    (multiple-value-bind (score passed) (agento11y-cl::%parse-judge-response "{\"score\": -0.2}" 0.5)
       (check "a score below 0 clamps to 0.0" (= score 0.0d0))
       (check "a clamped-to-zero score fails the default threshold" (null passed)))
     (multiple-value-bind (score passed explanation)
-        (sigil-cl::%parse-judge-response
+        (agento11y-cl::%parse-judge-response
          "{\"score\": 0.4, \"pass\": \"yes\", \"reason\": \"close enough\"}" 0.5)
       (check "the pass alias overrides the threshold verdict"
              (and (= score 0.4d0) passed))
       (check "the reason alias is read as the explanation"
              (equal explanation "close enough")))
     (multiple-value-bind (score passed)
-        (sigil-cl::%parse-judge-response "{\"score\": \"0.8\"}" 0.5)
+        (agento11y-cl::%parse-judge-response "{\"score\": \"0.8\"}" 0.5)
       (check "a numeric string score parses" (= score 0.8d0))
       (check "a string score still derives passed from the threshold" passed))
     (check "the last object carrying a score wins"
-           (= 0.2d0 (sigil-cl::%parse-judge-response
+           (= 0.2d0 (agento11y-cl::%parse-judge-response
                      "{\"score\":0.9} then {\"score\":0.2}" 0.5)))
     (check "an object with no score is skipped"
-           (= 0.9d0 (sigil-cl::%parse-judge-response
+           (= 0.9d0 (agento11y-cl::%parse-judge-response
                      "{\"score\":0.9} then {\"note\":\"thinking\"}" 0.5)))
     (let ((no-object (handler-case
-                         (progn (sigil-cl::%parse-judge-response "nothing here" 0.5) nil)
-                       (sigil-error (e) (sigil-error-message e))))
+                         (progn (agento11y-cl::%parse-judge-response "nothing here" 0.5) nil)
+                       (agento11y-error (e) (agento11y-error-message e))))
           (no-score (handler-case
-                        (progn (sigil-cl::%parse-judge-response "{\"note\":\"hi\"}" 0.5) nil)
-                      (sigil-error (e) (sigil-error-message e)))))
+                        (progn (agento11y-cl::%parse-judge-response "{\"note\":\"hi\"}" 0.5) nil)
+                      (agento11y-error (e) (agento11y-error-message e)))))
       (check "unusable output signals" (and no-object no-score))
       (check "no object and no score produce different messages"
              (not (equal no-object no-score))))
@@ -5883,28 +5948,28 @@ experiment-runs branch, whose prefix they share."
     ;; parse has to signal, not fall through to the scratch work above it.
     (check "a final score that does not parse signals"
            (handler-case
-               (progn (sigil-cl::%parse-judge-response
+               (progn (agento11y-cl::%parse-judge-response
                        "{\"score\":0.2,\"explanation\":\"draft\"} {\"score\":\"N/A\"}" 0.5)
                       nil)
-             (sigil-validation-error () t)))
+             (agento11y-validation-error () t)))
 
     ;; --- Numeric parsing of an untrusted score ---
     (check "lenient numeric spellings parse"
-           (and (= 0.5d0 (sigil-cl::%parse-real "+0.5"))
-                (= 0.5d0 (sigil-cl::%parse-real ".5"))
-                (= 7.0d0 (sigil-cl::%parse-real "007"))
-                (= 1.0d300 (sigil-cl::%parse-real "1e300"))))
+           (and (= 0.5d0 (agento11y-cl::%parse-real "+0.5"))
+                (= 0.5d0 (agento11y-cl::%parse-real ".5"))
+                (= 7.0d0 (agento11y-cl::%parse-real "007"))
+                (= 1.0d300 (agento11y-cl::%parse-real "1e300"))))
     (check "a score that overflows a double is not a number"
-           (and (null (sigil-cl::%parse-real "1e309"))
-                (null (sigil-cl::%parse-real "1e400"))
-                (null (sigil-cl::%parse-real "-1e400"))))
+           (and (null (agento11y-cl::%parse-real "1e309"))
+                (null (agento11y-cl::%parse-real "1e400"))
+                (null (agento11y-cl::%parse-real "-1e400"))))
     (check "a score that underflows is zero"
-           (eql 0.0d0 (sigil-cl::%parse-real "9e-400")))
+           (eql 0.0d0 (agento11y-cl::%parse-real "9e-400")))
     ;; The bound is checked before (EXPT 10 N), so this returns instead of
     ;; building a ten-million-digit bignum. The timing is the assertion.
     (let ((start (get-internal-real-time)))
       (check "a wild exponent is rejected without shifting"
-             (null (sigil-cl::%parse-real "1e10000000")))
+             (null (agento11y-cl::%parse-real "1e10000000")))
       (check "rejecting a wild exponent is immediate"
              (< (- (get-internal-real-time) start)
                 (* 5 internal-time-units-per-second))))
@@ -5913,31 +5978,31 @@ experiment-runs branch, whose prefix they share."
     (let ((start (get-internal-real-time))
           (run (make-string 300000 :initial-element #\7)))
       (check "a wild digit run is rejected in the mantissa"
-             (and (null (sigil-cl::%parse-real run))
-                  (null (sigil-cl::%parse-real
+             (and (null (agento11y-cl::%parse-real run))
+                  (null (agento11y-cl::%parse-real
                          (concatenate 'string "0." run)))
-                  (null (sigil-cl::%parse-real
+                  (null (agento11y-cl::%parse-real
                          (concatenate 'string "1e" run)))))
       (check "rejecting a wild digit run is immediate"
              (< (- (get-internal-real-time) start)
                 (* 5 internal-time-units-per-second))))
     ;; "0.5" spends two digits, so this padding puts the number exactly on the
     ;; bound, and one more digit puts it past.
-    (let ((pad (make-string (- sigil-cl::+max-judge-score-digits+ 2)
+    (let ((pad (make-string (- agento11y-cl::+max-judge-score-digits+ 2)
                             :initial-element #\0)))
       (check "a number on the digit bound still parses"
-             (= 0.5d0 (sigil-cl::%parse-real (concatenate 'string "0.5" pad))))
+             (= 0.5d0 (agento11y-cl::%parse-real (concatenate 'string "0.5" pad))))
       (check "one digit past the bound is not a number"
-             (null (sigil-cl::%parse-real (concatenate 'string "0.5" pad "0")))))
+             (null (agento11y-cl::%parse-real (concatenate 'string "0.5" pad "0")))))
 
     ;; --- Prompt rendering ---
     (check "the default prompt ends with the JSON shape"
            (search "{\"score\": <number from 0 to 1>, \"passed\": <boolean>, \"explanation\": \"<brief reason>\"}"
-                   sigil-cl::+default-llm-judge-prompt+))
-    (let ((rendered (sigil-cl::%render-judge-prompt "in={input} out={output} exp={expected}"
+                   agento11y-cl::+default-llm-judge-prompt+))
+    (let ((rendered (agento11y-cl::%render-judge-prompt "in={input} out={output} exp={expected}"
                                                     "A" "B" "C")))
       (check "placeholders are substituted" (equal rendered "in=A out=B exp=C")))
-    (let ((rendered (sigil-cl::%render-judge-prompt "{input}|{output}" "{output}" "B" "C")))
+    (let ((rendered (agento11y-cl::%render-judge-prompt "{input}|{output}" "{output}" "B" "C")))
       (check "a substituted value is not substituted again"
              (equal rendered "{output}|B")))
 
@@ -5976,7 +6041,7 @@ experiment-runs branch, whose prefix they share."
                       (equal (getf grader :operation-name) "llm-judge")
                       (equal (getf grader :model-name) "gpt-4")))
           (check "the grader carries the reported usage"
-                 (= 10 (sigil-cl::token-usage-input-tokens (getf grader :usage)))))))
+                 (= 10 (agento11y-cl::token-usage-input-tokens (getf grader :usage)))))))
     (let* ((judge (make-llm-judge :evaluator-id "judge-2" :model-name "m"
                                   :threshold 0.9
                                   :invoke (lambda (p) (declare (ignore p))
@@ -6016,7 +6081,7 @@ experiment-runs branch, whose prefix they share."
       (destructuring-bind (label args) case
         (check (format nil "~a signals" label)
                (signals-condition-p (lambda () (apply #'make-llm-judge args))
-                                    'sigil-validation-error))))
+                                    'agento11y-validation-error))))
 
     ;; --- Regex judge ---
     (let* ((judge (make-regex-judge :evaluator-id "rx-1" :pattern "he.lo"))
@@ -6074,16 +6139,16 @@ experiment-runs branch, whose prefix they share."
                                     (list :output "a")))))
     (check "a blank pattern signals"
            (signals-condition-p (lambda () (make-regex-judge :evaluator-id "rx" :pattern ""))
-                                'sigil-validation-error))
+                                'agento11y-validation-error))
     (check "an uncompilable pattern signals"
            (signals-condition-p (lambda () (make-regex-judge :evaluator-id "rx" :pattern "([a-"))
-                                'sigil-validation-error))
+                                'agento11y-validation-error))
 
     ;; --- Recording an evaluation as a score ---
     (let ((calls (cons :calls nil))
           (graded-ids nil))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :traces-enabled nil
                             :http-fn (routed-http calls "exp-judge"))
         (declare (ignore get-requests))
@@ -6100,7 +6165,7 @@ experiment-runs branch, whose prefix they share."
               (let ((rec (start-generation client :model-provider "openai"
                                                   :model-name "gpt-4")))
                 (recorder-end rec))
-              (setf grader-base (sigil-cl::%grader-id-base run trial "final" "judge-1"))
+              (setf grader-base (agento11y-cl::%grader-id-base run trial "final" "judge-1"))
               (setf (cdr calls) nil)
               (let ((result (evaluate-output judge (list :input "q" :output "a"))))
                 (trial-record-evaluation trial result))
@@ -6140,7 +6205,7 @@ experiment-runs branch, whose prefix they share."
     ;; leave the first score pointing at the second one's prompt.
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :traces-enabled nil
                             :http-fn (routed-http calls "exp-rescore"))
         (declare (ignore get-requests))
@@ -6189,7 +6254,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Suppressing the grader generation ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :traces-enabled nil
                             :http-fn (routed-http calls "exp-nograder"))
         (declare (ignore get-requests))
@@ -6218,7 +6283,7 @@ experiment-runs branch, whose prefix they share."
     ;; --- Score key override ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
-          (make-test-client :eval-endpoint "https://sigil.example.test"
+          (make-test-client :eval-endpoint "https://agento11y.example.test"
                             :generation-enabled nil :traces-enabled nil
                             :http-fn (routed-http calls "exp-key"))
         (declare (ignore get-requests))
@@ -6263,7 +6328,7 @@ experiment-runs branch, whose prefix they share."
     (check "test-case-id is an accepted spelling for id"
            (equal (test-case-test-case-id (make-test-case :test-case-id "c2")) "c2"))
     (check "a test case requires an id"
-           (signals-condition-p (lambda () (make-test-case :id "")) 'sigil-validation-error))
+           (signals-condition-p (lambda () (make-test-case :id "")) 'agento11y-validation-error))
 
     ;; --- Snapshots ---
     (let ((snapshot (test-case-snapshot
@@ -6338,13 +6403,13 @@ experiment-runs branch, whose prefix they share."
              (null (test-suite-case suite "nope"))))
     (check "a suite requires an id"
            (signals-condition-p (lambda () (make-test-suite :suite-id " "))
-                                'sigil-validation-error))
+                                'agento11y-validation-error))
 
     ;; --- A run carries its suite's id and version, and trials snapshot cases ---
     (let ((calls (cons :calls nil)))
       (multiple-value-bind (client get-requests)
           (make-test-client
-           :eval-endpoint "https://sigil.example.test"
+           :eval-endpoint "https://agento11y.example.test"
            :generation-enabled nil :traces-enabled nil
            :http-fn (lambda (url &key method headers content &allow-other-keys)
                       (declare (ignore headers))
@@ -6389,22 +6454,22 @@ experiment-runs branch, whose prefix they share."
                (jobj "generations" (coerce generations 'vector)))
              (signals-validation-p (thunk)
                (handler-case (progn (funcall thunk) nil)
-                 (sigil-validation-error () t))))
+                 (agento11y-validation-error () t))))
       ;; Members response normalization.
       (check "member list from bare array"
-             (= 1 (length (sigil-cl::%member-list (jarr (jobj "conversation_id" "c1"))))))
+             (= 1 (length (agento11y-cl::%member-list (jarr (jobj "conversation_id" "c1"))))))
       (check "member list from members wrapper"
-             (= 1 (length (sigil-cl::%member-list
+             (= 1 (length (agento11y-cl::%member-list
                            (jobj "members" (jarr (jobj "conversation_id" "c1")))))))
       (check "member list from items wrapper"
-             (= 1 (length (sigil-cl::%member-list
+             (= 1 (length (agento11y-cl::%member-list
                            (jobj "items" (jarr (jobj "conversation_id" "c1")))))))
       (check "member list drops non-objects"
-             (null (sigil-cl::%member-list (jarr "junk" 42))))
+             (null (agento11y-cl::%member-list (jarr "junk" 42))))
       (check "member list empty for unexpected body"
-             (null (sigil-cl::%member-list "oops")))
+             (null (agento11y-cl::%member-list "oops")))
       (check "member list empty members falls through to items"
-             (= 1 (length (sigil-cl::%member-list
+             (= 1 (length (agento11y-cl::%member-list
                            (jobj "members" (jarr)
                                  "items" (jarr (jobj "conversation_id" "c1")))))))
 
@@ -6444,7 +6509,7 @@ experiment-runs branch, whose prefix they share."
       (let ((urls nil))
         (multiple-value-bind (client get-requests)
             (make-test-client
-             :eval-endpoint "https://sigil.example.test"
+             :eval-endpoint "https://agento11y.example.test"
              :generation-enabled nil :traces-enabled nil
              :http-fn (lambda (url &key method headers content &allow-other-keys)
                         (declare (ignore method headers content))
@@ -6519,24 +6584,24 @@ experiment-runs branch, whose prefix they share."
   "Return all hist-state structs in REGISTRY as a list."
   (let ((out nil))
     (maphash (lambda (k st) (declare (ignore k)) (push st out))
-             (sigil-cl::metric-registry-table registry))
+             (agento11y-cl::metric-registry-table registry))
     out))
 
 (defun %series-named (registry name)
   "Return hist-states in REGISTRY whose metric name is NAME."
-  (remove-if-not (lambda (st) (equal (sigil-cl::hist-state-name st) name))
+  (remove-if-not (lambda (st) (equal (agento11y-cl::hist-state-name st) name))
                  (%registry-series registry)))
 
 (defun %series-attr (st key)
   "Return the value of attribute KEY in hist-state ST, or NIL."
-  (cdr (assoc key (sigil-cl::hist-state-attrs st) :test #'equal)))
+  (cdr (assoc key (agento11y-cl::hist-state-attrs st) :test #'equal)))
 
 (defun run-metrics-tests ()
   (with-test-suite ("Metrics")
     ;; --- OTLP datapoint field types ---
-    (let* ((bounds sigil-cl::+duration-buckets+)
+    (let* ((bounds agento11y-cl::+duration-buckets+)
            (counts (append (make-list (length bounds) :initial-element 0) (list 0)))
-           (dp (sigil-cl::build-histogram-datapoint
+           (dp (agento11y-cl::build-histogram-datapoint
                 (vector (otel-string-attr "gen_ai.operation.name" "generateText"))
                 bounds counts 2.5d0 1 "100" "200")))
       (check "datapoint count is uint64 string" (equal (jget dp "count") "1"))
@@ -6551,18 +6616,18 @@ experiment-runs branch, whose prefix they share."
       (check "datapoint timeUnixNano set" (equal (jget dp "timeUnixNano") "200")))
 
     ;; --- OTLP resourceMetrics envelope shape ---
-    (let* ((dp (sigil-cl::build-histogram-datapoint
-                (vector) sigil-cl::+duration-buckets+
-                (append (make-list (length sigil-cl::+duration-buckets+) :initial-element 0)
+    (let* ((dp (agento11y-cl::build-histogram-datapoint
+                (vector) agento11y-cl::+duration-buckets+
+                (append (make-list (length agento11y-cl::+duration-buckets+) :initial-element 0)
                         (list 0))
                 1.0d0 1 "0" "1"))
-           (metric (sigil-cl::build-otlp-metric "gen_ai.client.operation.duration" "s" (list dp)))
-           (payload (sigil-cl::build-otlp-metrics-payload (list metric) "my-svc" "1.0")))
+           (metric (agento11y-cl::build-otlp-metric "gen_ai.client.operation.duration" "s" (list dp)))
+           (payload (agento11y-cl::build-otlp-metrics-payload (list metric) "my-svc" "1.0")))
       (check "payload has resourceMetrics" (jget payload "resourceMetrics"))
       (let* ((rm (aref (jget payload "resourceMetrics") 0))
              (sm (aref (jget rm "scopeMetrics") 0)))
-        (check "scope name is sigil-cl"
-               (equal (jget* sm "scope" "name") "sigil-cl"))
+        (check "scope name is agento11y-cl"
+               (equal (jget* sm "scope" "name") "agento11y-cl"))
         (let ((m (aref (jget sm "metrics") 0)))
           (check "metric name" (equal (jget m "name") "gen_ai.client.operation.duration"))
           (check "metric unit" (equal (jget m "unit") "s"))
@@ -6572,31 +6637,31 @@ experiment-runs branch, whose prefix they share."
                  (plusp (length (jget* m "histogram" "dataPoints")))))))
 
     ;; --- Aggregation + bucket assignment ---
-    (let ((reg (sigil-cl::make-metric-registry)))
-      (sigil-cl::record-histogram reg "gen_ai.client.operation.duration" "s"
-                                  sigil-cl::+duration-buckets+ nil 2.5d0)
+    (let ((reg (agento11y-cl::make-metric-registry)))
+      (agento11y-cl::record-histogram reg "gen_ai.client.operation.duration" "s"
+                                  agento11y-cl::+duration-buckets+ nil 2.5d0)
       (let ((st (first (%series-named reg "gen_ai.client.operation.duration"))))
         (check "series created" (not (null st)))
-        (check "count incremented" (= (sigil-cl::hist-state-count st) 1))
-        (check "sum accumulated" (= (sigil-cl::hist-state-sum st) 2.5d0))
+        (check "count incremented" (= (agento11y-cl::hist-state-count st) 1))
+        (check "sum accumulated" (= (agento11y-cl::hist-state-sum st) 2.5d0))
         (check "bucketCounts length = bounds + 1"
-               (= (length (sigil-cl::hist-state-counts st))
-                  (1+ (length sigil-cl::+duration-buckets+))))
+               (= (length (agento11y-cl::hist-state-counts st))
+                  (1+ (length agento11y-cl::+duration-buckets+))))
         ;; 2.5s -> first bound >= 2.5 is 2.56 at index 8
         (check "2.5s lands in bucket index 8"
-               (= (nth 8 (sigil-cl::hist-state-counts st)) 1))
+               (= (nth 8 (agento11y-cl::hist-state-counts st)) 1))
         (check "no other bucket incremented"
-               (= 1 (reduce #'+ (sigil-cl::hist-state-counts st))))))
+               (= 1 (reduce #'+ (agento11y-cl::hist-state-counts st))))))
 
     ;; --- Aggregation across events with same attrs collapses to one series ---
-    (let ((reg (sigil-cl::make-metric-registry)))
-      (sigil-cl::record-histogram reg "m" "s" sigil-cl::+duration-buckets+
+    (let ((reg (agento11y-cl::make-metric-registry)))
+      (agento11y-cl::record-histogram reg "m" "s" agento11y-cl::+duration-buckets+
                                   (list (cons "a" "1")) 0.5d0)
-      (sigil-cl::record-histogram reg "m" "s" sigil-cl::+duration-buckets+
+      (agento11y-cl::record-histogram reg "m" "s" agento11y-cl::+duration-buckets+
                                   (list (cons "a" "1")) 0.5d0)
       (check "same attrs -> one series" (= (length (%series-named reg "m")) 1))
       (check "count summed across events"
-             (= (sigil-cl::hist-state-count (first (%series-named reg "m"))) 2)))
+             (= (agento11y-cl::hist-state-count (first (%series-named reg "m"))) 2)))
 
     ;; --- Generation produces all four histograms ---
     (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
@@ -6617,7 +6682,7 @@ experiment-runs branch, whose prefix they share."
                     :duration-seconds 2.5d0
                     :ttft-seconds 0.3d0)
         (recorder-end rec)
-        (let ((reg (sigil-cl::client-metric-registry client)))
+        (let ((reg (agento11y-cl::client-metric-registry client)))
           (check "operation.duration recorded"
                  (= (length (%series-named reg "gen_ai.client.operation.duration")) 1))
           (check "time_to_first_token recorded"
@@ -6646,10 +6711,10 @@ experiment-runs branch, whose prefix they share."
             (check "duration error.type empty (no error)"
                    (equal (%series-attr dur "error.type") ""))
             (check "duration 2.5s in bucket index 8"
-                   (= (nth 8 (sigil-cl::hist-state-counts dur)) 1)))
+                   (= (nth 8 (agento11y-cl::hist-state-counts dur)) 1)))
           ;; tool_calls value = 1 -> bucket index 1 (bound 1)
           (let ((tc (first (%series-named reg "gen_ai.client.tool_calls_per_operation"))))
-            (check "tool_calls sum = 1" (= (sigil-cl::hist-state-sum tc) 1d0))))))
+            (check "tool_calls sum = 1" (= (agento11y-cl::hist-state-sum tc) 1d0))))))
 
     ;; --- Token type: only non-zero types produce series ---
     (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
@@ -6659,7 +6724,7 @@ experiment-runs branch, whose prefix they share."
         (set-result rec :usage (make-token-usage :input 100 :output 0)
                         :duration-seconds 1.0d0)
         (recorder-end rec)
-        (let* ((reg (sigil-cl::client-metric-registry client))
+        (let* ((reg (agento11y-cl::client-metric-registry client))
                (token-series (%series-named reg "gen_ai.client.token.usage")))
           (check "only input token.usage series (output zero)"
                  (= (length token-series) 1))
@@ -6683,8 +6748,8 @@ experiment-runs branch, whose prefix they share."
             (check "POST body has resourceMetrics" (jget parsed "resourceMetrics"))
             (let* ((rm (aref (jget parsed "resourceMetrics") 0))
                    (sm (aref (jget rm "scopeMetrics") 0)))
-              (check "POST scope name sigil-cl"
-                     (equal (jget* sm "scope" "name") "sigil-cl"))
+              (check "POST scope name agento11y-cl"
+                     (equal (jget* sm "scope" "name") "agento11y-cl"))
               (check "POST has metrics" (plusp (length (jget sm "metrics")))))))))
 
     ;; --- Embedding records duration + input token.usage ---
@@ -6694,7 +6759,7 @@ experiment-runs branch, whose prefix they share."
                                          :model-name "text-embedding-3-small")))
         (set-result rec :input-count 3 :input-tokens 42 :duration-seconds 0.5d0)
         (recorder-end rec)
-        (let ((reg (sigil-cl::client-metric-registry client)))
+        (let ((reg (agento11y-cl::client-metric-registry client)))
           (check "embedding duration recorded"
                  (= (length (%series-named reg "gen_ai.client.operation.duration")) 1))
           (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
@@ -6710,7 +6775,7 @@ experiment-runs branch, whose prefix they share."
       (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc1")))
         (set-result rec :result "ok" :duration-seconds 0.2d0)
         (recorder-end rec)
-        (let ((reg (sigil-cl::client-metric-registry client)))
+        (let ((reg (agento11y-cl::client-metric-registry client)))
           (check "tool execution duration recorded"
                  (= (length (%series-named reg "gen_ai.client.operation.duration")) 1))
           (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
@@ -6723,53 +6788,53 @@ experiment-runs branch, whose prefix they share."
       (let ((rec (start-generation client :mode :sync
                                           :model-provider "openai" :model-name "gpt-4")))
         (set-result rec :usage (make-token-usage :input 10 :output 5))
-        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
-        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:02Z")
+        (setf (agento11y-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (agento11y-cl::recorder-completed-at rec) "2024-01-01T00:00:02Z")
         (recorder-end rec)
-        (let* ((reg (sigil-cl::client-metric-registry client))
+        (let* ((reg (agento11y-cl::client-metric-registry client))
                (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
           (check "generation duration from timestamps recorded" (not (null dur)))
           (check "generation duration from timestamps = 2s"
-                 (= (sigil-cl::hist-state-sum dur) 2d0)))))
+                 (= (agento11y-cl::hist-state-sum dur) 2d0)))))
     (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
       (declare (ignore get-requests))
       (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc1")))
         (set-result rec :result "ok")
-        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
-        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:01Z")
+        (setf (agento11y-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (agento11y-cl::recorder-completed-at rec) "2024-01-01T00:00:01Z")
         (recorder-end rec)
-        (let* ((reg (sigil-cl::client-metric-registry client))
+        (let* ((reg (agento11y-cl::client-metric-registry client))
                (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
           (check "tool duration from timestamps recorded" (not (null dur)))
           (check "tool duration from timestamps = 1s"
-                 (= (sigil-cl::hist-state-sum dur) 1d0)))))
+                 (= (agento11y-cl::hist-state-sum dur) 1d0)))))
     (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
       (declare (ignore get-requests))
       (let ((rec (start-embedding client :model-provider "openai"
                                          :model-name "text-embedding-3-small")))
         (set-result rec :input-count 1 :input-tokens 10)
-        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
-        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:03Z")
+        (setf (agento11y-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (agento11y-cl::recorder-completed-at rec) "2024-01-01T00:00:03Z")
         (recorder-end rec)
-        (let* ((reg (sigil-cl::client-metric-registry client))
+        (let* ((reg (agento11y-cl::client-metric-registry client))
                (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
           (check "embedding duration from timestamps recorded" (not (null dur)))
           (check "embedding duration from timestamps = 3s"
-                 (= (sigil-cl::hist-state-sum dur) 3d0)))))
+                 (= (agento11y-cl::hist-state-sum dur) 3d0)))))
 
     (multiple-value-bind (client get-requests)
         (make-test-client :metrics-enabled t :workflow-steps-enabled t)
       (declare (ignore get-requests))
-      (let ((rec (sigil-cl::start-workflow-step client :conversation-id "conv-1"
+      (let ((rec (agento11y-cl::start-workflow-step client :conversation-id "conv-1"
                                                        :step-name "classify")))
-        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
-        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:01Z")
-        (sigil-cl::recorder-end rec)
-        (let* ((reg (sigil-cl::client-metric-registry client))
+        (setf (agento11y-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (agento11y-cl::recorder-completed-at rec) "2024-01-01T00:00:01Z")
+        (agento11y-cl::recorder-end rec)
+        (let* ((reg (agento11y-cl::client-metric-registry client))
                (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
           (check "workflow step duration from timestamps recorded" (not (null dur)))
           (check "workflow step duration from timestamps = 1s"
-                 (= (sigil-cl::hist-state-sum dur) 1d0)))))
+                 (= (agento11y-cl::hist-state-sum dur) 1d0)))))
 
     ;; --- Explicit duration-seconds wins over timestamps ---
     (multiple-value-bind (client get-requests) (make-test-client :metrics-enabled t)
@@ -6778,13 +6843,13 @@ experiment-runs branch, whose prefix they share."
                                           :model-provider "openai" :model-name "gpt-4")))
         (set-result rec :usage (make-token-usage :input 10 :output 5)
                         :duration-seconds 0.5d0)
-        (setf (sigil-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
-        (setf (sigil-cl::recorder-completed-at rec) "2024-01-01T00:00:02Z")
+        (setf (agento11y-cl::recorder-started-at rec) "2024-01-01T00:00:00Z")
+        (setf (agento11y-cl::recorder-completed-at rec) "2024-01-01T00:00:02Z")
         (recorder-end rec)
-        (let* ((reg (sigil-cl::client-metric-registry client))
+        (let* ((reg (agento11y-cl::client-metric-registry client))
                (dur (first (%series-named reg "gen_ai.client.operation.duration"))))
           (check "explicit duration wins over timestamps"
-                 (= (sigil-cl::hist-state-sum dur) 0.5d0)))))
+                 (= (agento11y-cl::hist-state-sum dur) 0.5d0)))))
 
     ;; --- Client config tags promoted onto metric series; per-call tags are not ---
     (let ((client (make-client
@@ -6799,17 +6864,17 @@ experiment-runs branch, whose prefix they share."
         (set-result rec :usage (make-token-usage :input 100 :output 50)
                         :duration-seconds 1.0d0)
         (recorder-end rec)
-        (let ((reg (sigil-cl::client-metric-registry client)))
+        (let ((reg (agento11y-cl::client-metric-registry client)))
           (let ((dur (first (%series-named reg "gen_ai.client.operation.duration"))))
-            (check "duration series carries sigil.tag.env"
-                   (equal (%series-attr dur "sigil.tag.env") "prod"))
+            (check "duration series carries agento11y.tag.env"
+                   (equal (%series-attr dur "agento11y.tag.env") "prod"))
             (check "duration series omits per-call tag"
-                   (null (%series-attr dur "sigil.tag.request_id"))))
+                   (null (%series-attr dur "agento11y.tag.request_id"))))
           (let ((tok (first (%series-named reg "gen_ai.client.token.usage"))))
-            (check "token.usage series carries sigil.tag.env"
-                   (equal (%series-attr tok "sigil.tag.env") "prod"))
+            (check "token.usage series carries agento11y.tag.env"
+                   (equal (%series-attr tok "agento11y.tag.env") "prod"))
             (check "token.usage series omits per-call tag"
-                   (null (%series-attr tok "sigil.tag.request_id")))))))
+                   (null (%series-attr tok "agento11y.tag.request_id")))))))
 
     ;; --- Disabled by default: no recording, no POST ---
     (multiple-value-bind (client get-requests) (make-test-client) ; metrics-enabled nil
@@ -6819,9 +6884,9 @@ experiment-runs branch, whose prefix they share."
                         :duration-seconds 1.0d0)
         (recorder-end rec)
         (client-flush client)
-        (let ((reg (sigil-cl::client-metric-registry client)))
+        (let ((reg (agento11y-cl::client-metric-registry client)))
           (check "registry empty when metrics disabled"
-                 (zerop (hash-table-count (sigil-cl::metric-registry-table reg)))))
+                 (zerop (hash-table-count (agento11y-cl::metric-registry-table reg)))))
         (let ((metric-posts (remove-if-not
                              (lambda (r) (search "/v1/metrics" (first r)))
                              (funcall get-requests))))
@@ -6832,7 +6897,7 @@ experiment-runs branch, whose prefix they share."
 ;;; ================================================================
 
 (defun run-tests ()
-  "Run all sigil-cl tests. Returns (values ok-p total-pass total-fail)."
+  "Run all agento11y-cl tests. Returns (values ok-p total-pass total-fail)."
   (let ((total-pass 0)
         (total-fail 0))
     (dolist (test-fn (list #'run-util-tests

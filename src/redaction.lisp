@@ -1,10 +1,10 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; Secret redaction engine for exported generation content.
 ;;;
 ;;; ~22 high-confidence patterns hand-curated from Gitleaks
 ;;; (https://github.com/gitleaks/gitleaks). Kept in sync with
-;;; sigil-sdk/python/sigil_sdk/redaction.py. Two tiers:
+;;; python/agento11y/redaction.py. Two tiers:
 ;;;   - Tier 1: definite secret formats plus optional email addresses,
 ;;;     used by both redact-full and redact-light.
 ;;;   - Tier 2: heuristic env-value patterns, used only by redact-full.

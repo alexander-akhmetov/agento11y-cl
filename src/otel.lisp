@@ -1,6 +1,6 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
-(defvar +sdk-name+ "sigil-cl")
+(defvar +sdk-name+ "agento11y-cl")
 
 ;;; --- Attribute helpers ---
 
@@ -61,7 +61,7 @@ KIND: 1=INTERNAL, 3=CLIENT. STATUS-CODE: 1=OK, 2=ERROR."
 ;;; --- Metric histogram buckets ---
 ;;; Duration and token bucket boundaries match the current OTel GenAI semantic
 ;;; conventions (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/)
-;;; and the reference sigil-sdk wire output. The older [0.001..10.0] duration set
+;;; and the reference agento11y wire output. The older [0.001..10.0] duration set
 ;;; shown on some sources is superseded; do not revert to it.
 
 (defparameter +duration-buckets+
@@ -134,7 +134,7 @@ encoded as uint64 strings (OTLP JSON convention); sum stays a JSON number."
               (error () nil))))))))
 
 (defun classify-error (error-string)
-  "Classify an error string into a Sigil error category.
+  "Classify an error string into an SDK error category.
 The contract is a string. A caller passing a condition object or any other
 value gets it printed rather than an error: callers include payload and span
 builders, where signalling here would drop the whole record."
@@ -161,17 +161,17 @@ Returns the classified category so consumers keep the classification."
 ;;; --- Common span attributes ---
 
 (defun prefixed-tag-pairs (tags)
-  "Turn a tags alist into (\"sigil.tag.<key>\" . value) pairs, skipping
-non-string entries. Mirrors the reference SDK's sigil.tag.* promotion."
+  "Turn a tags alist into (\"agento11y.tag.<key>\" . value) pairs, skipping
+non-string entries. Mirrors the reference SDK's agento11y.tag.* promotion."
   (loop for pair in tags
         when (and (consp pair) (stringp (car pair)) (stringp (cdr pair)))
-          collect (cons (concatenate 'string "sigil.tag." (car pair)) (cdr pair))))
+          collect (cons (concatenate 'string "agento11y.tag." (car pair)) (cdr pair))))
 
 (defun common-span-attrs (config &key provider model agent-name agent-version
                                       conversation-id)
-  "Build list of common OTLP attributes for Sigil spans."
+  "Build list of common OTLP attributes for Agent Observability spans."
   (let ((attrs nil))
-    (push (otel-string-attr "sigil.sdk.name" +sdk-name+) attrs)
+    (push (otel-string-attr "agento11y.sdk.name" +sdk-name+) attrs)
     (when (and conversation-id (stringp conversation-id) (plusp (length conversation-id)))
       (push (otel-string-attr "gen_ai.conversation.id" conversation-id) attrs))
     (when (and agent-name (plusp (length agent-name)))

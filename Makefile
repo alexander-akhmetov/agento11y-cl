@@ -14,14 +14,14 @@ LOAD := --load $(QUICKLISP_HOME)/setup.lisp --eval '(push (truename ".") asdf:*c
 
 test:
 	@set -o pipefail; $(SBCL) $(LOAD) \
-		--eval '(asdf:load-system :sigil-cl/t)' \
-		--eval '(multiple-value-bind (ok pass fail) (sigil-cl/t:run-tests) (declare (ignore pass fail)) (uiop:quit (if ok 0 1)))' \
+		--eval '(asdf:load-system :agento11y-cl/t)' \
+		--eval '(multiple-value-bind (ok pass fail) (agento11y-cl/t:run-tests) (declare (ignore pass fail)) (uiop:quit (if ok 0 1)))' \
 		2>&1 | grep -E "^(=|---|  [✓✗]|TOTAL)"
 
 load:
 	@set -o pipefail; $(SBCL) $(LOAD) \
-		--eval '(asdf:load-system :sigil-cl)' \
-		--eval '(format t "~%sigil-cl loaded OK~%")' \
+		--eval '(asdf:load-system :agento11y-cl)' \
+		--eval '(format t "~%agento11y-cl loaded OK~%")' \
 		2>&1 | tail -5
 
 clean:

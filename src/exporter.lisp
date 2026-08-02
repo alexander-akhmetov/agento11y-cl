@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 (defun do-http-post (config url headers body)
   "POST body to url. Uses config's http-fn if set, otherwise dexador."
@@ -27,18 +27,18 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
                      ((<= 200 status 299)
                       (return (values t resp-body)))
                      ((<= 400 status 499)
-                      (sigil-log config :warn "exporter"
+                      (agento11y-log config :warn "exporter"
                                 (format nil "~a rejected with ~d" label status))
                       (return nil))
                      (t
-                      (sigil-log config :warn "exporter"
+                      (agento11y-log config :warn "exporter"
                                 (format nil "~a failed (~d), retrying ~d/~d"
                                         label status (1+ attempt) (config-max-retries config)))
                       (sleep (backoff-seconds attempt
                                              (config-initial-backoff-sec config)
                                              (config-max-backoff-sec config))))))
                (error (e)
-                 (sigil-log config :warn "exporter"
+                 (agento11y-log config :warn "exporter"
                            (format nil "~a error: ~a, retrying ~d/~d"
                                    label (princ-to-string e)
                                    (1+ attempt) (config-max-retries config)))
@@ -46,7 +46,7 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
                                         (config-initial-backoff-sec config)
                                         (config-max-backoff-sec config)))))
           finally (progn
-                    (sigil-log config :warn "exporter"
+                    (agento11y-log config :warn "exporter"
                               (format nil "~a failed after ~d retries"
                                       label (config-max-retries config)))
                     (return nil)))))
@@ -61,7 +61,7 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
               (when (and errors (vectorp errors))
                 (loop for err across errors
                       when (hash-table-p err)
-                      do (sigil-log config :warn "exporter"
+                      do (agento11y-log config :warn "exporter"
                                    (format nil "generation rejected: ~a"
                                            (or (jget err "message")
                                                (jget err "error")
@@ -69,7 +69,7 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
     (error () nil)))
 
 (defun export-generations (config generations auth-headers)
-  "POST a batch of generations to the Sigil generation endpoint."
+  "POST a batch of generations to the generation endpoint."
   (when (null generations) (return-from export-generations t))
   (let* ((url (config-generation-endpoint config))
          (payload (jzon:stringify (jobj "generations" (coerce generations 'vector)))))
@@ -89,7 +89,7 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
     (post-with-retry config url payload auth-headers "traces" (length spans))))
 
 (defun export-workflow-steps (config workflow-steps auth-headers)
-  "POST a batch of workflow steps to the Sigil workflow steps endpoint."
+  "POST a batch of workflow steps to the workflow steps endpoint."
   (when (null workflow-steps) (return-from export-workflow-steps t))
   (let* ((url (config-workflow-steps-endpoint config))
          (payload (jzon:stringify (jobj "workflow_steps"

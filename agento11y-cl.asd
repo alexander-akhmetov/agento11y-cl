@@ -1,5 +1,5 @@
-(defsystem :sigil-cl
-  :description "Common Lisp SDK for Grafana Sigil AI observability"
+(defsystem :agento11y-cl
+  :description "Common Lisp SDK for Grafana Agent Observability"
   :version "0.1.0"
   :author "Alexander Akhmetov"
   :license "Apache-2.0"
@@ -34,9 +34,9 @@
                (:file "conversations")
                (:file "normalize")))
 
-(defsystem :sigil-cl/t
-  :description "Tests for sigil-cl"
-  :depends-on (:sigil-cl)
+(defsystem :agento11y-cl/t
+  :description "Tests for agento11y-cl"
+  :depends-on (:agento11y-cl)
   :serial t
   :pathname "t/"
   :components ((:file "package")

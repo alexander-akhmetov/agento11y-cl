@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; Built-in output evaluators.
 ;;;
@@ -214,7 +214,7 @@ unless the reply overrides it."
         (when found-p
           (let ((score (%parse-real raw-score)))
             (unless score
-              (error 'sigil-validation-error
+              (error 'agento11y-validation-error
                      :message "LLM judge response requires a numeric score"))
             (let* ((clamped (min 1.0d0 (max 0.0d0 (coerce score 'double-float))))
                    (passed (>= clamped threshold)))
@@ -232,9 +232,9 @@ unless the reply overrides it."
     ;; Two distinct failures: nothing that parses at all, versus objects that
     ;; parse but carry no score. They point at different prompt problems.
     (if (null objects)
-        (error 'sigil-validation-error
+        (error 'agento11y-validation-error
                :message "LLM judge response did not contain a JSON object")
-        (error 'sigil-validation-error
+        (error 'agento11y-validation-error
                :message "LLM judge response requires a numeric score"))))
 
 ;;; --- LLM judge ---
@@ -268,16 +268,16 @@ plus, as a second value, an optional TOKEN-USAGE. PARSER, when supplied, is
 called as (funcall parser text) and returns (values score passed explanation);
 the default reads the JSON shape in +DEFAULT-LLM-JUDGE-PROMPT+."
   (when (%blank-string-p evaluator-id)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "evaluator validation failed: evaluator_id is required"))
   (unless (functionp invoke)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "evaluator validation failed: invoke callback is required"))
   (when (%blank-string-p model-name)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "evaluator validation failed: model name is required"))
   (unless (and (realp threshold) (<= 0 threshold 1))
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "evaluator validation failed: pass threshold must be between 0 and 1"))
   (let ((resolved-version (if (%blank-string-p version) "1" (%trimmed-text version))))
     (make-instance 'llm-judge
@@ -357,10 +357,10 @@ leftmost match to span the whole output, which is what CL-PPCRE:SCAN reports
 naturally; Python's re.fullmatch backtracks inside the pattern to find a match
 that spans the whole string, so it accepts patterns this check rejects."
   (when (%blank-string-p evaluator-id)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "evaluator validation failed: evaluator_id is required"))
   (when (%blank-string-p pattern)
-    (error 'sigil-validation-error
+    (error 'agento11y-validation-error
            :message "evaluator validation failed: pattern is required"))
   (let* ((prefix (concatenate 'string
                               (if case-insensitive "i" "")
@@ -372,7 +372,7 @@ that spans the whole string, so it accepts patterns this check rejects."
          (scanner (handler-case
                       (cl-ppcre:create-scanner source)
                     (error (e)
-                      (error 'sigil-validation-error
+                      (error 'agento11y-validation-error
                              :message (format nil "evaluator validation failed: compile regex judge pattern: ~a"
                                               (princ-to-string e)))))))
     (make-instance 'regex-judge

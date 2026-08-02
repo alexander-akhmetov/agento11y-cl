@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 (defun encode-basic-auth (user password)
   "Encode USER:PASSWORD as Base64 for HTTP Basic Auth."
@@ -30,7 +30,7 @@ position of the first occurrence so caller-defined ordering is preserved."
 For :basic mode, uses tenant-id as username when auth-user is omitted
 (standard Grafana Cloud configuration). Any user-supplied
 config-extra-headers are merged in afterwards; on case-insensitive name
-collisions the user-supplied header wins (so SIGIL_HEADERS=Authorization=...
+collisions the user-supplied header wins (so AGENTO11Y_HEADERS=Authorization=...
 can override the auth-mode-derived value)."
   (let ((headers nil))
     (case (config-auth-mode config)

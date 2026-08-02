@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; Typed trials.
 ;;;
@@ -45,7 +45,7 @@
    ;; queued, so the run stops asserting a score count the backend will grow.
    (cloud-evaluated-fn :initarg :cloud-evaluated-fn :initform nil
                        :reader trial-cloud-evaluated-fn)
-   (lock :initform (bt2:make-lock :name "sigil-experiment-trial")
+   (lock :initform (bt2:make-lock :name "agento11y-experiment-trial")
          :reader trial-lock)))
 
 (defun trial-mint-id (experiment-id test-case-id attempt)
@@ -61,9 +61,9 @@ so a rerun from any SDK addresses the same trial."
                                             trace-id span-id test-case metadata)
   "POST a typed trial under EXPERIMENT-ID. Idempotent on TRIAL-ID."
   (when (%blank-string-p trial-id)
-    (error 'sigil-validation-error :message "trial validation failed: trial_id is required"))
+    (error 'agento11y-validation-error :message "trial validation failed: trial_id is required"))
   (when (%blank-string-p test-case-id)
-    (error 'sigil-validation-error :message "trial validation failed: test_case_id is required"))
+    (error 'agento11y-validation-error :message "trial validation failed: test_case_id is required"))
   (let* ((config (client-config client))
          (payload (jobj "trial_id" (%trimmed-text trial-id)
                         "test_case_id" (%trimmed-text test-case-id)
@@ -90,7 +90,7 @@ so a rerun from any SDK addresses the same trial."
                             output-tokens duration-ms conversation-id trace-id span-id)
   "PATCH a typed trial. The body is sparse: only supplied fields are sent."
   (when (%blank-string-p trial-id)
-    (error 'sigil-validation-error :message "trial validation failed: trial_id is required"))
+    (error 'agento11y-validation-error :message "trial validation failed: trial_id is required"))
   (let* ((config (client-config client))
          (payload (jobj)))
     (unless (%blank-string-p status)
@@ -125,10 +125,10 @@ read as non-terminal and poll to the caller's deadline; a blank evaluation_id
 would turn the next status read into a validation error blaming the caller."
   (let ((status (%trimmed-text (jget response "status"))))
     (unless (member status +trial-evaluation-statuses+ :test #'string=)
-      (error 'sigil-export-error
+      (error 'agento11y-export-error
              :message (format nil "unsupported evaluation status ~s" status)))
     (when (%blank-string-p (jget response "evaluation_id"))
-      (error 'sigil-export-error
+      (error 'agento11y-export-error
              :message "evaluation response carries no evaluation_id")))
   response)
 
@@ -143,15 +143,15 @@ would turn the next status read into a validation error blaming the caller."
   "Queue a stored tenant evaluator against the trial's bound conversation.
 The evaluation is keyed by trial, conversation, evaluator, and resolved
 version, so triggering the same combination returns the existing row instead
-of grading twice. Experimental: signals SIGIL-EXPERIMENTAL-DISABLED-ERROR
+of grading twice. Experimental: signals AGENTO11Y-EXPERIMENTAL-DISABLED-ERROR
 without sending a request unless the gate is on."
   (let ((config (client-config client)))
     (%require-experimental config "cloud trial evaluation")
     (when (%blank-string-p trial-id)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: trial_id is required"))
     (when (%blank-string-p evaluator-id)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: evaluator_id is required"))
     (let ((payload (jobj "evaluator_id" (%trimmed-text evaluator-id))))
       (unless (%blank-string-p evaluator-version)
@@ -168,10 +168,10 @@ without sending a request unless the gate is on."
   (let ((config (client-config client)))
     (%require-experimental config "cloud trial evaluation")
     (when (%blank-string-p trial-id)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: trial_id is required"))
     (when (%blank-string-p evaluation-id)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: evaluation_id is required"))
     (%validate-trial-evaluation
      (request-eval-json config :get
@@ -197,8 +197,8 @@ without sending a request unless the gate is on."
 
 Persists the local conversation binding, flushes pending generations, queues
 the evaluation, then blocks until it reaches a terminal status. Returns the
-evaluation on success; signals SIGIL-TRIAL-EVALUATION-FAILED-ERROR when the
-worker fails and SIGIL-TRIAL-EVALUATION-TIMEOUT-ERROR when TIMEOUT-SEC runs
+evaluation on success; signals AGENTO11Y-TRIAL-EVALUATION-FAILED-ERROR when the
+worker fails and AGENTO11Y-TRIAL-EVALUATION-TIMEOUT-ERROR when TIMEOUT-SEC runs
 out. Both conditions carry the evaluation id, and the evaluation keeps running
 server-side either way.
 
@@ -208,12 +208,12 @@ must pass :score-count NIL to EXPERIMENT-RUN-FINALIZE itself.
 
 TIMEOUT-SEC and POLL-INTERVAL-SEC are taken literally, unlike Go, where zero
 means the default. A zero timeout still queues the evaluation, but the wait
-signals SIGIL-TRIAL-EVALUATION-TIMEOUT-ERROR unless the trigger already
+signals AGENTO11Y-TRIAL-EVALUATION-TIMEOUT-ERROR unless the trigger already
 reported a terminal status; a caller that only wants to queue the evaluation
 uses TRIGGER-TRIAL-EVALUATION. A zero interval reads status back to back. Use
 both in tests, not to make a real wait faster.
 
-Experimental: signals SIGIL-EXPERIMENTAL-DISABLED-ERROR without sending a
+Experimental: signals AGENTO11Y-EXPERIMENTAL-DISABLED-ERROR without sending a
 request unless the gate is on."
   (let* ((client (trial-client trial))
          (config (client-config client))
@@ -223,16 +223,16 @@ request unless the gate is on."
     ;; leaves nothing behind.
     (%require-experimental config "cloud trial evaluation")
     (when (%blank-string-p evaluator-id)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: evaluator_id is required"))
     (when (minusp timeout-sec)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: evaluation timeout must not be negative"))
     (when (minusp poll-interval-sec)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: evaluation poll interval must not be negative"))
     (when (%blank-string-p (trial-conversation-id trial))
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "trial validation failed: bind a conversation before evaluating a trial"))
     ;; TRIAL-BIND-CONVERSATION is local until now, and the backend refuses an
     ;; evaluation for a trial with no stored conversation.
@@ -260,7 +260,7 @@ request unless the gate is on."
             ((string= status "failed")
              (let ((evaluation-id (%trimmed-text (jget evaluation "evaluation_id")))
                    (detail (%trimmed-text (jget evaluation "error"))))
-               (error 'sigil-trial-evaluation-failed-error
+               (error 'agento11y-trial-evaluation-failed-error
                       :evaluation-id evaluation-id
                       :detail (when (plusp (length detail)) detail)
                       :message (format nil "trial evaluation failed~@[: ~a~]"
@@ -271,7 +271,7 @@ request unless the gate is on."
           ;; remaining budget, so an evaluation that finishes inside the last
           ;; window is not reported as a timeout.
           (when (<= remaining 0)
-            (error 'sigil-trial-evaluation-timeout-error
+            (error 'agento11y-trial-evaluation-timeout-error
                    :evaluation-id (%trimmed-text (jget evaluation "evaluation_id"))
                    :message (format nil "trial evaluation did not finish within ~a second(s)"
                                     timeout-sec)))
@@ -284,7 +284,7 @@ request unless the gate is on."
 ;;; --- Trial artifacts ---
 
 (defun %artifact-kind-from-mime (mime)
-  "Map a MIME type onto a Sigil artifact kind.
+  "Map a MIME type onto an artifact kind.
 Follows _kind_from_mime in agento11y experiments/experiment.py:129-145, whose
 `text/x-markdown` handling is the superset of Go's."
   (let ((m (string-downcase (%trimmed-text mime))))
@@ -342,12 +342,12 @@ is blank."
                          (cons name "name")
                          (cons kind "kind")))
       (when (%blank-string-p (car check))
-        (error 'sigil-validation-error
+        (error 'agento11y-validation-error
                :message (format nil "artifact validation failed: ~a is required"
                                 (cdr check)))))
     (let ((bytes (if (stringp content) (string-to-utf8-octets content) content)))
       (when (or (null bytes) (zerop (length bytes)))
-        (error 'sigil-validation-error
+        (error 'agento11y-validation-error
                :message "artifact validation failed: content is required"))
       (request-eval-bytes-json
        config :post
@@ -375,7 +375,7 @@ caller porting code that relied on the default redaction has to strip secrets
 itself."
   (let ((sources (count-if-not #'null (list content text path))))
     (unless (= sources 1)
-      (error 'sigil-validation-error
+      (error 'agento11y-validation-error
              :message "artifact validation failed: supply exactly one of content, text, or path")))
   (multiple-value-bind (bytes resolved-mime)
       (cond

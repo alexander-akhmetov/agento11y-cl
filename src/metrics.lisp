@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 ;;; ================================================================
 ;;; In-memory histogram registry + OTLP metrics export
@@ -28,14 +28,14 @@ the identifying attribute alist. Cumulative — never reset after creation."
 START-NANO is fixed at creation; cumulative series report it as
 startTimeUnixNano on every export."
   (table (make-hash-table :test 'equal))
-  (lock (bt2:make-lock :name "sigil-metrics"))
+  (lock (bt2:make-lock :name "agento11y-metrics"))
   (start-nano (current-unix-nano)))
 
 (defun metric-identity-attrs (config provider model agent-name agent-version)
   "Build the provider/model/agent identity attribute alist shared by all four
 metrics. Provider, model, and agent name are always present (empty string when
 unset); agent version only when non-empty. Client-level config tags are
-appended as sigil.tag.* attributes. Mirrors the reference SDK."
+appended as agento11y.tag.* attributes. Mirrors the reference SDK."
   (flet ((trimmed (v) (if (stringp v) (string-trim '(#\Space #\Tab #\Newline #\Return) v) "")))
     (let ((attrs (list (cons "gen_ai.provider.name" (trimmed provider))
                        (cons "gen_ai.request.model" (trimmed model))

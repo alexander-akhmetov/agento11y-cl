@@ -1,4 +1,4 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
 (defun jobj (&rest pairs)
   "Build a JSON object (hash-table) from alternating key value pairs."

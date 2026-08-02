@@ -28,7 +28,7 @@ jobs:
           sbcl --noinform --no-userinit --non-interactive \
             --load ~/quicklisp/setup.lisp \
             --eval '(push (truename ".") asdf:*central-registry*)' \
-            --eval '(ql:quickload :sigil-cl :silent t)' \
+            --eval '(ql:quickload :agento11y-cl :silent t)' \
             --eval '(quit)'
 
       - name: Load system and check for warnings
@@ -39,8 +39,8 @@ jobs:
             --eval '(handler-bind ((warning (lambda (c)
                         (format *error-output* "~&WARNING: ~a~%" c)
                         (muffle-warning c))))
-                      (asdf:load-system :sigil-cl))' \
-            --eval '(format t "~%sigil-cl loaded OK~%")'
+                      (asdf:load-system :agento11y-cl))' \
+            --eval '(format t "~%agento11y-cl loaded OK~%")'
 
   test:
     name: Test
@@ -61,7 +61,7 @@ jobs:
           sbcl --noinform --no-userinit --non-interactive \
             --load ~/quicklisp/setup.lisp \
             --eval '(push (truename ".") asdf:*central-registry*)' \
-            --eval '(ql:quickload :sigil-cl/t :silent t)' \
+            --eval '(ql:quickload :agento11y-cl/t :silent t)' \
             --eval '(quit)'
 
       - name: Run tests

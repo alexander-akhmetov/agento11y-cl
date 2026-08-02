@@ -1,85 +1,85 @@
-(in-package :sigil-cl)
+(in-package :agento11y-cl)
 
-(define-condition sigil-error (error)
-  ((message :initarg :message :reader sigil-error-message :initform ""))
+(define-condition agento11y-error (error)
+  ((message :initarg :message :reader agento11y-error-message :initform ""))
   (:report (lambda (c stream)
-             (format stream "Sigil error: ~a" (sigil-error-message c)))))
+             (format stream "Agento11y error: ~a" (agento11y-error-message c)))))
 
-(define-condition sigil-config-error (sigil-error)
+(define-condition agento11y-config-error (agento11y-error)
   ()
   (:report (lambda (c stream)
-             (format stream "Sigil config error: ~a" (sigil-error-message c)))))
+             (format stream "Agento11y config error: ~a" (agento11y-error-message c)))))
 
-(define-condition sigil-export-error (sigil-error)
-  ((status-code :initarg :status-code :reader sigil-export-error-status-code
+(define-condition agento11y-export-error (agento11y-error)
+  ((status-code :initarg :status-code :reader agento11y-export-error-status-code
                 :initform nil))
   (:report (lambda (c stream)
-             (format stream "Sigil export error (~a): ~a"
-                     (or (sigil-export-error-status-code c) "?")
-                     (sigil-error-message c)))))
+             (format stream "Agento11y export error (~a): ~a"
+                     (or (agento11y-export-error-status-code c) "?")
+                     (agento11y-error-message c)))))
 
-(define-condition sigil-validation-error (sigil-error)
+(define-condition agento11y-validation-error (agento11y-error)
   ()
   (:report (lambda (c stream)
-             (format stream "Sigil validation error: ~a" (sigil-error-message c)))))
+             (format stream "Agento11y validation error: ~a" (agento11y-error-message c)))))
 
-(define-condition sigil-not-found-error (sigil-error)
+(define-condition agento11y-not-found-error (agento11y-error)
   ()
   (:report (lambda (c stream)
-             (format stream "Sigil not found error: ~a" (sigil-error-message c)))))
+             (format stream "Agento11y not found error: ~a" (agento11y-error-message c)))))
 
-(define-condition sigil-conflict-error (sigil-error)
+(define-condition agento11y-conflict-error (agento11y-error)
   ;; KIND classifies the backend's 409 text (see CLASSIFY-CONFLICT). It lets
   ;; callers branch on the conflict without parsing the message themselves.
-  ((kind :initarg :kind :reader sigil-conflict-error-kind :initform :unknown))
+  ((kind :initarg :kind :reader agento11y-conflict-error-kind :initform :unknown))
   (:report (lambda (c stream)
-             (format stream "Sigil conflict error (~a): ~a"
-                     (sigil-conflict-error-kind c)
-                     (sigil-error-message c)))))
+             (format stream "Agento11y conflict error (~a): ~a"
+                     (agento11y-conflict-error-kind c)
+                     (agento11y-error-message c)))))
 
-(define-condition sigil-actor-mismatch-error (sigil-error)
+(define-condition agento11y-actor-mismatch-error (agento11y-error)
   ()
   (:report (lambda (c stream)
-             (format stream "Sigil actor mismatch error: ~a" (sigil-error-message c)))))
+             (format stream "Agento11y actor mismatch error: ~a" (agento11y-error-message c)))))
 
-(define-condition sigil-hook-denied-error (sigil-error)
-  ((rule-id     :initarg :rule-id     :reader sigil-hook-denied-error-rule-id     :initform "")
-   (reason      :initarg :reason      :reader sigil-hook-denied-error-reason      :initform "")
-   (evaluations :initarg :evaluations :reader sigil-hook-denied-error-evaluations :initform nil))
+(define-condition agento11y-hook-denied-error (agento11y-error)
+  ((rule-id     :initarg :rule-id     :reader agento11y-hook-denied-error-rule-id     :initform "")
+   (reason      :initarg :reason      :reader agento11y-hook-denied-error-reason      :initform "")
+   (evaluations :initarg :evaluations :reader agento11y-hook-denied-error-evaluations :initform nil))
   (:report (lambda (c stream)
-             (format stream "Sigil hook denied (rule ~a): ~a"
-                     (sigil-hook-denied-error-rule-id c)
-                     (sigil-hook-denied-error-reason c)))))
+             (format stream "Agento11y hook denied (rule ~a): ~a"
+                     (agento11y-hook-denied-error-rule-id c)
+                     (agento11y-hook-denied-error-reason c)))))
 
-(define-condition sigil-hook-transport-error (sigil-error)
+(define-condition agento11y-hook-transport-error (agento11y-error)
   ()
   (:report (lambda (c stream)
-             (format stream "Sigil hook transport error: ~a"
-                     (sigil-error-message c)))))
+             (format stream "Agento11y hook transport error: ~a"
+                     (agento11y-error-message c)))))
 
-(define-condition sigil-experimental-disabled-error (sigil-error)
+(define-condition agento11y-experimental-disabled-error (agento11y-error)
   ()
   (:report (lambda (c stream)
-             (format stream "Sigil experimental feature disabled: ~a"
-                     (sigil-error-message c)))))
+             (format stream "Agento11y experimental feature disabled: ~a"
+                     (agento11y-error-message c)))))
 
 ;; Both evaluation conditions carry the evaluation id: the row survives on the
 ;; backend, and triggering the same combination again returns that same id, so a
 ;; caller can resume the wait instead of queueing a second evaluation.
-(define-condition sigil-trial-evaluation-failed-error (sigil-error)
-  ((evaluation-id :initarg :evaluation-id :reader sigil-trial-evaluation-error-id
+(define-condition agento11y-trial-evaluation-failed-error (agento11y-error)
+  ((evaluation-id :initarg :evaluation-id :reader agento11y-trial-evaluation-error-id
                   :initform nil)
-   (detail :initarg :detail :reader sigil-trial-evaluation-error-detail
+   (detail :initarg :detail :reader agento11y-trial-evaluation-error-detail
            :initform nil))
   (:report (lambda (c stream)
-             (format stream "Sigil trial evaluation failed (~a): ~a"
-                     (or (sigil-trial-evaluation-error-id c) "?")
-                     (sigil-error-message c)))))
+             (format stream "Agento11y trial evaluation failed (~a): ~a"
+                     (or (agento11y-trial-evaluation-error-id c) "?")
+                     (agento11y-error-message c)))))
 
-(define-condition sigil-trial-evaluation-timeout-error (sigil-error)
-  ((evaluation-id :initarg :evaluation-id :reader sigil-trial-evaluation-error-id
+(define-condition agento11y-trial-evaluation-timeout-error (agento11y-error)
+  ((evaluation-id :initarg :evaluation-id :reader agento11y-trial-evaluation-error-id
                   :initform nil))
   (:report (lambda (c stream)
-             (format stream "Sigil trial evaluation timed out (~a): ~a"
-                     (or (sigil-trial-evaluation-error-id c) "?")
-                     (sigil-error-message c)))))
+             (format stream "Agento11y trial evaluation timed out (~a): ~a"
+                     (or (agento11y-trial-evaluation-error-id c) "?")
+                     (agento11y-error-message c)))))
