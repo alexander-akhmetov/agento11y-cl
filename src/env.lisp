@@ -86,15 +86,15 @@ Skips empty entries and entries with no '='. Returns a fresh list in source orde
 
 (defun parse-content-capture-mode (s config &optional (var-name "AGENTO11Y_CONTENT_CAPTURE_MODE"))
   "Map canonical content capture string to an agento11y-cl keyword.
-Accepts \"full\", \"no_tool_content\", and \"metadata_only\". The
-:metadata-with-system-prompt mode is a CL-only extension and is not exposed
-via env. Unknown values produce a warning via agento11y-log and return :invalid.
-VAR-NAME names the variable the value came from, so the warning points at the
-spelling the caller actually set."
+Accepts \"full\", \"no_tool_content\", \"full_with_metadata_spans\", and
+\"metadata_only\". Unknown values produce a warning via agento11y-log and
+return :invalid. VAR-NAME names the variable the value came from, so the
+warning points at the spelling the caller actually set."
   (let ((normalized (string-downcase (%trim s))))
     (cond
       ((string= normalized "full") :full)
       ((string= normalized "no_tool_content") :no-tool-content)
+      ((string= normalized "full_with_metadata_spans") :full-with-metadata-spans)
       ((string= normalized "metadata_only") :metadata-only)
       (t
        (agento11y-log config :warn "env"

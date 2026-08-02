@@ -26,7 +26,7 @@ Synchronous (not queued)."
       ;; without a signal.
       (when feedback
         (let ((capture (config-content-capture-mode config)))
-          (if (capture-keeps-content-p capture)
+          (if (capture-keeps-payload-content-p capture)
               (setf (gethash "comment" payload) feedback)
               (agento11y-log config :warn "rating"
                         (format nil "content capture mode ~a withholds the rating comment"

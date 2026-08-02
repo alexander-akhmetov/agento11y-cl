@@ -98,51 +98,66 @@
 ;;; beside the slot it describes rather than in any one of them.
 
 (defparameter +content-capture-modes+
-  '(:full :no-tool-content :metadata-with-system-prompt :metadata-only)
+  '(:full :no-tool-content :full-with-metadata-spans :metadata-only)
   "The supported :content-capture-mode values.")
+
+(defparameter +content-metadata-keys+
+  '("agento11y.conversation.title" "sigil.conversation.title" "call_error")
+  "Generation metadata keys whose values carry caller content.
+The SDK mirrors the conversation title into the first key, so a redacting mode
+has to remove it from caller-supplied metadata too: a caller can write any of
+these keys, and the strip does not ask who wrote them. The second is the
+pre-rename spelling, which an older exporter can still send. The third mirrors
+call_error, which this SDK does not write but the reference SDK does.")
 
 (defun valid-content-capture-mode-p (mode)
   "True when MODE is one of +content-capture-modes+."
   (and (member mode +content-capture-modes+) t))
 
-(defun capture-keeps-content-p (mode)
-  "True when MODE keeps caller content: message text, thinking text, tool call
-inputs, tool result content, media URLs, the conversation title, a tool's
-description and input_schema_json, the rating comment, and error text on
-payloads and span status messages. A tool's name, type, and deferred flag are
-structure, not content, and export in every mode. The system prompt has its own
-gate, capture-keeps-system-prompt-p, and tool span arguments and results have
-capture-keeps-tool-span-content-p.
-:full and :no-tool-content keep content. Every other value redacts it, so an
-unsupported mode fails closed."
+(defun capture-keeps-payload-content-p (mode)
+  "True when MODE keeps caller content in exported payloads: message text,
+thinking text, tool call inputs, tool result content, media URLs, the
+conversation title, a tool's description and input_schema_json, the system
+prompt, workflow step input and output state, the rating comment, and
+call_error text. A tool's name, type, and deferred flag are structure, not
+content, and export in every mode.
+:full, :no-tool-content, and :full-with-metadata-spans keep payload content.
+Every other value redacts it, so an unsupported mode fails closed.
+Span-borne content has its own gate, capture-keeps-span-content-p."
+  (or (eq mode :full) (eq mode :no-tool-content) (eq mode :full-with-metadata-spans)))
+
+(defun capture-redacts-payload-content-p (mode)
+  "True when MODE withholds caller content from payloads. The inverse of
+capture-keeps-payload-content-p, so an unsupported mode redacts."
+  (not (capture-keeps-payload-content-p mode)))
+
+(defun capture-keeps-span-content-p (mode)
+  "True when MODE keeps caller content on OTel spans: embedding input texts, a
+tool's description, and every span status message. Tool call arguments and
+results are stricter still and have capture-keeps-tool-span-content-p.
+:full and :no-tool-content keep span content. :full-with-metadata-spans keeps
+payload content but strips the spans, which is the point of the mode: the
+generation ingest destination is private while the traces destination is
+shared. Every other value redacts, so an unsupported mode fails closed."
   (or (eq mode :full) (eq mode :no-tool-content)))
-
-(defun capture-redacts-content-p (mode)
-  "True when MODE withholds caller content. The inverse of
-capture-keeps-content-p, so an unsupported mode redacts."
-  (not (capture-keeps-content-p mode)))
-
-(defun capture-keeps-system-prompt-p (mode)
-  "True when MODE exports the system prompt. :metadata-with-system-prompt keeps
-it while withholding every other content field; an unsupported mode drops it."
-  (or (capture-keeps-content-p mode) (eq mode :metadata-with-system-prompt)))
 
 (defun capture-keeps-tool-span-content-p (mode)
   "True when MODE keeps tool execution span arguments and results.
-Only :full keeps tool span content; :no-tool-content, :metadata-with-system-prompt,
+Only :full keeps tool span content; :no-tool-content, :full-with-metadata-spans,
 and :metadata-only redact it."
   (eq mode :full))
 
 (defun content-capture-mode-string (mode)
   "Wire value for the agento11y.sdk.content_capture_mode generation tag.
-:full maps to \"full\", :no-tool-content to \"no_tool_content\", and everything
-else to \"metadata_only\". The CL-only :metadata-with-system-prompt reports
-metadata_only because it strips all message content, and metadata_only is the
-only stripped marker the backend acts on. An unsupported mode also reports
-metadata_only, matching how serialization treats it."
+:full maps to \"full\", :no-tool-content to \"no_tool_content\",
+:full-with-metadata-spans to \"full_with_metadata_spans\", and everything else
+to \"metadata_only\". An unsupported mode reports metadata_only, matching how
+serialization treats it. metadata_only is the only stripped marker the backend
+acts on."
   (cond
     ((eq mode :full) "full")
     ((eq mode :no-tool-content) "no_tool_content")
+    ((eq mode :full-with-metadata-spans) "full_with_metadata_spans")
     (t "metadata_only")))
 
 (defparameter +default-eval-path-prefix+ "/api/v1")

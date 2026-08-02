@@ -555,6 +555,11 @@ experiment-runs branch, whose prefix they share."
       (let ((cfg (resolve '(("AGENTO11Y_CONTENT_CAPTURE_MODE" . "no_tool_content")))))
         (check "AGENTO11Y_CONTENT_CAPTURE_MODE=no_tool_content"
                (eq (agento11y-cl::config-content-capture-mode cfg) :no-tool-content)))
+      (let ((cfg (resolve '(("AGENTO11Y_CONTENT_CAPTURE_MODE"
+                             . "full_with_metadata_spans")))))
+        (check "AGENTO11Y_CONTENT_CAPTURE_MODE=full_with_metadata_spans"
+               (eq (agento11y-cl::config-content-capture-mode cfg)
+                   :full-with-metadata-spans)))
       (let* ((warns 0)
              (cfg (agento11y-cl::resolve-config-from-env
                    (make-config :log-fn (lambda (l c m &rest kvs)
@@ -991,7 +996,8 @@ experiment-runs branch, whose prefix they share."
           (check "media full: non-string provider-type keeps the media object"
                  (equal (jget* non-string-meta "media" "kind") "image")))))
 
-    ;; Media parts: redacting modes clear only the URL
+    ;; Media parts: redacting modes clear only the URL. :metadata-with-system-prompt
+    ;; is no longer a supported mode, so it redacts like any unsupported value.
     (dolist (mode '(:metadata-only :metadata-with-system-prompt))
       (multiple-value-bind (client get-requests) (make-test-client :capture mode)
         (declare (ignore get-requests))
@@ -1069,7 +1075,9 @@ experiment-runs branch, whose prefix they share."
                  (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
                         "metadata_only")))))
 
-    ;; Metadata-with-system-prompt: redact message content but keep system prompt
+    ;; The removed :metadata-with-system-prompt keyword: message structure survives,
+    ;; every content field is withheld, and so is the system prompt the mode used
+    ;; to keep. This is the unsupported-value path, reached through make-client.
     (multiple-value-bind (client get-requests)
         (make-test-client :capture :metadata-with-system-prompt)
       (declare (ignore get-requests))
@@ -1098,34 +1106,104 @@ experiment-runs branch, whose prefix they share."
         (recorder-end rec)
         (let ((gen (first (agento11y-cl::queue-drain-all
                            (agento11y-cl::client-generation-queue client)))))
-          (check "metadata-with-system-prompt: system_prompt populated"
-                 (equal (jget gen "system_prompt") "Be helpful"))
-          (check "metadata-with-system-prompt: input present" (jget gen "input"))
-          (check "metadata-with-system-prompt: output present" (jget gen "output"))
+          (check "removed metadata-with-system-prompt: system_prompt withheld"
+                 (null (jget gen "system_prompt")))
+          (check "removed metadata-with-system-prompt: input present" (jget gen "input"))
+          (check "removed metadata-with-system-prompt: output present" (jget gen "output"))
           (let ((user-msg (aref (jget gen "input") 0)))
-            (check "metadata-with-system-prompt: user role preserved"
+            (check "removed metadata-with-system-prompt: user role preserved"
                    (equal (jget user-msg "role") "MESSAGE_ROLE_USER"))
-            (check "metadata-with-system-prompt: text redacted"
+            (check "removed metadata-with-system-prompt: text redacted"
                    (equal (jget (aref (jget user-msg "parts") 0) "text") "")))
           (let* ((asst-msg (aref (jget gen "input") 1))
                  (tc-part (aref (jget asst-msg "parts") 0)))
-            (check "metadata-with-system-prompt: tool_call shape preserved"
+            (check "removed metadata-with-system-prompt: tool_call shape preserved"
                    (and (equal (jget* tc-part "tool_call" "id") "tc1")
                         (equal (jget* tc-part "tool_call" "name") "search")))
-            (check "metadata-with-system-prompt: tool_call input_json redacted"
+            (check "removed metadata-with-system-prompt: tool_call input_json redacted"
                    (equal (jget* tc-part "tool_call" "input_json") "")))
           (let* ((tool-msg (aref (jget gen "input") 2))
                  (tr-part (aref (jget tool-msg "parts") 0)))
-            (check "metadata-with-system-prompt: tool_result shape preserved"
+            (check "removed metadata-with-system-prompt: tool_result shape preserved"
                    (and (equal (jget* tr-part "tool_result" "tool_call_id") "tc1")
                         (equal (jget* tr-part "tool_result" "name") "search")))
-            (check "metadata-with-system-prompt: tool_result content redacted"
+            (check "removed metadata-with-system-prompt: tool_result content redacted"
                    (equal (jget* tr-part "tool_result" "content") "")))
           (let ((out-msg (aref (jget gen "output") 0)))
-            (check "metadata-with-system-prompt: output role preserved"
+            (check "removed metadata-with-system-prompt: output role preserved"
                    (equal (jget out-msg "role") "MESSAGE_ROLE_ASSISTANT"))
-            (check "metadata-with-system-prompt: output text redacted"
+            (check "removed metadata-with-system-prompt: output text redacted"
                    (equal (jget (aref (jget out-msg "parts") 0) "text") ""))))))
+
+    ;; Full-with-metadata-spans: the generation payload keeps everything
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :full-with-metadata-spans)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :conversation-title "My Chat"
+                                          :system-prompt "Be helpful"
+                                          :input-messages
+                                          (list (make-message
+                                                 :role :user
+                                                 :parts (list (make-text-part "Hello")))))))
+        (set-result rec :output-messages (list (make-message
+                                                :role :assistant
+                                                :parts (list (make-text-part "Hi")))))
+        (set-call-error rec "429 rate limit exceeded")
+        (recorder-end rec)
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
+          (check "full-with-metadata-spans: system prompt kept"
+                 (equal (jget gen "system_prompt") "Be helpful"))
+          (check "full-with-metadata-spans: input text kept"
+                 (equal (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text")
+                        "Hello"))
+          (check "full-with-metadata-spans: output text kept"
+                 (equal (jget (aref (jget (aref (jget gen "output") 0) "parts") 0) "text")
+                        "Hi"))
+          (check "full-with-metadata-spans: conversation title kept"
+                 (equal (jget* gen "metadata" "agento11y.conversation.title") "My Chat"))
+          (check "full-with-metadata-spans: call_error not redacted"
+                 (equal (jget gen "call_error") "429 rate limit exceeded"))
+          (check "full-with-metadata-spans: capture tag names the mode"
+                 (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                        "full_with_metadata_spans")))))
+
+    ;; Span status messages: the span gate, not the payload gate. The tool span
+    ;; keeps the error under :no-tool-content, which drops only args and results.
+    (dolist (pair '((:full . "provider refused: status=429 for tenant acme")
+                    (:no-tool-content . "provider refused: status=429 for tenant acme")
+                    (:full-with-metadata-spans . "rate_limit")
+                    (:metadata-only . "rate_limit")))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture (car pair) :generation-enabled nil)
+        (declare (ignore get-requests))
+        (let ((rec (start-tool-execution client :tool-name "search" :tool-call-id "tc-1")))
+          (set-result rec :error-message "provider refused: status=429 for tenant acme")
+          (recorder-end rec)
+          (let ((span (first (agento11y-cl::queue-drain-all
+                              (agento11y-cl::client-trace-queue client)))))
+            (check (format nil "~a: tool span status message" (car pair))
+                   (equal (jget* span "status" "message") (cdr pair)))))))
+
+    ;; Embedding input texts are span content: the opt-in is not enough on its own
+    (dolist (pair '((:full . t) (:no-tool-content . t)
+                    (:full-with-metadata-spans . nil) (:metadata-only . nil)))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture (car pair) :generation-enabled nil
+                            :embedding-capture-input t)
+        (declare (ignore get-requests))
+        (let ((rec (start-embedding client :model-provider "test" :model-name "e")))
+          (set-result rec :input-texts (list "private query") :input-count 1)
+          (recorder-end rec)
+          (let* ((span (first (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-trace-queue client))))
+                 (texts (find "gen_ai.embeddings.input_texts"
+                              (coerce (jget span "attributes") 'list)
+                              :key (lambda (a) (jget a "key")) :test #'equal)))
+            (check (format nil "~a: embedding input texts" (car pair))
+                   (if (cdr pair) texts (null texts)))))))
 
     ;; No-tool-content: full generation content but redact tool spans
     (multiple-value-bind (client get-requests) (make-test-client :capture :no-tool-content)
@@ -1201,8 +1279,48 @@ experiment-runs branch, whose prefix they share."
           (check "caller metadata: sdk.name still present"
                  (equal (jget* gen "metadata" "agento11y.sdk.name") "agento11y-cl")))))
 
-    ;; Conversation title in metadata: kept by the content-keeping modes only
-    (dolist (mode '(:full :no-tool-content))
+    ;; A caller can write the metadata keys the SDK mirrors content into. A
+    ;; redacting mode strips them whoever wrote them; every other caller key stays.
+    (dolist (pair '((:full . t) (:metadata-only . nil)))
+      (multiple-value-bind (client get-requests) (make-test-client :capture (car pair))
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :metadata
+                                            '(("agento11y.conversation.title" . "Caller Chat")
+                                              ("sigil.conversation.title" . "Legacy Chat")
+                                              ("call_error" . "raw provider text")
+                                              ("my.key" . "my-value")))))
+          (recorder-end rec)
+          (let ((meta (jget (first (agento11y-cl::queue-drain-all
+                                    (agento11y-cl::client-generation-queue client)))
+                            "metadata")))
+            (dolist (key '("agento11y.conversation.title" "sigil.conversation.title"
+                           "call_error"))
+              (check (format nil "~a: caller metadata ~a" (car pair) key)
+                     (if (cdr pair)
+                         (nth-value 1 (gethash key meta))
+                         (null (nth-value 1 (gethash key meta))))))
+            (check (format nil "~a: unrelated caller metadata kept" (car pair))
+                   (equal (jget meta "my.key") "my-value"))))))
+
+    ;; The SDK title wins over a caller key of the same name
+    (multiple-value-bind (client get-requests) (make-test-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "test" :model-name "m"
+                                          :conversation-title "SDK Chat"
+                                          :metadata
+                                          '(("agento11y.conversation.title" . "Caller Chat")))))
+        (recorder-end rec)
+        (check "sdk conversation title wins over the caller key"
+               (equal (jget* (first (agento11y-cl::queue-drain-all
+                                     (agento11y-cl::client-generation-queue client)))
+                             "metadata" "agento11y.conversation.title")
+                      "SDK Chat"))))
+
+    ;; Conversation title in metadata: kept by the payload-content modes only
+    (dolist (mode '(:full :no-tool-content :full-with-metadata-spans))
       (multiple-value-bind (client get-requests) (make-test-client :capture mode)
         (declare (ignore get-requests))
         (let ((rec (start-generation client :mode :sync
@@ -1247,8 +1365,9 @@ experiment-runs branch, whose prefix they share."
                  (and (search "[REDACTED:grafana-cloud-token]" title)
                       (not (search "glc_abcdefghijklmnopqrstuvwxyz" title)))))))
 
-    ;; Tool definitions: descriptions and schemas follow the capture mode
-    (dolist (mode '(:full :no-tool-content :metadata-only :metadata-with-system-prompt))
+    ;; Tool definitions: descriptions and schemas follow the payload gate
+    (dolist (mode '(:full :no-tool-content :full-with-metadata-spans
+                    :metadata-only :metadata-with-system-prompt))
       (multiple-value-bind (client get-requests) (make-test-client :capture mode)
         (declare (ignore get-requests))
         (let ((rec (start-generation client :mode :sync
@@ -1261,7 +1380,7 @@ experiment-runs branch, whose prefix they share."
           (let* ((gen (first (agento11y-cl::queue-drain-all
                               (agento11y-cl::client-generation-queue client))))
                  (tool (aref (jget gen "tools") 0))
-                 (keep (member mode '(:full :no-tool-content))))
+                 (keep (member mode '(:full :no-tool-content :full-with-metadata-spans))))
             (check (format nil "~a: tool name kept" mode)
                    (equal (jget tool "name") "search"))
             (check (format nil "~a: tool type kept" mode)
@@ -1278,8 +1397,9 @@ experiment-runs branch, whose prefix they share."
                                (jzon:stringify (jobj "type" "object")))
                               "")))))))
 
-    ;; Tool span description follows the capture mode, not the tool-span gate
-    (dolist (mode '(:full :no-tool-content :metadata-only :metadata-with-system-prompt))
+    ;; Tool span description follows the span gate, not the tool-span gate
+    (dolist (mode '(:full :no-tool-content :full-with-metadata-spans
+                    :metadata-only :metadata-with-system-prompt))
       (multiple-value-bind (client get-requests)
           (make-test-client :capture mode :generation-enabled nil)
         (declare (ignore get-requests))
@@ -1306,6 +1426,7 @@ experiment-runs branch, whose prefix they share."
     ;; The capture-mode tag tells the backend what was stripped
     (dolist (pair '((:full . "full")
                     (:no-tool-content . "no_tool_content")
+                    (:full-with-metadata-spans . "full_with_metadata_spans")
                     (:metadata-with-system-prompt . "metadata_only")
                     (:metadata-only . "metadata_only")))
       (multiple-value-bind (client get-requests) (make-test-client :capture (car pair))
@@ -1846,10 +1967,10 @@ experiment-runs branch, whose prefix they share."
                    (and (search "Connect via " (jget gen "system_prompt"))
                         (not (search conn-string (jget gen "system_prompt"))))))))
 
-      ;; --- Serialization: system prompt redacted under :metadata-with-system-prompt,
-      ;;     message text still blanked by capture mode ---
+      ;; --- Serialization: a redacting mode withholds the system prompt outright,
+      ;;     so the secret redactor never runs on it ---
       (multiple-value-bind (client get-requests)
-          (make-test-client :capture :metadata-with-system-prompt :redact-secrets t)
+          (make-test-client :capture :metadata-only :redact-secrets t)
         (declare (ignore get-requests))
         (let ((rec (start-generation client :mode :sync
                                             :model-provider "test" :model-name "m"
@@ -1862,11 +1983,27 @@ experiment-runs branch, whose prefix they share."
           (recorder-end rec)
           (let ((gen (first (agento11y-cl::queue-drain-all
                              (agento11y-cl::client-generation-queue client)))))
-            (check "mws: system prompt redacted"
-                   (search "[REDACTED:connection-string]" (jget gen "system_prompt")))
-            (check "mws: message text still blanked by capture mode"
+            (check "metadata-only: system prompt withheld"
+                   (null (jget gen "system_prompt")))
+            (check "metadata-only: message text blanked by capture mode"
                    (equal (jget (aref (jget (aref (jget gen "input") 0) "parts") 0) "text")
                           "")))))
+
+      ;; --- Serialization: :full-with-metadata-spans keeps the payload, so the
+      ;;     secret redactor still runs on the system prompt ---
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full-with-metadata-spans :redact-secrets t)
+        (declare (ignore get-requests))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "test" :model-name "m"
+                                            :system-prompt
+                                            (format nil "db ~a" conn-string))))
+          (recorder-end rec)
+          (let ((gen (first (agento11y-cl::queue-drain-all
+                             (agento11y-cl::client-generation-queue client)))))
+            (check "full-with-metadata-spans: system prompt secret redacted"
+                   (and (search "[REDACTED:connection-string]" (jget gen "system_prompt"))
+                        (not (search conn-string (jget gen "system_prompt"))))))))
 
       ;; --- Serialization: assistant output light-redacted under :full ---
       (multiple-value-bind (client get-requests)
@@ -2337,11 +2474,13 @@ experiment-runs branch, whose prefix they share."
           (check (format nil "~a: rater_id unchanged" mode)
                  (equal (jget payload "rater_id") "u-7"))))
 
-      ;; :no-tool-content keeps generation content, so it keeps the comment
-      (multiple-value-bind (payload url) (submit :no-tool-content)
-        (declare (ignore url))
-        (check "no-tool-content: comment sent"
-               (equal (jget payload "comment") "the answer named my customer"))))
+      ;; The comment follows the payload gate, so every mode that keeps payload
+      ;; content keeps it. Only a redacting mode drops it.
+      (dolist (mode '(:no-tool-content :full-with-metadata-spans))
+        (multiple-value-bind (payload url) (submit mode)
+          (declare (ignore url))
+          (check (format nil "~a: comment sent" mode)
+                 (equal (jget payload "comment") "the answer named my customer")))))
 
     ;; Dropping the comment is not silent: the POST succeeds either way, and
     ;; :metadata-only is the default mode.

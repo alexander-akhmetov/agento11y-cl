@@ -19,7 +19,7 @@ It captures LLM generations, tool executions, and embeddings from your applicati
 - **Synchronous hook evaluation** — opt-in preflight/postflight guard checks against the hooks API with allow/deny semantics, fail-open transport handling, and `transformed_input` rewrite passthrough
 - **Message normalization** — convert raw Anthropic and OpenAI API responses into SDK types
 - **Background export** — batched, async HTTP export with exponential backoff retry
-- **Content capture modes** — `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only`
+- **Content capture modes** — `:full`, `:no-tool-content`, `:full-with-metadata-spans`, or `:metadata-only`
 
 ## Installation
 
@@ -126,8 +126,8 @@ The four string fields default to `""`; `:provider-type` defaults to `nil`.
 
 The URL can hold the bytes inline as a `data:` URI. `:provider-type` sets the
 part's `metadata.provider_type`; when it is `nil` or empty the SDK omits the
-`metadata` object. Under `:metadata-only` and `:metadata-with-system-prompt` the
-SDK clears `url` and keeps `kind`, `mime_type`, and `name`.
+`metadata` object. Under `:metadata-only` the SDK clears `url` and keeps `kind`,
+`mime_type`, and `name`.
 
 ### Normalize API responses
 
@@ -249,7 +249,7 @@ Behaviour:
 | `:auth-password` | `nil` | Auth password/token |
 | `:tenant-id` | `nil` | Grafana Cloud tenant ID |
 | `:extra-headers` | `nil` | Alist of extra HTTP headers merged with auth headers (user wins on case-insensitive collision) |
-| `:content-capture-mode` | `:metadata-only` | `:full`, `:no-tool-content`, `:metadata-with-system-prompt`, or `:metadata-only` |
+| `:content-capture-mode` | `:metadata-only` | `:full`, `:no-tool-content`, `:full-with-metadata-spans`, or `:metadata-only` |
 | `:embedding-capture-input` | `nil` | Put embedding input texts on the span as `gen_ai.embeddings.input_texts`. Also needs a content capture mode of `:full` or `:no-tool-content`; the other two modes suppress the texts. No environment variable sets this, matching the Go, Python, and JavaScript SDKs |
 | `:embedding-max-input-items` | `20` | Number of input texts kept on the span. A zero or negative value falls back to 20 |
 | `:embedding-max-text-length` | `1024` | Characters kept per input text. If the length is above 3, longer text keeps its first `length - 3` characters plus `...`. If the length is 3 or less, the text is cut with no suffix. A zero or negative value falls back to 1024 |
@@ -295,7 +295,7 @@ spellings are never merged: the selected value is used whole, including for
 | `AGENTO11Y_AGENT_VERSION` | `:agent-version` | |
 | `AGENTO11Y_USER_ID` | `:user-id` | |
 | `AGENTO11Y_TAGS` | `:tags` | `k=v,k2=v2`; env is the base layer, caller-supplied tags win on key collision |
-| `AGENTO11Y_CONTENT_CAPTURE_MODE` | `:content-capture-mode` | Accepts `full` / `no_tool_content` / `metadata_only`; unknown values warn and are ignored. `:metadata-with-system-prompt` is a code-only extension. An unsupported caller keyword warns and falls back to `:metadata-only` |
+| `AGENTO11Y_CONTENT_CAPTURE_MODE` | `:content-capture-mode` | Accepts `full` / `no_tool_content` / `full_with_metadata_spans` / `metadata_only`; unknown values warn and are ignored. An unsupported caller keyword warns and falls back to `:metadata-only` |
 | `AGENTO11Y_DEBUG` | `:debug` | `1` / `true` / `yes` / `on` → t, otherwise nil |
 | `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES` | `:experimental-features` | Same truthy values as `AGENTO11Y_DEBUG` |
 
@@ -336,33 +336,54 @@ agent fields and finally to the service fields, so applications that only set
 
 ### Content capture modes
 
-| Field | `:full` | `:no-tool-content` | `:metadata-with-system-prompt` | `:metadata-only` |
-|-------|---------|--------------------|--------------------------------|------------------|
-| Message text | full | full | empty string | empty string |
-| Thinking text | full | full | empty string, part kept | empty string, part kept |
-| Tool call input, tool result content | full | full | empty string | empty string |
-| Media URL | full | full | empty string (kind, MIME type, name kept) | empty string (kind, MIME type, name kept) |
-| System prompt | full | full | full | omitted |
-| Conversation title | full | full | omitted | omitted |
-| Tool `description`, `input_schema_json` | full | full | empty string (`name`, `type`, `deferred` kept) | empty string (`name`, `type`, `deferred` kept) |
-| Rating comment | sent | sent | omitted | omitted |
-| `call_error`, workflow `error`, span status | full | full | error category | error category |
-| Tool span `gen_ai.tool.description` | full | full | omitted | omitted |
-| Tool span args/results | full | `<redacted>` | `<redacted>` | `<redacted>` |
-| Embedding input texts | when `:embedding-capture-input` | when `:embedding-capture-input` | omitted | omitted |
+Two surfaces carry content, and the mode gates them separately: the generation
+payload POSTed to the generation API, and the OTel spans POSTed to the traces
+endpoint.
+
+| Field | Surface | `:full` | `:no-tool-content` | `:full-with-metadata-spans` | `:metadata-only` |
+|-------|---------|---------|--------------------|-----------------------------|------------------|
+| Message text | payload | full | full | full | empty string |
+| Thinking text | payload | full | full | full | empty string, part kept |
+| Tool call input, tool result content | payload | full | full | full | empty string |
+| Media URL | payload | full | full | full | empty string (kind, MIME type, name kept) |
+| System prompt | payload | full | full | full | omitted |
+| Conversation title | payload | full | full | full | omitted |
+| Tool `description`, `input_schema_json` | payload | full | full | full | empty string (`name`, `type`, `deferred` kept) |
+| Rating comment | payload | sent | sent | sent | omitted |
+| `call_error`, workflow `error` | payload | full | full | full | error category |
+| Span status message | span | full | full | error category | error category |
+| Tool span `gen_ai.tool.description` | span | full | full | omitted | omitted |
+| Embedding input texts | span | when `:embedding-capture-input` | when `:embedding-capture-input` | omitted | omitted |
+| Tool span args/results | span | full | `<redacted>` | `<redacted>` | `<redacted>` |
 
 Message and part structure survives every mode: a redacted part is exported with
 empty content rather than dropped, so part counts and roles stay comparable
 across modes.
 
-`:no-tool-content` matches the Go SDK's `ContentCaptureModeNoToolContent` semantics: keep generation content for evaluation, but redact tool execution span attributes (where untrusted tool I/O accumulates).
+`:no-tool-content` matches the Go SDK's `ContentCaptureModeNoToolContent`
+semantics: keep generation content for evaluation, but redact tool execution
+span attributes (where untrusted tool I/O accumulates).
+
+`:full-with-metadata-spans` matches `ContentCaptureModeFullWithMetadataSpans`.
+Use it when the generation ingest destination is private but the traces
+destination is shared and must receive no content. One deviation from the Go
+SDK: this SDK also drops `gen_ai.tool.description` from the tool span under this
+mode. The Go SDK writes it and leaves the removal to the forwarder, whose
+content-key list includes it.
+
+Caller-supplied `:metadata` is not stripped, with one exception: the keys the
+SDK mirrors content into. A redacting mode removes
+`agento11y.conversation.title`, its pre-rename spelling
+`sigil.conversation.title`, and `call_error` from the metadata map whoever wrote
+them. Tags are never stripped -- keep content out of tags and out of any other
+metadata key.
 
 When a mode withholds error text, the SDK exports the classified error category
 (`rate_limit`, `auth_error`, `server_error`, `timeout`, `client_error`, or
 `sdk_error`) instead of the provider's message, so consumers keep the
-classification. Error text follows the content gate on every span type,
-including the tool execution span: `:no-tool-content` drops tool arguments and
-results but keeps the error message.
+classification. The tool execution span follows the span gate like every other
+span type: `:no-tool-content` drops tool arguments and results but keeps the
+error message.
 
 `submit-conversation-rating` logs a warning when the capture mode drops the
 comment. The POST still succeeds, and the default mode is `:metadata-only`, so a
@@ -370,18 +391,26 @@ caller who never set a mode would otherwise see the feedback text disappear
 without a signal.
 
 Every exported generation carries the tag
-`agento11y.sdk.content_capture_mode`, holding `full`, `no_tool_content`, or
-`metadata_only`. The server reads it to tell a stripped generation from a
-full one: it collapses stripped generations in conversation transcripts, skips
-them as per-generation judge variables, and warns on test-case promotion. The
-SDK sets the tag last, so a caller tag using the same key cannot override it.
-`:metadata-with-system-prompt` reports `metadata_only` because it strips all
-message content and `metadata_only` is the value the backend acts on.
+`agento11y.sdk.content_capture_mode`, holding `full`, `no_tool_content`,
+`full_with_metadata_spans`, or `metadata_only`. The server reads it to tell a
+stripped generation from a full one: it collapses stripped generations in
+conversation transcripts, skips them as per-generation judge variables, and
+warns on test-case promotion. The SDK sets the tag last, so a caller tag using
+the same key cannot override it. `metadata_only` is the only stripped marker the
+server acts on.
 
 A `:content-capture-mode` outside the four supported keywords is treated as
 `:metadata-only`. `resolve-config-from-env` also logs a warning naming the
 rejected value, and serialization redacts independently of that warning, so a
 config built directly with `make-config` still fails closed.
+
+**Breaking change.** `:metadata-with-system-prompt` was a CL-only mode with no
+counterpart in the other SDKs. It reported `metadata_only` on the wire while
+still exporting `system_prompt`, so the server labelled the generation stripped
+when it was not. The keyword is gone. A caller still passing it now gets
+`:metadata-only` and a warning, which withholds the system prompt too.
+`:full-with-metadata-spans` is the closest replacement for anyone who wanted
+content on one path but not the other.
 
 ### Metrics
 

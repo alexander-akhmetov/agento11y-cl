@@ -99,7 +99,7 @@ redact only when REDACT-INPUTS is true (user=full, assistant=light, tool=full)."
   "Serialize a message part to JSON hash-table. Respects capture mode.
 When REDACTOR is non-nil, content that survives capture-mode blanking is
 scanned for secrets with strength SECRET-MODE (:full, :light, or :none)."
-  (let ((redact (capture-redacts-content-p capture-mode))
+  (let ((redact (capture-redacts-payload-content-p capture-mode))
         (smode (or secret-mode :none)))
     ;; STRENGTH is a part's intrinsic redaction strength; a message-level :none
     ;; clamps every part to :none regardless.
@@ -307,8 +307,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
 (defun build-generation-payload (rec config)
   "Build a generation JSON hash-table from the recorder state."
   (let* ((capture (config-content-capture-mode config))
-         (capture-content (capture-keeps-content-p capture))
-         (capture-sys (capture-keeps-system-prompt-p capture))
+         (capture-content (capture-keeps-payload-content-p capture))
          (redactor (when (config-redact-secrets config)
                      (make-secret-redactor
                       :include-emails (config-redact-email-addresses config))))
@@ -331,7 +330,15 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
                 (when (and user-meta (listp user-meta))
                   (loop for (k . v) in user-meta
                         when (and (stringp k) v)
-                        do (setf (gethash k meta) v))))
+                        do (setf (gethash k meta) v)))
+                ;; The SDK mirrors content into metadata keys, so a redacting
+                ;; mode has to remove them whoever wrote them. This runs after
+                ;; the merge: a caller key written before the strip survives it.
+                ;; Every other caller key stays, content or not -- the caller
+                ;; owns what goes in metadata.
+                (unless capture-content
+                  (dolist (key +content-metadata-keys+)
+                    (remhash key meta))))
               ;; Store conversation title in metadata (not as top-level proto
               ;; field). The title is caller content, so a redacting mode drops it.
               (when (and capture-content (gen-rec-conversation-title rec))
@@ -396,7 +403,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
             (content-capture-mode-string capture))
       (setf (gethash "tags" gen) tags-obj))
     ;; System prompt
-    (when (and capture-sys (gen-rec-system-prompt rec))
+    (when (and capture-content (gen-rec-system-prompt rec))
       (setf (gethash "system_prompt" gen)
             (if redactor
                 (apply-secret-redaction redactor :full (gen-rec-system-prompt rec))
@@ -495,7 +502,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
           (push (otel-string-attr "error.category" category) attrs))))
     ;; Build span
     (let* ((capture (config-content-capture-mode config))
-           (capture-content (capture-keeps-content-p capture))
+           (capture-span (capture-keeps-span-content-p capture))
            (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
            (end-nano (if (and start-nano (gen-rec-duration-seconds rec))
                          (unix-nano-plus-seconds start-nano (gen-rec-duration-seconds rec))
@@ -510,7 +517,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
                   :attributes (coerce (nreverse attrs) 'vector)
                   :status-code (if (recorder-call-error rec) 2 1)
                   :status-message (if (recorder-call-error rec)
-                                      (if capture-content
+                                      (if capture-span
                                           (recorder-call-error rec)
                                           (redacted-error-text (recorder-call-error rec)))
                                       "")))))
@@ -563,7 +570,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
     (when (config-traces-enabled config)
       (let* ((capture (config-content-capture-mode config))
              (capture-tool (capture-keeps-tool-span-content-p capture))
-             (capture-content (capture-keeps-content-p capture))
+             (capture-span (capture-keeps-span-content-p capture))
              (parent *trace-context*)
              (trace-id (or (getf parent :trace-id) (generate-trace-id)))
              (parent-span-id (getf parent :span-id))
@@ -585,7 +592,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
           (when (and tt (stringp tt) (plusp (length tt)))
             (push (otel-string-attr "gen_ai.tool.type" tt) attrs)))
         (let ((td (tool-rec-tool-description rec)))
-          (when (and capture-content td (stringp td) (plusp (length td)))
+          (when (and capture-span td (stringp td) (plusp (length td)))
             (push (otel-string-attr "gen_ai.tool.description" td) attrs)))
         ;; Secret redaction applies to generation payloads only; standalone
         ;; tool-execution spans export arguments/results gated by capture mode
@@ -625,14 +632,16 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
                        :attributes (coerce (nreverse attrs) 'vector)
                        :status-code (if (or (tool-rec-error-message rec)
                                             (recorder-call-error rec)) 2 1)
-                       ;; The status message follows the content gate, not the
+                       ;; The status message follows the span gate, not the
                        ;; tool-span gate: :no-tool-content drops tool arguments
-                       ;; and results but keeps error text, matching the other
-                       ;; span types and the reference SDK.
+                       ;; and results but keeps error text. The reference SDK
+                       ;; redacts a span error only under metadata_only and
+                       ;; full_with_metadata_spans (redactSpanErrors, go/agento11y
+                       ;; client.go), and this matches the other span types here.
                        :status-message (let ((err (or (tool-rec-error-message rec)
                                                       (recorder-call-error rec))))
                                          (if err
-                                             (if capture-content err (redacted-error-text err))
+                                             (if capture-span err (redacted-error-text err))
                                              "")))))))))
 
 ;;; ================================================================
@@ -710,7 +719,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
   (let ((config (client-config (recorder-client rec))))
     (when (config-traces-enabled config)
       (let* ((capture (config-content-capture-mode config))
-             (capture-content (capture-keeps-content-p capture))
+             (capture-span (capture-keeps-span-content-p capture))
              (parent *trace-context*)
              (trace-id (or (getf parent :trace-id) (generate-trace-id)))
              (parent-span-id (getf parent :span-id))
@@ -742,7 +751,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
           (when (and dimensions (plusp dimensions))
             (push (otel-int-attr "gen_ai.embeddings.dimension.count" dimensions) attrs)))
         (when (and (config-embedding-capture-input config)
-                   capture-content
+                   capture-span
                    (emb-rec-input-texts rec))
           (let ((texts (truncate-embedding-texts
                         (emb-rec-input-texts rec)
@@ -774,7 +783,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                        :attributes (coerce (nreverse attrs) 'vector)
                        :status-code (if (recorder-call-error rec) 2 1)
                        :status-message (if (recorder-call-error rec)
-                                           (if capture-content
+                                           (if capture-span
                                                (recorder-call-error rec)
                                                (redacted-error-text (recorder-call-error rec)))
                                            ""))))))))
@@ -823,7 +832,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
 (defun build-workflow-step-payload (rec config)
   "Build a workflow-step JSON hash-table from the recorder state."
   (let* ((capture (config-content-capture-mode config))
-         (capture-content (capture-keeps-content-p capture))
+         (capture-content (capture-keeps-payload-content-p capture))
          (step (jobj "id" (wfs-rec-step-id rec)
                      "conversation_id" (or (wfs-rec-conversation-id rec) "")
                      "step_name" (or (wfs-rec-step-name rec) "")
@@ -871,7 +880,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
          (step-name (or (wfs-rec-step-name rec) "unknown"))
          (err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
          (capture (config-content-capture-mode config))
-         (capture-content (capture-keeps-content-p capture))
+         (capture-span (capture-keeps-span-content-p capture))
          (attrs (common-span-attrs config
                   :provider ""
                   :model ""
@@ -905,7 +914,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                   :attributes (coerce (nreverse attrs) 'vector)
                   :status-code (if err 2 1)
                   :status-message (if err
-                                      (if capture-content err (redacted-error-text err))
+                                      (if capture-span err (redacted-error-text err))
                                       "")))))
 
 (defmethod recorder-end ((rec workflow-step-recorder))
