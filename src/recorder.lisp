@@ -347,7 +347,11 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
                           (apply-secret-redaction redactor :full
                                                   (gen-rec-conversation-title rec))
                           (gen-rec-conversation-title rec))))))
+         ;; The payload carries the identifiers even when trace export is off,
+         ;; so a consumer running its own OTel exporter keeps the cross-link.
          (gen (jobj "id" (gen-rec-generation-id rec)
+                    "trace_id" (or (gen-rec-trace-id rec) "")
+                    "span_id" (or (gen-rec-span-id rec) "")
                     "mode" mode-str
                     "operation_name" op-name
                     "model" (jobj "provider" (or (gen-rec-model-provider rec) "")
@@ -449,9 +453,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
     (when gen-payload
       (let ((gen-id (jget gen-payload "id")))
         (when (and gen-id (plusp (length gen-id)))
-          (push (otel-string-attr "agento11y.generation.id" gen-id) attrs)))
-      (setf (gethash "trace_id" gen-payload) trace-id)
-      (setf (gethash "span_id" gen-payload) span-id))
+          (push (otel-string-attr "agento11y.generation.id" gen-id) attrs))))
     ;; Response metadata
     (when (gen-rec-response-id rec)
       (push (otel-string-attr "gen_ai.response.id" (gen-rec-response-id rec)) attrs))

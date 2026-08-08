@@ -905,6 +905,56 @@ experiment-runs branch, whose prefix they share."
             (check "span name" (search "generateText" (jget span "name")))
             (check "span kind=CLIENT" (= (jget span "kind") 3)))))
 
+    ;; Trace export off: the payload still carries the recorder's identifiers
+    (multiple-value-bind (client get-requests) (make-test-client :traces-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4")))
+        (recorder-end rec)
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
+          (check "traces off: payload trace_id from recorder"
+                 (equal (jget gen "trace_id") (gen-rec-trace-id rec)))
+          (check "traces off: payload span_id from recorder"
+                 (equal (jget gen "span_id") (gen-rec-span-id rec)))
+          (check "traces off: payload trace_id not empty"
+                 (plusp (length (jget gen "trace_id"))))
+          (check "traces off: payload span_id not empty"
+                 (plusp (length (jget gen "span_id")))))
+        (check "traces off: no span enqueued"
+               (agento11y-cl::queue-empty-p (agento11y-cl::client-trace-queue client)))))
+
+    ;; Both planes on: payload and span agree on the identifiers
+    (multiple-value-bind (client get-requests) (make-test-client :traces-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :sync
+                                          :model-provider "openai" :model-name "gpt-4")))
+        (recorder-end rec)
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client))))
+              (span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
+          (check "both planes: payload trace_id equals span traceId"
+                 (equal (jget gen "trace_id") (jget span "traceId")))
+          (check "both planes: payload span_id equals span spanId"
+                 (equal (jget gen "span_id") (jget span "spanId")))
+          (check "both planes: identifiers come from the recorder"
+                 (and (equal (jget gen "trace_id") (gen-rec-trace-id rec))
+                      (equal (jget gen "span_id") (gen-rec-span-id rec)))))))
+
+    ;; Trace export off: an ambient trace-id still reaches the payload
+    (multiple-value-bind (client get-requests) (make-test-client :traces-enabled nil)
+      (declare (ignore get-requests))
+      (let* ((*trace-context* (list :trace-id "0123456789abcdef0123456789abcdef"))
+             (rec (start-generation client :mode :sync
+                                           :model-provider "openai" :model-name "gpt-4")))
+        (recorder-end rec)
+        (let ((gen (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-generation-queue client)))))
+          (check "traces off: ambient trace-id reaches payload"
+                 (equal (jget gen "trace_id")
+                        "0123456789abcdef0123456789abcdef")))))
+
     ;; Idempotent end
     (multiple-value-bind (client2 get-requests2) (make-test-client)
       (declare (ignore get-requests2))
