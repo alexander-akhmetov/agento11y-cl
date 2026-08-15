@@ -199,7 +199,8 @@ TELEMETRY-CONTEXT-THUNK.")
                                       temperature top-p max-tokens tool-choice
                                       (thinking-enabled :unset)
                                       parent-generation-ids
-                                      tags metadata generation-id started-at)
+                                      tags metadata generation-id started-at
+                                      content-capture)
   "Create and start a generation recorder.
 When called inside a `with-workflow-step` (or any other context that binds
 `*trace-context*`), the generation inherits the workflow's trace-id and uses
@@ -208,7 +209,11 @@ its span-id as parent so spans nest under the workflow span.
 STARTED-AT overrides the wall clock. Pass it when the recorder is opened after
 the call it describes has already returned: without it both timestamps are read
 at record time, the backend derives a zero latency, and the exported span is
-shifted forward by its own duration."
+shifted forward by its own duration.
+
+CONTENT-CAPTURE sets the capture mode for this generation only, ahead of the
+capture-mode resolver and the client-level mode. A tool execution opened inside
+`with-generation` inherits the mode resolved here."
   (let* ((config (client-config client))
          (run *experiment-run*)
          (ctx *trace-context*)
@@ -230,6 +235,8 @@ shifted forward by its own duration."
     (let ((rec (make-instance 'generation-recorder
       :client client
       :started-at (or started-at (iso8601-now))
+      :content-capture-mode (resolve-content-capture-mode
+                             config :override content-capture :metadata metadata)
       :generation-id (or generation-id (generate-id))
       :trace-id (or inherited-trace-id (generate-trace-id))
       :span-id (generate-span-id)
@@ -259,13 +266,22 @@ shifted forward by its own duration."
 
 (defun start-tool-execution (client &key tool-name tool-call-id tool-type tool-description
                                           conversation-id agent-name agent-version
-                                          model-provider model-name started-at)
+                                          model-provider model-name started-at
+                                          content-capture)
   "Create and start a tool execution recorder.
-STARTED-AT overrides the wall clock; see START-GENERATION."
+STARTED-AT overrides the wall clock; see START-GENERATION.
+
+CONTENT-CAPTURE sets the capture mode for this tool execution only. Without it
+the recorder takes the mode the enclosing generation resolved to, then the
+capture-mode resolver, then the client-level mode."
   (let ((config (client-config client)))
     (make-instance 'tool-execution-recorder
       :client client
       :started-at (or started-at (iso8601-now))
+      :content-capture-mode (resolve-content-capture-mode
+                             config
+                             :override content-capture
+                             :parent-mode (getf *trace-context* :content-capture-mode))
       :tool-name tool-name
       :tool-call-id tool-call-id
       :tool-type tool-type
@@ -282,11 +298,15 @@ STARTED-AT overrides the wall clock; see START-GENERATION."
   "Create and start an embedding recorder.
 DIMENSIONS is the requested dimension count; a result dimension count set later
 via set-result takes precedence over it on the span.
-STARTED-AT overrides the wall clock; see START-GENERATION."
+STARTED-AT overrides the wall clock; see START-GENERATION.
+
+An embedding has no per-call capture mode, matching the reference SDKs: its
+mode comes from the capture-mode resolver, then the client-level mode."
   (let ((config (client-config client)))
     (make-instance 'embedding-recorder
       :client client
       :started-at (or started-at (iso8601-now))
+      :content-capture-mode (resolve-content-capture-mode config)
       :model-provider model-provider
       :model-name model-name
       :agent-name (%resolve-agent-name config agent-name)

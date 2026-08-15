@@ -249,7 +249,8 @@ Behaviour:
 | `:auth-password` | `nil` | Auth password/token |
 | `:tenant-id` | `nil` | Grafana Cloud tenant ID |
 | `:extra-headers` | `nil` | Alist of extra HTTP headers merged with auth headers (user wins on case-insensitive collision) |
-| `:content-capture-mode` | `:metadata-only` | `:full`, `:no-tool-content`, `:full-with-metadata-spans`, or `:metadata-only` |
+| `:content-capture-mode` | `:no-tool-content` | `:full`, `:no-tool-content`, `:full-with-metadata-spans`, or `:metadata-only` |
+| `:content-capture-resolver` | `nil` | Function of one argument (the metadata supplied at start, `nil` where there is none) returning a capture mode, or `nil` / `:default` to defer to `:content-capture-mode`. A resolver that signals resolves to `:metadata-only` |
 | `:embedding-capture-input` | `nil` | Put embedding input texts on the span as `gen_ai.embeddings.input_texts`. Also needs a content capture mode of `:full` or `:no-tool-content`; the other two modes suppress the texts. No environment variable sets this, matching the Go, Python, and JavaScript SDKs |
 | `:embedding-max-input-items` | `20` | Number of input texts kept on the span. A zero or negative value falls back to 20 |
 | `:embedding-max-text-length` | `1024` | Characters kept per input text. If the length is above 3, longer text keeps its first `length - 3` characters plus `...`. If the length is 3 or less, the text is cut with no suffix. A zero or negative value falls back to 1024 |
@@ -309,10 +310,11 @@ no-op because TLS is controlled by the URL scheme.
 >
 > - `:auth-mode :none` — `AGENTO11Y_AUTH_MODE` will replace it. A caller asking
 >   for "no auth" can have credentials added by env.
-> - `:content-capture-mode :metadata-only` — `AGENTO11Y_CONTENT_CAPTURE_MODE`
->   will replace it. A caller relying on `:metadata-only` to keep
->   prompt/response text out of telemetry can be silently downgraded to `full`
->   by the environment.
+> - `:content-capture-mode :no-tool-content` — `AGENTO11Y_CONTENT_CAPTURE_MODE`
+>   will replace it. A caller who set `:no-tool-content` to keep tool I/O off
+>   spans can be silently widened to `full` by the environment. Only the schema
+>   default `:no-tool-content` is treated as unset, so an explicit
+>   `:metadata-only` is never replaced.
 >
 > If a deployment relies on these defaults for privacy or auth posture,
 > either set the matching variable to the desired value or unset it
@@ -350,6 +352,7 @@ endpoint.
 | Conversation title | payload | full | full | full | omitted |
 | Tool `description`, `input_schema_json` | payload | full | full | full | empty string (`name`, `type`, `deferred` kept) |
 | Rating comment | payload | sent | sent | sent | omitted |
+| Workflow step `input_state`, `output_state` | payload | full | full | full | omitted |
 | `call_error`, workflow `error` | payload | full | full | full | error category |
 | Span status message | span | full | full | error category | error category |
 | Tool span `gen_ai.tool.description` | span | full | full | omitted | omitted |
@@ -386,23 +389,74 @@ span type: `:no-tool-content` drops tool arguments and results but keeps the
 error message.
 
 `submit-conversation-rating` logs a warning when the capture mode drops the
-comment. The POST still succeeds, and the default mode is `:metadata-only`, so a
-caller who never set a mode would otherwise see the feedback text disappear
-without a signal.
+comment. The POST still succeeds, so a caller who set a stripping mode would
+otherwise see the feedback text disappear without a signal. A rating has no
+recorder, so it reads the client-level mode and not a per-call one.
 
-Every exported generation carries the tag
-`agento11y.sdk.content_capture_mode`, holding `full`, `no_tool_content`,
-`full_with_metadata_spans`, or `metadata_only`. The server reads it to tell a
-stripped generation from a full one: it collapses stripped generations in
-conversation transcripts, skips them as per-generation judge variables, and
-warns on test-case promotion. The SDK sets the tag last, so a caller tag using
-the same key cannot override it. `metadata_only` is the only stripped marker the
-server acts on.
+#### Resolving the mode per call
+
+A generation takes `:content-capture` on `start-generation` or
+`with-generation`; a tool execution takes it on `start-tool-execution` or
+`with-tool-execution`. Precedence matches the reference SDKs:
+
+| Recording | Precedence, highest first |
+|-----------|---------------------------|
+| Generation | per-call `:content-capture` > `:content-capture-resolver` > `:content-capture-mode` |
+| Tool execution | per-call `:content-capture` > the enclosing generation's resolved mode > `:content-capture-resolver` > `:content-capture-mode` |
+| Embedding | `:content-capture-resolver` > `:content-capture-mode` |
+
+```lisp
+(agento11y-cl:with-generation (rec *client*
+                           :model-provider "anthropic"
+                           :model-name "claude-sonnet-4-20250514"
+                           :content-capture :metadata-only)
+  ;; This generation exports no content, whatever the client is set to, and a
+  ;; tool execution opened inside it inherits :metadata-only.
+  )
+```
+
+A tool execution inherits through `*trace-context*`, so it has to run inside the
+generation's dynamic extent. On a thread the caller spawns, carry the context
+over with `capture-telemetry-context` / `with-telemetry-context` or
+`telemetry-context-thunk`. Without a carried context the tool execution resolves
+from `:content-capture-resolver` and then the client-level
+`:content-capture-mode`. Code that binds `*trace-context*` by hand builds the
+plist with `child-trace-context`, which carries the mode; a plist built with
+`list` drops it and lands the tool execution on the same two-step fallback.
+
+`:content-capture-resolver` runs at most once per recording, and not at all when
+a per-call `:content-capture` or an inherited parent mode already decided the
+mode. It receives the metadata supplied at start; a tool execution and an
+embedding carry none, so it gets `nil`. A per-call mode or a resolver return
+outside the four supported keywords logs a warning and resolves to
+`:metadata-only`. So does a resolver that signals: a resolver that cannot decide
+must not widen what leaves the process.
+
+Every exported generation carries `agento11y.sdk.content_capture_mode`, holding
+`full`, `no_tool_content`, `full_with_metadata_spans`, or `metadata_only`. It is
+written to both the tags map and the metadata map: the server reads the tag, the
+reference SDKs write the metadata key. The server uses it to tell a stripped
+generation from a full one: it collapses stripped generations in conversation
+transcripts, skips them as per-generation judge variables, and warns on test-case
+promotion. The SDK writes both entries last, so a caller tag or metadata key of
+the same name cannot override it. `metadata_only` is the only stripped marker
+the server acts on.
 
 A `:content-capture-mode` outside the four supported keywords is treated as
 `:metadata-only`. `resolve-config-from-env` also logs a warning naming the
 rejected value, and serialization redacts independently of that warning, so a
 config built directly with `make-config` still fails closed.
+
+**Default change.** Earlier releases defaulted `:content-capture-mode` to
+`:metadata-only`. It is now `:no-tool-content`, which is the default the other
+SDK clients use: tool arguments and results stay off spans and every other
+content field is exported. A deployment that never set the mode now sends every
+field the `:metadata-only` column of the table above withholds, which is more
+than the prompt and the response: the system prompt, the conversation title,
+tool descriptions and schemas, workflow step `input_state` and `output_state`,
+and rating comments go too. To keep them out of telemetry, set
+`:content-capture-mode :metadata-only` or
+`AGENTO11Y_CONTENT_CAPTURE_MODE=metadata_only` explicitly.
 
 **Breaking change.** `:metadata-with-system-prompt` was a CL-only mode with no
 counterpart in the other SDKs. It reported `metadata_only` on the wire while

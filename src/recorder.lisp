@@ -5,9 +5,26 @@
 ;;; --- Trace context ---
 
 (defvar *trace-context* nil
-  "Current trace context plist (:trace-id ... :span-id ...).
+  "Current trace context plist (:trace-id ... :span-id ... :content-capture-mode ...).
 Set by generation recorder, read by tool/embedding recorders.
-Each with-generation call binds this per-thread via LET.")
+Each with-generation call binds this per-thread via LET.
+:content-capture-mode carries the mode the enclosing generation resolved to, so
+a tool execution opened inside it inherits that mode instead of the client-level
+one. Build the plist with CHILD-TRACE-CONTEXT rather than by hand: a plist built
+with LIST carries no capture mode, and a tool execution under it exports content
+the enclosing generation withholds.")
+
+(defun child-trace-context (trace-id span-id
+                            &key (content-capture-mode
+                                  (getf *trace-context* :content-capture-mode)))
+  "Build the *trace-context* plist for a span opened under TRACE-ID and SPAN-ID.
+The capture mode defaults to the one in force at the call, so a context built
+inside a generation keeps that generation's mode for the tool executions under
+it. Call it before rebinding *trace-context*, which is where the default reads
+from."
+  (list :trace-id trace-id
+        :span-id span-id
+        :content-capture-mode content-capture-mode))
 
 ;;; --- Base recorder ---
 
@@ -16,7 +33,18 @@ Each with-generation call binds this per-thread via LET.")
    (started-at  :initarg :started-at  :accessor recorder-started-at  :initform nil)
    (completed-at :initarg :completed-at :accessor recorder-completed-at :initform nil)
    (call-error  :initarg :call-error  :accessor recorder-call-error  :initform nil)
-   (ended-p     :initarg :ended-p     :accessor recorder-ended-p     :initform nil)))
+   (ended-p     :initarg :ended-p     :accessor recorder-ended-p     :initform nil)
+   ;; Capture mode resolved when this recorder started. Workflow steps leave it
+   ;; NIL and stay on the client-level mode; generation, tool-execution and
+   ;; embedding recorders resolve it at start.
+   (content-capture-mode :initarg :content-capture-mode
+                         :accessor recorder-content-capture-mode :initform nil)))
+
+(defun recorder-capture-mode (rec)
+  "Capture mode for REC: the mode it resolved to at start, or the client-level
+mode when it carries none."
+  (or (recorder-content-capture-mode rec)
+      (config-content-capture-mode (client-config (recorder-client rec)))))
 
 (defgeneric set-result (recorder &key &allow-other-keys))
 (defgeneric set-call-error (recorder error-string))
@@ -325,7 +353,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
 
 (defun build-generation-payload (rec config)
   "Build a generation JSON hash-table from the recorder state."
-  (let* ((capture (config-content-capture-mode config))
+  (let* ((capture (recorder-capture-mode rec))
          (capture-content (capture-keeps-payload-content-p capture))
          (redactor (when (config-redact-secrets config)
                      (make-secret-redactor
@@ -358,12 +386,21 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
                 (unless capture-content
                   (dolist (key +content-metadata-keys+)
                     (remhash key meta))))
+              ;; Written after the caller merge and the content-key strip, so
+              ;; the SDK value wins over a caller key of the same name and no
+              ;; mode can remove it. +content-capture-mode-key+ says why the
+              ;; marker is in both maps.
+              (setf (gethash +content-capture-mode-key+ meta)
+                    (content-capture-mode-string capture))
               ;; Store conversation title in metadata (not as top-level proto
               ;; field). The title is caller content, so a redacting mode drops it.
+              ;; A title is a short natural-language string, so it takes the
+              ;; light tier: tier 2 replaces the word after "token:", "key:",
+              ;; "secret:" and five more key names, which a title can contain.
               (when (and capture-content (gen-rec-conversation-title rec))
                 (setf (gethash "agento11y.conversation.title" meta)
                       (if redactor
-                          (apply-secret-redaction redactor :full
+                          (apply-secret-redaction redactor :light
                                                   (gen-rec-conversation-title rec))
                           (gen-rec-conversation-title rec))))))
          ;; The payload carries the identifiers even when trace export is off,
@@ -422,7 +459,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
       (dolist (pair all-tags)
         (when (and (consp pair) (stringp (car pair)) (stringp (cdr pair)))
           (setf (gethash (car pair) tags-obj) (cdr pair))))
-      (setf (gethash "agento11y.sdk.content_capture_mode" tags-obj)
+      (setf (gethash +content-capture-mode-key+ tags-obj)
             (content-capture-mode-string capture))
       (setf (gethash "tags" gen) tags-obj))
     ;; System prompt
@@ -501,14 +538,16 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
           (when (plusp cc)
             (push (otel-int-attr "gen_ai.usage.cache_write_input_tokens" cc) attrs)))))
     ;; Request controls
-    (when (gen-rec-temperature rec)
-      (push (otel-string-attr "gen_ai.request.temperature"
-                               (princ-to-string (gen-rec-temperature rec))) attrs))
+    ;; The payload takes these as the caller set them; the span needs numbers,
+    ;; so a non-numeric value is left off the span rather than failing the
+    ;; whole span build.
+    (when (realp (gen-rec-temperature rec))
+      (push (otel-double-attr "gen_ai.request.temperature"
+                              (gen-rec-temperature rec)) attrs))
     (when (gen-rec-max-tokens rec)
       (push (otel-int-attr "gen_ai.request.max_tokens" (gen-rec-max-tokens rec)) attrs))
-    (when (gen-rec-top-p rec)
-      (push (otel-string-attr "gen_ai.request.top_p"
-                               (princ-to-string (gen-rec-top-p rec))) attrs))
+    (when (realp (gen-rec-top-p rec))
+      (push (otel-double-attr "gen_ai.request.top_p" (gen-rec-top-p rec)) attrs))
     (when (gen-rec-tool-choice rec)
       (push (otel-string-attr "agento11y.gen_ai.request.tool_choice"
                                (gen-rec-tool-choice rec)) attrs))
@@ -522,7 +561,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
         (when category
           (push (otel-string-attr "error.category" category) attrs))))
     ;; Build span
-    (let* ((capture (config-content-capture-mode config))
+    (let* ((capture (recorder-capture-mode rec))
            (capture-span (capture-keeps-span-content-p capture))
            (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
            (end-nano (if (and start-nano (gen-rec-duration-seconds rec))
@@ -589,7 +628,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
 (defmethod recorder-end ((rec tool-execution-recorder))
   (let ((config (client-config (recorder-client rec))))
     (when (config-traces-enabled config)
-      (let* ((capture (config-content-capture-mode config))
+      (let* ((capture (recorder-capture-mode rec))
              (capture-tool (capture-keeps-tool-span-content-p capture))
              (capture-span (capture-keeps-span-content-p capture))
              (parent *trace-context*)
@@ -739,7 +778,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
 (defmethod recorder-end ((rec embedding-recorder))
   (let ((config (client-config (recorder-client rec))))
     (when (config-traces-enabled config)
-      (let* ((capture (config-content-capture-mode config))
+      (let* ((capture (recorder-capture-mode rec))
              (capture-span (capture-keeps-span-content-p capture))
              (parent *trace-context*)
              (trace-id (or (getf parent :trace-id) (generate-trace-id)))
@@ -751,8 +790,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                                                :agent-name (emb-rec-agent-name rec)
                                                :agent-version (emb-rec-agent-version rec))))
         (push (otel-string-attr "gen_ai.operation.name" "embeddings") attrs)
-        (when (plusp (length model))
-          (push (otel-string-attr "gen_ai.request.model" model) attrs))
+        ;; No gen_ai.request.model push here: common-span-attrs above emits it.
         (let ((encoding (%trimmed-or-nil (emb-rec-encoding-format rec))))
           (when encoding
             (push (otel-string-array-attr "gen_ai.request.encoding_formats"

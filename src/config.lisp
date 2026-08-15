@@ -53,7 +53,15 @@
    (max-backoff-sec     :initarg :max-backoff-sec     :reader config-max-backoff-sec     :initform 5.0)
    ;; Content capture
    (content-capture-mode :initarg :content-capture-mode :reader config-content-capture-mode
-                         :initform :metadata-only)
+                         :initform :no-tool-content)
+   ;; Called when a generation, tool execution, or embedding starts and no
+   ;; closer setting has decided its capture mode. Takes the metadata supplied
+   ;; at start (NIL where the recording type carries none) and returns a mode,
+   ;; or NIL to defer to the client-level mode. Metadata a later set-result call
+   ;; supplies is not seen: the mode is resolved once, at start, which is what
+   ;; makes it inheritable. See %resolve-capture-mode-from-resolver.
+   (content-capture-resolver :initarg :content-capture-resolver
+                             :reader config-content-capture-resolver :initform nil)
    ;; Embedding input text capture. Opt-in, and additionally gated by
    ;; content-capture-mode: only :full and :no-tool-content keep the texts.
    ;; The two limits hold NIL until a caller sets them; the readers below apply
@@ -101,6 +109,11 @@
 (defparameter +content-capture-modes+
   '(:full :no-tool-content :full-with-metadata-spans :metadata-only)
   "The supported :content-capture-mode values.")
+
+(defparameter +content-capture-mode-key+ "agento11y.sdk.content_capture_mode"
+  "Key the resolved capture mode is stamped under, on both the generation tags
+map and the generation metadata map. The sigil backend reads it from tags; the
+reference SDKs write it to metadata.")
 
 (defparameter +content-metadata-keys+
   '("agento11y.conversation.title" "sigil.conversation.title" "call_error")
@@ -160,6 +173,55 @@ acts on."
     ((eq mode :no-tool-content) "no_tool_content")
     ((eq mode :full-with-metadata-spans) "full_with_metadata_spans")
     (t "metadata_only")))
+
+;;; --- Content capture mode resolution ---
+;;;
+;;; Precedence, from the shared docs/concepts/content-capture-modes.md:
+;;;   generation      per-call > resolver > client
+;;;   tool execution  per-call > parent generation's resolved mode > resolver > client
+;;;   embedding       resolver > client
+;;; A mode is resolved once, when the recorder starts, and held on the recorder,
+;;; so a config change mid-call cannot move a recording between modes. A layer
+;;; defers by holding NIL or :default; only the client-level mode is final.
+
+(defun %capture-mode-choice (config mode source)
+  "Return MODE when a layer chose one, or NIL when it deferred.
+NIL and :default both defer. A mode outside the vocabulary is a caller mistake
+that would strip every field without saying why, so it warns, names SOURCE, and
+resolves to :metadata-only."
+  (cond
+    ((null mode) nil)
+    ((eq mode :default) nil)
+    ((valid-content-capture-mode-p mode) mode)
+    (t (agento11y-log config :warn "config"
+                      (format nil "ignoring ~a content capture mode ~s (unsupported value), using :metadata-only"
+                              source mode))
+       :metadata-only)))
+
+(defun %resolve-capture-mode-from-resolver (config metadata)
+  "Ask the configured resolver for a capture mode, or return NIL.
+NIL means no resolver, or a resolver that deferred. A resolver that signals
+resolves to :metadata-only: a resolver that cannot decide must not widen what
+leaves the process."
+  (let ((resolver (config-content-capture-resolver config)))
+    (when resolver
+      (handler-case
+          (%capture-mode-choice config (funcall resolver metadata) "resolver")
+        (error (e)
+          (agento11y-log config :warn "config"
+                         (format nil "content capture resolver failed: ~a, using :metadata-only"
+                                 (princ-to-string e)))
+          :metadata-only)))))
+
+(defun resolve-content-capture-mode (config &key override parent-mode metadata)
+  "Effective capture mode for one recording.
+OVERRIDE is the per-call mode, PARENT-MODE the mode a parent generation already
+resolved to, METADATA what the resolver is given. A layer that decides the mode
+stops the chain, so a per-call mode leaves the resolver uncalled."
+  (or (%capture-mode-choice config override "per-call")
+      parent-mode
+      (%resolve-capture-mode-from-resolver config metadata)
+      (config-content-capture-mode config)))
 
 (defparameter +default-eval-path-prefix+ "/api/v1")
 (defparameter +default-scores-export-path+ "/api/v1/scores:export")

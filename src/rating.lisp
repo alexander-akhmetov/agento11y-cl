@@ -23,9 +23,9 @@ Synchronous (not queued)."
                           "rating_id" rid))
            (auth-headers (build-auth-headers config)))
       ;; FEEDBACK is caller content, so a redacting capture mode drops it. The
-      ;; POST still succeeds, so warn: the default mode is :metadata-only, and a
-      ;; caller who never set a mode would otherwise see the text disappear
-      ;; without a signal.
+      ;; POST still succeeds, so warn: a caller who set :metadata-only on the
+      ;; client would otherwise see the text disappear without a signal. A
+      ;; rating has no recorder, so a per-call mode never reaches it.
       (when feedback
         (let ((capture (config-content-capture-mode config)))
           (if (capture-keeps-payload-content-p capture)

@@ -9,6 +9,7 @@
                                embedding-capture-input
                                embedding-max-input-items
                                embedding-max-text-length
+                               content-capture-resolver
                                (redact-secrets nil)
                                (redact-input-messages nil)
                                (redact-email-addresses t)
@@ -50,6 +51,7 @@
        :metrics-endpoint metrics-endpoint
        :metrics-enabled metrics-enabled
        :content-capture-mode capture
+       :content-capture-resolver content-capture-resolver
        :embedding-capture-input embedding-capture-input
        :embedding-max-input-items embedding-max-input-items
        :embedding-max-text-length embedding-max-text-length
@@ -562,6 +564,18 @@ experiment-runs branch, whose prefix they share."
                (equal (agento11y-cl::config-user-id cfg) "u-42")))
 
       ;; --- AGENTO11Y_CONTENT_CAPTURE_MODE ---
+      (check "schema default capture mode is :no-tool-content"
+             (eq (agento11y-cl::config-content-capture-mode (make-config))
+                 :no-tool-content))
+      ;; The env override fires only while the mode is still the schema
+      ;; default, so an explicit :metadata-only survives a deployment that sets
+      ;; the variable.
+      (let ((cfg (agento11y-cl::resolve-config-from-env
+                  (make-config :content-capture-mode :metadata-only)
+                  :env-fn (env-from-alist
+                           '(("AGENTO11Y_CONTENT_CAPTURE_MODE" . "full"))))))
+        (check "explicit :metadata-only is not overridden by env"
+               (eq (agento11y-cl::config-content-capture-mode cfg) :metadata-only)))
       (let ((cfg (resolve '(("AGENTO11Y_CONTENT_CAPTURE_MODE" . "full")))))
         (check "AGENTO11Y_CONTENT_CAPTURE_MODE=full"
                (eq (agento11y-cl::config-content-capture-mode cfg) :full)))
@@ -581,7 +595,7 @@ experiment-runs branch, whose prefix they share."
                    :env-fn (env-from-alist
                             '(("AGENTO11Y_CONTENT_CAPTURE_MODE" . "garbage"))))))
         (check "bad AGENTO11Y_CONTENT_CAPTURE_MODE keeps default"
-               (eq (agento11y-cl::config-content-capture-mode cfg) :metadata-only))
+               (eq (agento11y-cl::config-content-capture-mode cfg) :no-tool-content))
         (check "bad AGENTO11Y_CONTENT_CAPTURE_MODE warns"
                (>= warns 1)))
 
@@ -824,6 +838,16 @@ experiment-runs branch, whose prefix they share."
     (let ((attr (otel-int-attr "count" 42)))
       (check "int-attr value" (equal (jget* attr "value" "intValue") "42")))
 
+    ;; doubleValue is a JSON number, unlike intValue
+    (let ((attr (otel-double-attr "ratio" 0.2)))
+      (check "double-attr value is a number" (numberp (jget* attr "value" "doubleValue")))
+      (check "double-attr serializes as a bare number"
+             (equal (jzon:stringify attr)
+                    "{\"key\":\"ratio\",\"value\":{\"doubleValue\":0.2}}")))
+    (let ((attr (otel-double-attr "whole" 1)))
+      (check "double-attr widens an integer"
+             (search "\"doubleValue\":1.0" (jzon:stringify attr))))
+
     (let ((attr (otel-bool-attr "flag" t)))
       (check "bool-attr true" (eq (jget* attr "value" "boolValue") t)))
     (let ((attr (otel-bool-attr "flag" nil)))
@@ -917,6 +941,32 @@ experiment-runs branch, whose prefix they share."
             (check "span has traceId" (plusp (length (jget span "traceId"))))
             (check "span name" (search "generateText" (jget span "name")))
             (check "span kind=CLIENT" (= (jget span "kind") 3)))))
+
+    ;; Sampling parameters are double attributes, not strings
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (flet ((request-attr (span key)
+               (let ((found nil))
+                 (loop for a across (jget span "attributes")
+                       when (equal (jget a "key") key)
+                         do (setf found (jget a "value")))
+                 found)))
+        (let ((rec (start-generation client :mode :sync
+                                            :model-provider "openai" :model-name "gpt-4"
+                                            :temperature 0.2 :top-p 0.9)))
+          (recorder-end rec)
+          (let* ((span (first (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-trace-queue client))))
+                 (temperature (request-attr span "gen_ai.request.temperature"))
+                 (top-p (request-attr span "gen_ai.request.top_p")))
+            (check "temperature is a doubleValue"
+                   (numberp (jget temperature "doubleValue")))
+            (check "temperature value"
+                   (< (abs (- (jget temperature "doubleValue") 0.2)) 1d-6))
+            (check "temperature is not a stringValue"
+                   (null (jget temperature "stringValue")))
+            (check "top_p is a doubleValue" (numberp (jget top-p "doubleValue")))
+            (check "top_p value" (< (abs (- (jget top-p "doubleValue") 0.9)) 1d-6))))))
 
     ;; Trace export off: the payload still carries the recorder's identifiers
     (multiple-value-bind (client get-requests) (make-test-client :traces-enabled nil)
@@ -1121,10 +1171,11 @@ experiment-runs branch, whose prefix they share."
                                                  :role :assistant
                                                  :parts (list (make-text-part "Secret")
                                                               (make-thinking-part "Secret thought")))))))
-        ;; build-generation-payload directly, so the unsupported mode never
-        ;; passes through resolve-config-from-env.
+        ;; The mode is set on the recorder, so it never passes through
+        ;; resolve-config-from-env, which would rewrite it.
+        (setf (agento11y-cl::recorder-content-capture-mode rec) :typo-mode)
         (let* ((gen (agento11y-cl::build-generation-payload
-                     rec (make-config :content-capture-mode :typo-mode)))
+                     rec (agento11y-cl::client-config client)))
                (parts (jget (aref (jget gen "input") 0) "parts")))
           (check "unsupported mode: text redacted"
                  (equal (jget (aref parts 0) "text") ""))
@@ -1136,6 +1187,9 @@ experiment-runs branch, whose prefix they share."
                  (null (jget* gen "metadata" "agento11y.conversation.title")))
           (check "unsupported mode: capture tag reports metadata_only"
                  (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                        "metadata_only"))
+          (check "unsupported mode: capture metadata reports metadata_only"
+                 (equal (jget* gen "metadata" "agento11y.sdk.content_capture_mode")
                         "metadata_only")))))
 
     ;; The removed :metadata-with-system-prompt keyword: message structure survives,
@@ -1231,6 +1285,9 @@ experiment-runs branch, whose prefix they share."
                  (equal (jget gen "call_error") "429 rate limit exceeded"))
           (check "full-with-metadata-spans: capture tag names the mode"
                  (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                        "full_with_metadata_spans"))
+          (check "full-with-metadata-spans: capture metadata names the mode"
+                 (equal (jget* gen "metadata" "agento11y.sdk.content_capture_mode")
                         "full_with_metadata_spans")))))
 
     ;; Span status messages: the span gate, not the payload gate. The tool span
@@ -1501,25 +1558,233 @@ experiment-runs branch, whose prefix they share."
                              (agento11y-cl::client-generation-queue client)))))
             (check (format nil "~a: capture tag present with no caller tags" (car pair))
                    (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                          (cdr pair)))
+            ;; The backend reads the tag; the other SDKs write the metadata key.
+            (check (format nil "~a: capture metadata present with no caller metadata"
+                           (car pair))
+                   (equal (jget* gen "metadata" "agento11y.sdk.content_capture_mode")
                           (cdr pair)))))))
 
-    ;; Caller tags survive, and the SDK key wins over a caller tag of the same name
+    ;; Caller tags and metadata survive, and the SDK key wins over a caller
+    ;; entry of the same name in both maps
     (multiple-value-bind (client get-requests) (make-test-client :capture :full)
       (declare (ignore get-requests))
       (let ((rec (start-generation client :mode :sync
                                           :model-provider "test" :model-name "m"
                                           :tags '(("env" . "prod")
                                                   ("agento11y.sdk.content_capture_mode"
-                                                   . "metadata_only")))))
+                                                   . "metadata_only"))
+                                          :metadata '(("team" . "sigil")
+                                                      ("agento11y.sdk.content_capture_mode"
+                                                       . "metadata_only")))))
         (recorder-end rec)
-        (let ((tags (jget (first (agento11y-cl::queue-drain-all
-                                  (agento11y-cl::client-generation-queue client)))
-                          "tags")))
+        (let* ((gen (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-generation-queue client))))
+               (tags (jget gen "tags"))
+               (meta (jget gen "metadata")))
           (check "caller tag preserved" (equal (jget tags "env") "prod"))
           (check "caller cannot override the capture tag"
                  (equal (jget tags "agento11y.sdk.content_capture_mode") "full"))
           (check "capture tag published only under the agento11y key"
-                 (null (jget tags "sigil.sdk.content_capture_mode"))))))
+                 (null (jget tags "sigil.sdk.content_capture_mode")))
+          (check "caller metadata preserved" (equal (jget meta "team") "sigil"))
+          (check "caller cannot override the capture metadata key"
+                 (equal (jget meta "agento11y.sdk.content_capture_mode") "full")))))
+
+    ;; --- Capture mode resolves per call ---
+
+    ;; A per-call mode overrides the client mode, and only for that generation
+    (multiple-value-bind (client get-requests) (make-test-client :capture :no-tool-content)
+      (declare (ignore get-requests))
+      (flet ((record (&rest initargs)
+               (let ((rec (apply #'start-generation client :mode :sync
+                                 :model-provider "test" :model-name "m"
+                                 :input-messages
+                                 (list (make-message :role :user
+                                                     :parts (list (make-text-part "Hello"))))
+                                 initargs)))
+                 (recorder-end rec)
+                 (first (agento11y-cl::queue-drain-all
+                         (agento11y-cl::client-generation-queue client))))))
+        (let ((stripped (record :content-capture :metadata-only))
+              (kept (record)))
+          (check "per-call :metadata-only empties the text"
+                 (equal (jget (aref (jget (aref (jget stripped "input") 0) "parts") 0) "text")
+                        ""))
+          (check "per-call :metadata-only marks the generation"
+                 (equal (jget* stripped "tags" "agento11y.sdk.content_capture_mode")
+                        "metadata_only"))
+          (check "the next generation is back on the client mode"
+                 (equal (jget (aref (jget (aref (jget kept "input") 0) "parts") 0) "text")
+                        "Hello"))
+          (check "the next generation is marked with the client mode"
+                 (equal (jget* kept "tags" "agento11y.sdk.content_capture_mode")
+                        "no_tool_content")))))
+
+    ;; A tool execution inside a :metadata-only generation: it inherits that
+    ;; mode, a per-tool mode wins over it, and the inheritance rides a thread
+    ;; hop only when the caller carries the telemetry context over
+    (multiple-value-bind (client get-requests) (make-test-client :capture :full)
+      (declare (ignore get-requests))
+      (labels ((span-attr (span key)
+                 (let ((found nil))
+                   (loop for a across (jget span "attributes")
+                         when (equal (jget a "key") key)
+                           do (setf found (jget* a "value" "stringValue")))
+                   found))
+               (record-tool (run initargs)
+                 (let ((open (lambda ()
+                               (let ((rec (apply #'start-tool-execution client
+                                                 :tool-name "search"
+                                                 :tool-description "Search the web"
+                                                 initargs)))
+                                 (set-result rec :arguments "{\"q\":\"secret\"}"
+                                                 :result "hit")
+                                 (recorder-end rec)))))
+                   (ecase run
+                     (:inline (funcall open))
+                     ;; A caller opening its own nested span rebinds the
+                     ;; context with the exported builder, which carries the
+                     ;; mode across the rebind.
+                     (:rebound-context
+                      (let ((*trace-context*
+                              (child-trace-context (getf *trace-context* :trace-id)
+                                                   (agento11y-cl::generate-span-id))))
+                        (funcall open)))
+                     (:carried-thread
+                      (bt2:join-thread (bt2:make-thread (telemetry-context-thunk open))))
+                     (:fresh-thread
+                      (bt2:join-thread (bt2:make-thread open))))))
+               (tool-span (run &rest initargs)
+                 (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))
+                 (with-generation (gen client :model-provider "test" :model-name "m"
+                                              :content-capture :metadata-only)
+                   (check (format nil "~a: generation holds its per-call mode" run)
+                          (eq (agento11y-cl::recorder-content-capture-mode gen)
+                              :metadata-only))
+                   (record-tool run initargs))
+                 (find "execute_tool search"
+                       (agento11y-cl::queue-drain-all
+                        (agento11y-cl::client-trace-queue client))
+                       :key (lambda (span) (jget span "name"))
+                       :test #'equal)))
+        (let ((inherited (tool-span :inline))
+              (overridden (tool-span :inline :content-capture :full))
+              (rebound (tool-span :rebound-context))
+              (carried (tool-span :carried-thread))
+              (fresh (tool-span :fresh-thread)))
+          (check "tool execution inherits :metadata-only: description dropped"
+                 (null (span-attr inherited "gen_ai.tool.description")))
+          (check "tool execution inherits :metadata-only: arguments redacted"
+                 (equal (span-attr inherited "gen_ai.tool.call.arguments") "<redacted>"))
+          (check "per-tool :full wins over the inherited mode"
+                 (equal (span-attr overridden "gen_ai.tool.call.arguments")
+                        "{\"q\":\"secret\"}"))
+          (check "per-tool :full keeps the tool description"
+                 (equal (span-attr overridden "gen_ai.tool.description")
+                        "Search the web"))
+          (check "a context rebuilt with child-trace-context keeps the mode"
+                 (null (span-attr rebound "gen_ai.tool.description")))
+          (check "a carried telemetry context keeps the inherited mode"
+                 (null (span-attr carried "gen_ai.tool.description")))
+          (check "a thread with no carried context falls back to the client mode"
+                 (equal (span-attr fresh "gen_ai.tool.description") "Search the web")))))
+
+    ;; The resolver sits between the per-call mode and the client mode. An
+    ;; unsupported return and a resolver that signals both fail closed.
+    (dolist (case (list (list "returning a mode"
+                              (lambda (metadata) (declare (ignore metadata)) :metadata-only)
+                              "metadata_only")
+                        (list "returning nil"
+                              (lambda (metadata) (declare (ignore metadata)) nil)
+                              "full")
+                        (list "returning :default"
+                              (lambda (metadata) (declare (ignore metadata)) :default)
+                              "full")
+                        (list "returning an unsupported mode"
+                              (lambda (metadata) (declare (ignore metadata)) :typo-mode)
+                              "metadata_only")
+                        (list "that signals"
+                              (lambda (metadata) (declare (ignore metadata))
+                                (error "resolver blew up"))
+                              "metadata_only")))
+      (destructuring-bind (label resolver expected) case
+        (multiple-value-bind (client get-requests)
+            (make-test-client :capture :full :content-capture-resolver resolver)
+          (declare (ignore get-requests))
+          (let ((rec (start-generation client :mode :sync
+                                              :model-provider "test" :model-name "m")))
+            (recorder-end rec)
+            (let ((gen (first (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-generation-queue client)))))
+              (check (format nil "resolver ~a: mode on the wire" label)
+                     (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                            expected)))))))
+
+    ;; Per-call modes outside the vocabulary, and the :default pass-through
+    (dolist (case '((:metadata-only . "metadata_only")
+                    (:default . "full")
+                    (:typo-mode . "metadata_only")))
+      (let ((warns 0))
+        (multiple-value-bind (client get-requests)
+            (make-test-client :capture :full
+                              :log-fn (lambda (level component message &rest kvs)
+                                        (declare (ignore component message kvs))
+                                        (when (eq level :warn) (incf warns))))
+          (declare (ignore get-requests))
+          (let ((rec (start-generation client :mode :sync
+                                              :model-provider "test" :model-name "m"
+                                              :content-capture (car case))))
+            (recorder-end rec)
+            (let ((gen (first (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-generation-queue client)))))
+              (check (format nil "per-call ~a: mode on the wire" (car case))
+                     (equal (jget* gen "tags" "agento11y.sdk.content_capture_mode")
+                            (cdr case)))
+              (check (format nil "per-call ~a: warns only when unsupported" (car case))
+                     (= warns (if (eq (car case) :typo-mode) 1 0))))))))
+
+    ;; The resolver reads the generation's metadata, and a per-call mode wins
+    ;; over it without calling it at all
+    (let ((calls nil))
+      (multiple-value-bind (client get-requests)
+          (make-test-client :capture :full
+                            :content-capture-resolver
+                            (lambda (metadata) (push metadata calls) :metadata-only))
+        (declare (ignore get-requests))
+        (flet ((mode-tag (&rest initargs)
+                 (let ((rec (apply #'start-generation client :mode :sync
+                                   :model-provider "test" :model-name "m"
+                                   :metadata '(("tier" . "gold"))
+                                   initargs)))
+                   (recorder-end rec)
+                   (jget* (first (agento11y-cl::queue-drain-all
+                                  (agento11y-cl::client-generation-queue client)))
+                          "tags" "agento11y.sdk.content_capture_mode"))))
+          (check "resolver mode wins over the client mode"
+                 (equal (mode-tag) "metadata_only"))
+          (check "resolver reads the generation metadata"
+                 (equal (first calls) '(("tier" . "gold"))))
+          (check "per-call mode wins over the resolver"
+                 (equal (mode-tag :content-capture :full) "full"))
+          (check "a per-call mode does not call the resolver"
+                 (= (length calls) 1)))))
+
+    ;; An embedding has no per-call mode: the resolver decides, then the client
+    (multiple-value-bind (client get-requests)
+        (make-test-client :capture :full :embedding-capture-input t
+                          :content-capture-resolver
+                          (lambda (metadata) (declare (ignore metadata)) :metadata-only))
+      (declare (ignore get-requests))
+      (let ((rec (start-embedding client :model-provider "openai" :model-name "emb")))
+        (set-result rec :input-texts (list "secret text"))
+        (recorder-end rec)
+        (let ((span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
+          (check "embedding takes the resolver mode: input texts dropped"
+                 (null (find "gen_ai.embeddings.input_texts" (jget span "attributes")
+                             :key (lambda (attr) (jget attr "key"))
+                             :test #'equal))))))
 
     ;; Thinking parts keep their shape when redacted
     (dolist (mode '(:metadata-only :metadata-with-system-prompt))
@@ -1929,6 +2194,15 @@ experiment-runs branch, whose prefix they share."
                                                  :input-texts (vector "alpha" nil 7 "beta")))
                     '("alpha" "beta")))
 
+      ;; gen_ai.request.model comes from the common attributes, once
+      (check "embedding span carries one gen_ai.request.model attribute"
+             (= 1 (count "gen_ai.request.model" (jget (embedding-span) "attributes")
+                         :key (lambda (attr) (jget attr "key"))
+                         :test #'equal)))
+      (check "embedding span names the request model"
+             (equal (string-attr (embedding-span) "gen_ai.request.model")
+                    "text-embedding-3-small"))
+
       ;; Request and response parity attributes
       (check "embedding request.encoding_formats is a single-element array"
              (equal (array-attr (embedding-span :encoding-format "base64")
@@ -1991,6 +2265,83 @@ experiment-runs branch, whose prefix they share."
                (search "API_KEY=" out))
         (check "redact-full: secret value removed"
                (not (search "hunter2plaintextvalue" out))))
+
+      ;; --- Direct engine: tier-2 quoted values, and boundaries and separators
+      ;; outside ASCII ---
+      (dolist (case (list
+                     (list "json secret field keeps key and quotes" :full
+                           "{\"api_key\": \"s3cret-value\"}"
+                           "{\"api_key\": \"[REDACTED:json-secret-field]\"}")
+                     (list "quoted env value keeps the closing quote" :full
+                           "API_KEY=\"quoted-secret-value\""
+                           "API_KEY=\"[REDACTED:env-secret-quoted-value]\"")
+                     (list "a key name ending in KEY does not match" :full
+                           "MONKEY: banana"
+                           "MONKEY: banana")
+                     (list "token after a CJK character redacted" :light
+                           "密钥glc_abcdefghijklmnopqrstuvwxyz1234"
+                           "密钥[REDACTED:grafana-cloud-token]")
+                     (list "token after a CJK character redacted" :full
+                           "密钥glc_abcdefghijklmnopqrstuvwxyz1234"
+                           "密钥[REDACTED:grafana-cloud-token]")
+                     (list "email before a CJK character redacted" :light
+                           "contact bob@example.comの"
+                           "contact [REDACTED:email]の")
+                     (list "a non-breaking space separates a bearer token" :full
+                           (format nil "Bearer~aabcdefghijklmnopqrstuvwxyz"
+                                   (code-char 160))
+                           "[REDACTED:bearer-token]")
+                     (list "a non-breaking space ends an env secret value" :full
+                           (format nil "TOKEN=conformancevalue~atail" (code-char 160))
+                           (format nil "TOKEN=[REDACTED:env-secret-value]~atail"
+                                   (code-char 160)))))
+        (destructuring-bind (label tier input expected) case
+          (check (format nil "redact-~(~a~): ~a" tier label)
+                 (equal (if (eq tier :light)
+                            (agento11y-cl::redact-light redactor input)
+                            (agento11y-cl::redact-full redactor input))
+                        expected))))
+
+      ;; The email pattern starts on a class that holds non-word characters, so
+      ;; its leading boundary needs both branches: a dash in front of the
+      ;; address is not part of the match.
+      (check "redact-light: a dash before an email is not swallowed"
+             (equal (agento11y-cl::redact-light redactor "x -bob@example.com")
+                    "x -[REDACTED:email]"))
+
+      ;; --- Direct engine: one scan, so the leftmost pattern names the match ---
+      (check "redact-full: a bearer prefix wins over the token it carries"
+             (equal (agento11y-cl::redact-full
+                     redactor "Authorization: Bearer glc_abcdefghijklmnopqrstuvwxyz1234")
+                    "Authorization: [REDACTED:bearer-token]"))
+
+      ;; --- Pattern table: ids and tiers against the shared table ---
+      ;; Mirrors redaction/patterns.json in the agento11y repository: 22 tier-1
+      ;; patterns, 1 email pattern, 3 tier-2 patterns. A pattern added upstream
+      ;; has to be added here too, at the same tier and in the same position,
+      ;; because position decides which id labels a match.
+      (let ((upstream-tier1 '("grafana-cloud-token" "grafana-service-account-token"
+                              "aws-access-token" "github-pat" "github-oauth"
+                              "github-app-token" "github-fine-grained-pat"
+                              "anthropic-api-key" "anthropic-admin-key"
+                              "openai-api-key" "openai-project-key"
+                              "openai-svcacct-key" "gcp-api-key" "private-key"
+                              "connection-string" "bearer-token" "slack-token"
+                              "stripe-key" "sendgrid-api-key" "twilio-api-key"
+                              "npm-token" "pypi-token"))
+            (upstream-tier2 '("json-secret-field" "env-secret-quoted-value"
+                              "env-secret-value")))
+        (check "pattern table: tier-1 ids match the shared table in order"
+               (equal (mapcar #'car (agento11y-cl::tier1-patterns agento11y-cl::+tier1+))
+                      upstream-tier1))
+        (check "pattern table: tier-2 ids match the shared table in order"
+               (equal (mapcar #'first agento11y-cl::+tier2-patterns+) upstream-tier2))
+        (check "pattern table: the email pattern is present"
+               (equal (first agento11y-cl::+email-pattern+) "email"))
+        (check "pattern table: no tier-1 pattern carries a capturing group"
+               (notany (lambda (entry)
+                         (cl-ppcre:scan "\\((?!\\?)" (cdr entry)))
+                       (agento11y-cl::tier1-patterns agento11y-cl::+tier1+))))
 
       ;; --- Direct engine: email opt-out ---
       (check "redact-light: email redacted by default"
@@ -2836,6 +3187,37 @@ experiment-runs branch, whose prefix they share."
                                (mapcar (lambda (s) (jget s "parentSpanId"))
                                        (list inner gen tool emb))
                                :test #'equal))))))
+      ;; A capture mode the generation resolved to survives the context plists
+      ;; with-span and with-workflow-step build, so a tool execution nested
+      ;; under either still strips.
+      (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
+                                              :traces-enabled t
+                                              :content-capture-mode :full)
+                                 :env-fn (constantly nil))))
+        (with-generation (g client :mode :sync :model-provider "openai"
+                                   :model-name "gpt-4"
+                                   :content-capture :metadata-only)
+          (check "generation resolved to the per-call mode"
+                 (eq (agento11y-cl::recorder-content-capture-mode g) :metadata-only))
+          (with-span (client "outer")
+            (with-tool-execution (tr client :tool-name "in-span"
+                                            :tool-description "Search the web")
+              tr))
+          (with-workflow-step (wfs client :step-name "step")
+            (check "workflow step publishes a span id to nest under"
+                   (plusp (length (agento11y-cl::wfs-rec-span-id wfs))))
+            (with-tool-execution (tr client :tool-name "in-step"
+                                            :tool-description "Search the web")
+              tr)))
+        (let ((spans (drain client)))
+          (flet ((described-p (name)
+                   (let ((span (by-name spans (format nil "execute_tool ~a" name))))
+                     (find "gen_ai.tool.description" (jget span "attributes")
+                           :key (lambda (attr) (jget attr "key")) :test #'equal))))
+            (check "a tool inside with-span keeps the generation's mode"
+                   (null (described-p "in-span")))
+            (check "a tool inside with-workflow-step keeps the generation's mode"
+                   (null (described-p "in-step"))))))
       ;; An ambient context is still inherited: with-span takes its trace from
       ;; the caller and parents under the caller's span.
       (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"

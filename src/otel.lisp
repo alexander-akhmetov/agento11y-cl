@@ -12,6 +12,15 @@
   "Build an OTLP int attribute (value as string per OTLP JSON)."
   (jobj "key" key "value" (jobj "intValue" (format nil "~d" value))))
 
+(defun otel-double-attr (key value)
+  "Build an OTLP double attribute. VALUE is a real number.
+OTLP JSON writes doubleValue as a JSON number, unlike intValue, which is a
+decimal string. A float is written as the caller gave it, so a single-float 0.2
+stays 0.2 instead of picking up the digits that widening it to a double exposes.
+An integer or a ratio is widened, so the wire value reads as a double."
+  (jobj "key" key
+        "value" (jobj "doubleValue" (if (floatp value) value (float value 1d0)))))
+
 (defun otel-bool-attr (key value)
   "Build an OTLP bool attribute."
   (jobj "key" key "value" (jobj "boolValue" (if value t nil))))

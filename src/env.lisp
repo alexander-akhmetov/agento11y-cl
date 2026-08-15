@@ -173,7 +173,7 @@ no-op since TLS is controlled by the URL scheme.
 
 Note: an explicit caller value that equals the slot's schema default is
 indistinguishable from \"unset\" and WILL be overridden by env. This applies to
-:none for :auth-mode, :metadata-only for :content-capture-mode, and nil for
+:none for :auth-mode, :no-tool-content for :content-capture-mode, and nil for
 :redact-secrets / :redact-input-messages. For the redaction flags the asymmetry
 fails safe: env can only turn redaction on when the caller did not ask for it.
 Callers that need to enforce these defaults against deployment env must either
@@ -251,14 +251,15 @@ wins over env."
         ;; Tenant ID.
         (when (and tenant (null (config-tenant-id config)))
           (override :tenant-id tenant))
-        ;; Content capture mode (caller :metadata-only is treated as "not set").
-        (when (and capture (eq (config-content-capture-mode config) :metadata-only))
+        ;; Content capture mode (caller :no-tool-content, the schema default,
+        ;; is treated as "not set").
+        (when (and capture (eq (config-content-capture-mode config) :no-tool-content))
           (let ((parsed (parse-content-capture-mode capture config capture-var)))
             (unless (eq parsed :invalid)
               (override :content-capture-mode parsed))))
         ;; A caller mode outside the supported set falls back to :metadata-only.
         ;; The env branch above cannot also have fired: it requires the caller
-        ;; mode to be :metadata-only, which is supported. Serialization redacts
+        ;; mode to be :no-tool-content, which is supported. Serialization redacts
         ;; an unsupported mode on its own; this warning is the diagnostic.
         (unless (valid-content-capture-mode-p (config-content-capture-mode config))
           (agento11y-log config :warn "config"

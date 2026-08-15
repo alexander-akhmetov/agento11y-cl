@@ -5,8 +5,10 @@
 Binds *trace-context* per-thread so child tool/embedding spans
 are correctly parented to this generation."
   `(let ((,var (start-generation ,client ,@initargs)))
-     (let ((*trace-context* (list :trace-id (gen-rec-trace-id ,var)
-                                  :span-id (gen-rec-span-id ,var))))
+     (let ((*trace-context* (child-trace-context
+                             (gen-rec-trace-id ,var) (gen-rec-span-id ,var)
+                             :content-capture-mode
+                             (recorder-content-capture-mode ,var))))
        (unwind-protect
             (progn ,@body)
          (recorder-end ,var)))))
@@ -32,8 +34,8 @@ Calls recorder-end in unwind-protect."
 Binds *trace-context* per-thread so child generation/tool/embedding spans
 are correctly parented to this workflow step."
   `(let ((,var (start-workflow-step ,client ,@initargs)))
-     (let ((*trace-context* (list :trace-id (wfs-rec-trace-id ,var)
-                                  :span-id (wfs-rec-span-id ,var))))
+     (let ((*trace-context* (child-trace-context
+                             (wfs-rec-trace-id ,var) (wfs-rec-span-id ,var))))
        (unwind-protect
             (progn ,@body)
          (recorder-end ,var)))))
@@ -112,8 +114,8 @@ nested spans got a flat trace whose shape said nothing about what called what."
                   (,err-type nil)
                   (,vals nil))
              (unwind-protect
-                  (let ((*trace-context* (list :trace-id ,trace-id-var
-                                               :span-id ,span-id-var)))
+                  (let ((*trace-context* (child-trace-context
+                                          ,trace-id-var ,span-id-var)))
                     (handler-case
                         (progn
                           (setf ,vals (multiple-value-list (progn ,@body)))

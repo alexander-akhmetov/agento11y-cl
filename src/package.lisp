@@ -200,6 +200,8 @@
    #:config-scores-export-path
    #:config-ingest-actor
    #:config-experiment-url-template
+   #:config-content-capture-mode
+   #:config-content-capture-resolver
    #:config-embedding-capture-input
    #:config-embedding-max-input-items
    #:config-embedding-max-text-length
@@ -248,6 +250,7 @@
    ;; CAPTURE-TELEMETRY-CONTEXT / TELEMETRY-CONTEXT-THUNK.
    #:*trace-context*
    #:*experiment-run*
+   #:child-trace-context
    #:capture-telemetry-context
    #:with-telemetry-context
    #:telemetry-context-thunk
@@ -262,6 +265,7 @@
    ;; OTel helpers
    #:otel-string-attr
    #:otel-int-attr
+   #:otel-double-attr
    #:otel-bool-attr
    #:otel-string-array-attr
    ;; JSON helpers
