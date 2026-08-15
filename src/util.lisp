@@ -9,10 +9,27 @@
 ;;; --- Timestamps ---
 
 (defun iso8601-now ()
-  "Return current UTC time as ISO 8601 string."
+  "Return current UTC time as an ISO 8601 string with millisecond precision.
+
+The fraction is load-bearing rather than cosmetic. A recorder's started-at and
+completed-at are what the backend derives a generation's latency from, so at
+whole-second resolution every call shorter than a second reports zero, and a
+caller that records post-hoc (opening the recorder once the call has returned)
+reports zero for every call at any length. The other agento11y SDKs all send
+sub-second timestamps.
+
+Implementations without SB-EXT:GET-TIME-OF-DAY keep whole-second accuracy but
+still emit the .000 fraction, so the string has one length everywhere."
+  #+sbcl
+  (multiple-value-bind (unix-sec usec) (sb-ext:get-time-of-day)
+    (multiple-value-bind (sec min hour day month year)
+        (decode-universal-time (+ unix-sec +unix-epoch-universal+) 0)
+      (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0d.~3,'0dZ"
+              year month day hour min sec (floor usec 1000))))
+  #-sbcl
   (multiple-value-bind (sec min hour day month year)
       (decode-universal-time (get-universal-time) 0)
-    (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0dZ"
+    (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0d.000Z"
             year month day hour min sec)))
 
 (defun iso8601-to-unix-nano (iso-string)
