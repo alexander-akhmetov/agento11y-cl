@@ -190,14 +190,19 @@ scanned for secrets with strength SECRET-MODE (:full, :light, or :none)."
 (defun serialize-usage (usage)
   "Serialize token-usage to JSON hash-table.
 Uses the stored total-tokens value (which may differ from input+output
-when reasoning or cache tokens are counted separately)."
+when reasoning or cache tokens are counted separately).
+
+Cache-write tokens go out as `cache_write_input_tokens`, which is proto field
+5. The proto reserves `cache_creation_input_tokens` as field 7, so a payload
+that sends that name drops the count. The Lisp accessor keeps the Anthropic
+name it was written with: only the wire key moved."
   (if usage
       (jobj "input_tokens" (token-usage-input-tokens usage)
             "output_tokens" (token-usage-output-tokens usage)
             "total_tokens" (token-usage-total-tokens usage)
             "reasoning_tokens" (token-usage-reasoning-tokens usage)
             "cache_read_input_tokens" (token-usage-cache-read-tokens usage)
-            "cache_creation_input_tokens" (token-usage-cache-creation-tokens usage))
+            "cache_write_input_tokens" (token-usage-cache-creation-tokens usage))
       (jobj "input_tokens" 0 "output_tokens" 0 "total_tokens" 0)))
 
 ;;; --- Tool schema serialization ---

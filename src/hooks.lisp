@@ -110,8 +110,8 @@
 
 (defun %https-host-root (endpoint)
   "Host root for a schemeless or grpc:// ENDPOINT: drop the scheme and any
-path, then force https. The hooks API is HTTP, so a gRPC-shaped endpoint
-contributes only its host."
+path, then force https. The /api/v1 REST endpoints are HTTP, so a gRPC-shaped
+endpoint contributes only its host."
   (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) endpoint))
          (without-scheme (if (%has-grpc-scheme-p trimmed)
                              (subseq trimmed (length "grpc://"))
@@ -121,10 +121,16 @@ contributes only its host."
     (when (plusp (length host))
       (concatenate 'string "https://" host))))
 
-(defun %resolve-hooks-base-url (config)
-  "Return the host root used to build the hooks endpoint, or NIL when neither
-api-endpoint nor generation-endpoint is set. Schemeless and grpc:// values
-resolve to https://host, matching the canonical Python SDK behaviour."
+(defun %resolve-api-base-url (config)
+  "Return the host root the /api/v1 REST endpoints hang off: scheme and host,
+no path and no trailing slash. NIL when neither api-endpoint nor
+generation-endpoint is set. Schemeless and grpc:// values resolve to
+https://host, matching the Python SDK.
+
+Used by hook evaluation and by conversation rating. Both take api-endpoint
+first and fall back to the generation endpoint's host: the generation endpoint
+is an export path, so appending a REST path to it produces a URL no route
+answers."
   (let ((api (config-api-endpoint config)))
     (cond
       ((and (stringp api) (plusp (length api)))
@@ -173,7 +179,9 @@ rule then sees no tool calls and allows the request.
 Tool arguments and tool result payloads go out as embedded JSON, not
 base64. The hooks API reads them as raw JSON, so a base64 blob is what
 argument-level rules would end up matching against. Generation export is
-the other way around, because that is protobuf JSON."
+the other way around, because that is protobuf JSON.
+
+A blank optional field is omitted rather than sent empty."
   (cond
     ((typep part 'text-part)
      (let ((text (text-part-text part)))
@@ -184,20 +192,27 @@ the other way around, because that is protobuf JSON."
        (when (and text (plusp (length text)))
          (jobj "kind" "thinking" "thinking" text))))
     ((typep part 'tool-call-part)
-     (let ((payload (jobj "id" (or (tool-call-part-id part) "")
-                          "name" (or (tool-call-part-name part) ""))))
+     (let ((payload (jobj "name" (or (tool-call-part-name part) ""))))
+       (let ((id (tool-call-part-id part)))
+         (when (plusp (length (or id "")))
+           (setf (gethash "id" payload) id)))
        (let ((input-json (tool-call-part-input-json part)))
          (when (and input-json (plusp (length input-json)))
            (setf (gethash "input_json" payload) (%embedded-json input-json))))
        (jobj "kind" "tool_call" "tool_call" payload)))
     ((typep part 'tool-result-part)
-     (let ((payload (jobj "is_error" (and (tool-result-part-is-error part) t)
-                          "content" (or (tool-result-part-content part) ""))))
-       (when (tool-result-part-tool-call-id part)
-         (setf (gethash "tool_call_id" payload)
-               (tool-result-part-tool-call-id part)))
-       (when (tool-result-part-name part)
-         (setf (gethash "name" payload) (tool-result-part-name part)))
+     (let ((payload (jobj)))
+       (let ((tool-call-id (tool-result-part-tool-call-id part)))
+         (when (plusp (length (or tool-call-id "")))
+           (setf (gethash "tool_call_id" payload) tool-call-id)))
+       (let ((name (tool-result-part-name part)))
+         (when (plusp (length (or name "")))
+           (setf (gethash "name" payload) name)))
+       (when (tool-result-part-is-error part)
+         (setf (gethash "is_error" payload) t))
+       (let ((content (tool-result-part-content part)))
+         (when (plusp (length (or content "")))
+           (setf (gethash "content" payload) content)))
        (let ((cj (tool-result-part-content-json part)))
          (when (and cj (plusp (length cj)))
            (setf (gethash "content_json" payload) (%embedded-json cj))))
@@ -322,6 +337,11 @@ strings both resolve; anything else falls back to :preflight."
 (defun %string-field (value)
   (if (stringp value) value ""))
 
+(defun %bool-field (value)
+  "A wire boolean. Only literal true counts: JSON null parses to a symbol that
+is true in Lisp, and Go and Python both read a null flag as false."
+  (eq value t))
+
 (defun %int-field (value)
   (cond
     ((typep value 'boolean) 0)
@@ -330,46 +350,186 @@ strings both resolve; anything else falls back to :preflight."
     ((stringp value) (or (ignore-errors (parse-integer value :junk-allowed t)) 0))
     (t 0)))
 
+(defun %strict-base64-text (value)
+  "Decode VALUE as strict base64 and return the text, or NIL when it is not
+base64. Whitespace is rejected, matching Python's b64decode(validate=True): a
+JSON document that only looks like base64 once its spaces are dropped must not
+be treated as one. Go's StdEncoding ignores CR and LF, so a line-wrapped
+payload decodes there and not here.
+
+Decoding is base64-string-to-usb8-array plus babel, not
+base64-string-to-string: the latter maps each byte through code-char and turns
+a multi-byte UTF-8 payload into mojibake. Bytes that are not UTF-8 fall back to
+the same per-byte mapping, mirroring Go's string(decoded)."
+  (when (and (stringp value)
+             (plusp (length value))
+             (zerop (mod (length value) 4)))
+    (let ((octets (handler-case
+                      (cl-base64:base64-string-to-usb8-array value :whitespace :error)
+                    (error () nil))))
+      (when octets
+        (handler-case (babel:octets-to-string octets :encoding :utf-8)
+          (error () (map 'string #'code-char octets)))))))
+
+(defun %json-document-p (text)
+  (and (stringp text)
+       (handler-case (progn (jzon:parse text) t)
+         (error () nil))))
+
+(defun %decode-wire-payload (value)
+  "Resolve one response payload into the text of a valid JSON document, or NIL
+when there is nothing to resolve.
+
+An object or an array arrives already parsed, and is written back as its own
+JSON text. A missing field, an empty string and any other non-string resolve to
+NIL, so the four rules below all read a non-empty string.
+
+A payload is base64 of whatever bytes the proto field held, and nothing
+guarantees those bytes are JSON. The ladder is the one all three SDKs apply
+(conformance/hooks/README.md):
+
+  1. strict base64 that decodes to a JSON document becomes that document
+  2. strict base64 that decodes to anything else becomes a JSON string holding
+     the decoded text
+  3. a string that is not base64 but is itself JSON is kept as is
+  4. anything else becomes a JSON string holding the original text"
+  (cond
+    ((hash-table-p value) (jzon:stringify value))
+    ((and (vectorp value) (not (stringp value))) (jzon:stringify value))
+    ((not (stringp value)) nil)
+    ((zerop (length value)) nil)
+    (t
+     (let ((decoded (%strict-base64-text value)))
+       (cond
+         ((and decoded (%json-document-p decoded)) decoded)
+         (decoded (jzon:stringify decoded))
+         ((%json-document-p value) value)
+         (t (jzon:stringify value)))))))
+
+(defun %parse-wire-tool-call (payload)
+  "A tool-call part from its payload object, or NIL when there is nothing to
+recover. A call with no name names no tool, so no rule can have written it."
+  (when (hash-table-p payload)
+    (let ((name (%string-field (jget payload "name"))))
+      (when (plusp (length name))
+        (make-tool-call-part :id (%string-field (jget payload "id"))
+                             :name name
+                             :input-json (%decode-wire-payload
+                                          (jget payload "input_json")))))))
+
+(defun %parse-wire-tool-result (payload)
+  "A tool-result part from its payload object. Unlike a tool call, a result
+names no required field, so an empty payload object still produces a part: Go
+and Python both build one, and conformance/hooks/README.md drops a tool_result
+only when the payload object itself is absent. JS drops the empty one, which is
+the single shape the four SDKs disagree on."
+  (when (hash-table-p payload)
+    (let ((name (%string-field (jget payload "name"))))
+      (make-tool-result-part
+       :tool-call-id (%string-field (jget payload "tool_call_id"))
+       :name (when (plusp (length name)) name)
+       :content (%string-field (jget payload "content"))
+       :content-json (%decode-wire-payload (jget payload "content_json"))
+       :is-error (%bool-field (jget payload "is_error"))))))
+
+(defun %parse-wire-text (raw)
+  (let ((text (%string-field raw)))
+    (when (plusp (length text)) (make-text-part text))))
+
+(defun %parse-wire-thinking (raw)
+  (let ((text (%string-field raw)))
+    (when (plusp (length text)) (make-thinking-part text))))
+
+(defun %parse-wire-part (part)
+  "Parse one server-returned part, or NIL when it carries nothing to recover.
+
+The `kind` field decides which field is read. Nothing else is read after it, so
+a tool_call without its payload object is dropped even when the part carries
+text. Recovering the leftover field would report a part the rule never wrote,
+and give each SDK a different transformed_input for one body.
+
+An unknown kind becomes a text part when it carries text, because text is the
+only way the server can have described it.
+
+A part with no `kind` at all is the one shape that reads whichever payload
+field is set, in the order tool_call, tool_result, thinking, text. The server
+always sets `kind`, so that shape can only come from a hand-written or
+protobuf-JSON body."
+  (when (hash-table-p part)
+    (let ((kind (string-downcase (%string-field (jget part "kind")))))
+      (cond
+        ((string= kind "text") (%parse-wire-text (jget part "text")))
+        ((string= kind "thinking") (%parse-wire-thinking (jget part "thinking")))
+        ((string= kind "tool_call") (%parse-wire-tool-call (jget part "tool_call")))
+        ((string= kind "tool_result") (%parse-wire-tool-result (jget part "tool_result")))
+        ((plusp (length kind)) (%parse-wire-text (jget part "text")))
+        (t
+         ;; The payload field that is set resolves the kind, and the parser
+         ;; commits to it exactly as a declared kind does: a payload object
+         ;; that recovers nothing drops the part instead of falling through to
+         ;; the text beside it. Go, Python and JS resolve it the same way.
+         (let ((call (jget part "tool_call"))
+               (result (jget part "tool_result")))
+           (cond
+             ((hash-table-p call) (%parse-wire-tool-call call))
+             ((hash-table-p result) (%parse-wire-tool-result result))
+             (t (or (%parse-wire-thinking (jget part "thinking"))
+                    (%parse-wire-text (jget part "text")))))))))))
+
+(defun %parse-wire-role (raw)
+  "Map a wire role onto the SDK's vocabulary. The hooks API knows only
+user/assistant/tool, and system content travels in system_prompt, so a system
+role collapses to user rather than becoming a role no serializer emits."
+  (if (integerp raw)
+      (case raw (2 :assistant) (3 :tool) (t :user))
+      (let ((value (string-downcase (%string-field raw))))
+        (cond
+          ((string= value "assistant") :assistant)
+          ((string= value "tool") :tool)
+          (t :user)))))
+
+(defun %parse-wire-list (raw parser)
+  "Parse a wire array through PARSER, dropping every element it rejects."
+  (let ((out nil))
+    (when (and (vectorp raw) (not (stringp raw)))
+      (loop for item across raw
+            for parsed = (funcall parser item)
+            when parsed do (push parsed out)))
+    (nreverse out)))
+
 (defun %parse-wire-message (item)
-  "Parse one server-returned message. Only text and thinking parts are
-reconstructed, matching the canonical SDK: transformed_input carries
-rewritten prompt content, and the server does not send tool parts back."
+  "Parse one server-returned message. A message carries its body in `parts` in
+both directions; there is no `content` field on a wire message."
   (when (hash-table-p item)
-    (let* ((role-val (jget item "role"))
-           (role (cond
-                   ((integerp role-val)
-                    (case role-val
-                      (2 :assistant)
-                      (3 :tool)
-                      (t :user)))
-                   (t (let ((s (string-downcase (or (and (stringp role-val) role-val)
-                                                    "user"))))
-                        (cond
-                          ((string= s "assistant") :assistant)
-                          ((string= s "tool") :tool)
-                          ((string= s "system") :system)
-                          (t :user))))))
-           (parts-raw (jget item "parts"))
-           (parts nil))
-      (when (vectorp parts-raw)
-        (loop for pr across parts-raw
-              when (hash-table-p pr)
-              do (let ((txt (jget pr "text"))
-                       (think (jget pr "thinking")))
-                   (cond
-                     ((and (stringp txt) (plusp (length txt)))
-                      (push (make-text-part txt) parts))
-                     ((and (stringp think) (plusp (length think)))
-                      (push (make-thinking-part think) parts))))))
-      (let ((name (jget item "name")))
-        (make-message :role role
-                      :parts (nreverse parts)
-                      :name (when (and (stringp name) (plusp (length name)))
-                              name))))))
+    (let ((name (jget item "name")))
+      (make-message :role (%parse-wire-role (jget item "role"))
+                    :parts (%parse-wire-list (jget item "parts") #'%parse-wire-part)
+                    :name (when (and (stringp name) (plusp (length name)))
+                            name)))))
+
+(defun %parse-wire-tool (item)
+  "Parse one server-returned tool definition into the plist %SERIALIZE-TOOL
+takes, so a transform can be sent back unchanged. INPUT_SCHEMA_JSON is base64
+in both directions, and is decoded here because %SERIALIZE-TOOL re-encodes it."
+  (when (hash-table-p item)
+    (let ((name (%string-field (jget item "name"))))
+      (when (plusp (length name))
+        (let ((description (jget item "description"))
+              (type (jget item "type"))
+              (schema (%decode-wire-payload (jget item "input_schema_json"))))
+          (append (list :name name)
+                  (when (stringp description) (list :description description))
+                  (when (stringp type) (list :type type))
+                  (when schema (list :input-schema-json schema))
+                  (when (%bool-field (jget item "deferred")) (list :deferred t))))))))
 
 (defun %parse-transformed-input (data)
+  "Parse a transformed_input object, or NIL when it carries no transform.
+A body that rewrites only the output or only the tools is still a transform."
   (when (hash-table-p data)
-    (let ((messages nil)
+    (let ((messages (%parse-wire-list (jget data "messages") #'%parse-wire-message))
+          (output (%parse-wire-list (jget data "output") #'%parse-wire-message))
+          (tools (%parse-wire-list (jget data "tools") #'%parse-wire-tool))
           (system-prompt "")
           (conversation-preview ""))
       (let ((sp (jget data "system_prompt")))
@@ -378,15 +538,12 @@ rewritten prompt content, and the server does not send tool parts back."
       (let ((cp (jget data "conversation_preview")))
         (when (and (stringp cp) (plusp (length cp)))
           (setf conversation-preview cp)))
-      (let ((raw-msgs (jget data "messages")))
-        (when (vectorp raw-msgs)
-          (loop for item across raw-msgs
-                for parsed = (%parse-wire-message item)
-                when parsed do (push parsed messages))))
-      (when (or messages
+      (when (or messages output tools
                 (plusp (length system-prompt))
                 (plusp (length conversation-preview)))
-        (make-hook-input :messages (nreverse messages)
+        (make-hook-input :messages messages
+                         :output output
+                         :tools tools
                          :system-prompt system-prompt
                          :conversation-preview conversation-preview)))))
 
@@ -502,7 +659,7 @@ synthetic allow response, when nil signals agento11y-hook-transport-error."
       ;; skip the hook because the configured phases hold keywords.
       (unless (member (%phase-key phase) (mapcar #'%phase-key phases))
         (return-from evaluate-hook (%allow-response))))
-    (let ((base-url (%resolve-hooks-base-url config)))
+    (let ((base-url (%resolve-api-base-url config)))
       (unless base-url
         (return-from evaluate-hook
           (%fail-open-or-raise config hooks "api endpoint is required")))
@@ -562,5 +719,6 @@ synthetic allow response, when nil signals agento11y-hook-transport-error."
                             :message (or (response-reason response) "")
                             :rule-id (response-rule-id response)
                             :reason (response-reason response)
-                            :evaluations (response-evaluations response)))
+                            :evaluations (response-evaluations response)
+                            :transformed-input (response-transformed-input response)))
                    response))))))))))

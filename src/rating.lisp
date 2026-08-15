@@ -6,13 +6,15 @@
 RATING is :good or :bad. RATING-ID is required for idempotency.
 Synchronous (not queued)."
   (let* ((config (client-config client))
-         (endpoint (config-generation-endpoint config)))
-    (unless endpoint
-      (agento11y-log config :warn "rating" "no generation endpoint configured")
+         ;; Scheme and host, not the configured endpoint as given: the
+         ;; generation endpoint ends in /api/v1/generations:export, and the
+         ;; rating path appended to that reaches no route.
+         (base-url (%resolve-api-base-url config)))
+    (unless base-url
+      (agento11y-log config :warn "rating" "no api or generation endpoint configured")
       (return-from submit-conversation-rating nil))
     (let* ((url (format nil "~a/api/v1/conversations/~a/ratings"
-                        (string-right-trim "/" endpoint)
-                        conversation-id))
+                        base-url conversation-id))
            (rid (or rating-id (generate-id)))
            (payload (jobj "rating" (case rating
                                      (:good "CONVERSATION_RATING_VALUE_GOOD")

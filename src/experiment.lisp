@@ -346,18 +346,26 @@ generation. Keeps ids stable across reruns in every anchoring mode."
       ((plusp (length item)) item)
       (t (%trimmed-text generation-id)))))
 
+(defun %score-id-for-occurrence (run key occurrence)
+  "The deterministic score id the OCCURRENCE-th score on KEY gets.
+OCCURRENCE counts from 0, and every value above 0 produces a rescore id, so
+passing 1 for a first score mints the id the second score would take. A caller
+that needs the id before the counter moves can read it here without moving
+it."
+  (destructuring-bind (anchor score-key evaluator-id) key
+    (if (zerop occurrence)
+        (stable-id "score" (experiment-run-run-id run) anchor score-key evaluator-id)
+        (stable-id "score" (experiment-run-run-id run) anchor score-key evaluator-id
+                   (1+ occurrence)))))
+
 (defun %mint-score-id (run key)
   "Derive a deterministic score id for KEY, counting repeats of the same
 (anchor, score-key, evaluator-id) triple so a rescore gets a distinct durable
 id. Call under EXPERIMENT-RUN-LOCK.
 Matches _next_score_id in agento11y experiments/experiment.py:850-857."
-  (destructuring-bind (anchor score-key evaluator-id) key
-    (let ((occurrence (gethash key (experiment-run-score-occurrences run) 0)))
-      (setf (gethash key (experiment-run-score-occurrences run)) (1+ occurrence))
-      (if (zerop occurrence)
-          (stable-id "score" (experiment-run-run-id run) anchor score-key evaluator-id)
-          (stable-id "score" (experiment-run-run-id run) anchor score-key evaluator-id
-                     (1+ occurrence))))))
+  (let ((occurrence (gethash key (experiment-run-score-occurrences run) 0)))
+    (setf (gethash key (experiment-run-score-occurrences run)) (1+ occurrence))
+    (%score-id-for-occurrence run key occurrence)))
 
 (defun %commit-score-ids (run items keys)
   "Stamp deterministic score ids onto ITEMS.
@@ -522,26 +530,19 @@ count for EXPERIMENT-RUN-PUBLISH to export."
                                :trial trial)))
 
 (defun %grader-id-base (run trial score-key evaluator-id)
-  "The seed the grader's ids hang off.
-Derived from the run, trial, score key, and evaluator rather than from the
-minted score id, so it needs no reach into the score-id counter and still
-addresses the same rows on a rerun. Go seeds its grader ids from the score id
-instead, so the two SDKs do not produce identical grader ids.
+  "The seed the grader's ids hang off: the score id %MINT-SCORE-ID will produce
+for this trial, score key, and evaluator. Go and Python seed from the same id,
+so a rerun from any SDK addresses the same grader rows.
 
 The occurrence the score about to be minted will use is read off the run's
-counter and folded in, exactly as %MINT-SCORE-ID does, so rescoring the same
-trial with the same evaluator writes a second grader generation instead of
-overwriting the first. Read, not advanced: %COMMIT-SCORE-IDS advances the
-counter only once the batch validates, so a corrected retry mints the same
-grader ids it did before."
+counter, so rescoring the same trial with the same evaluator writes a second
+grader generation instead of overwriting the first. Read, not advanced:
+%COMMIT-SCORE-IDS advances the counter only once the batch validates, so a
+corrected retry mints the same grader ids it did before."
   (let* ((key (list (%trimmed-text (trial-id trial)) score-key evaluator-id))
          (occurrence (bt2:with-lock-held ((experiment-run-lock run))
                        (gethash key (experiment-run-score-occurrences run) 0))))
-    (if (zerop occurrence)
-        (stable-id "grader" (experiment-run-run-id run) (trial-id trial)
-                   score-key evaluator-id)
-        (stable-id "grader" (experiment-run-run-id run) (trial-id trial)
-                   score-key evaluator-id (1+ occurrence)))))
+    (%score-id-for-occurrence run key occurrence)))
 
 (defun %record-grader-generation (trial grader generation-id conversation-id
                                   evaluator-id metadata)

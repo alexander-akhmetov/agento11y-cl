@@ -19,8 +19,9 @@
    (experiment-url-template :initarg :experiment-url-template
                             :reader config-experiment-url-template
                             :initform nil)
-   ;; Hook API root (host root used to derive /api/v1/...).
-   ;; When nil, the hook endpoint is derived from generation-endpoint.
+   ;; REST API root (host root used to derive /api/v1/...). Read by hook
+   ;; evaluation and by conversation rating.
+   ;; When nil, the host is derived from generation-endpoint.
    (api-endpoint        :initarg :api-endpoint        :reader config-api-endpoint        :initform nil)
    ;; Synchronous hook evaluation config (hooks-config struct or nil).
    (hooks-config        :initarg :hooks-config        :reader config-hooks-config        :initform nil)

@@ -45,7 +45,13 @@
 (define-condition agento11y-hook-denied-error (agento11y-error)
   ((rule-id     :initarg :rule-id     :reader agento11y-hook-denied-error-rule-id     :initform "")
    (reason      :initarg :reason      :reader agento11y-hook-denied-error-reason      :initform "")
-   (evaluations :initarg :evaluations :reader agento11y-hook-denied-error-evaluations :initform nil))
+   (evaluations :initarg :evaluations :reader agento11y-hook-denied-error-evaluations :initform nil)
+   ;; EVALUATE-HOOK signals instead of returning the denied response, so a
+   ;; transformed_input sent with a deny reaches the caller only through this
+   ;; slot.
+   (transformed-input :initarg :transformed-input
+                      :reader agento11y-hook-denied-error-transformed-input
+                      :initform nil))
   (:report (lambda (c stream)
              (format stream "Agento11y hook denied (rule ~a): ~a"
                      (agento11y-hook-denied-error-rule-id c)

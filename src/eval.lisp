@@ -628,10 +628,21 @@ accepted as a caller-facing alias."
                        nil "experiment get")))
 
 (defun get-experiment-report (client run-id)
-  "Fetch the aggregated report for an experiment run."
+  "Fetch the aggregated report for an experiment run.
+
+The backend keys the run under `experiment` and older drafts key it under
+`run`. Both envelopes are folded onto `run` so a caller reads one key,
+matching ExperimentReport.Run in the Go SDK."
   (let* ((config (client-config client))
-         (url (format nil "~a/report" (%experiment-api-url config run-id))))
-    (request-eval-json config :get url nil "experiment report")))
+         (url (format nil "~a/report" (%experiment-api-url config run-id)))
+         (report (request-eval-json config :get url nil "experiment report")))
+    (when (hash-table-p report)
+      (multiple-value-bind (experiment found-p) (gethash "experiment" report)
+        (when found-p
+          (remhash "experiment" report)
+          (unless (nth-value 1 (gethash "run" report))
+            (setf (gethash "run" report) experiment)))))
+    report))
 
 (defun list-experiment-scores (client run-id &key (limit 50) cursor)
   "List stored scores for an experiment run."

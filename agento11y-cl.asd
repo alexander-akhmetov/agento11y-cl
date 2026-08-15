@@ -20,8 +20,10 @@
                (:file "exporter")
                (:file "metrics")
                (:file "recorder")
-               (:file "rating")
+               ;; Before "rating": SUBMIT-CONVERSATION-RATING derives its base
+               ;; URL with %RESOLVE-API-BASE-URL, defined here.
                (:file "hooks")
+               (:file "rating")
                (:file "client")
                (:file "eval")
                (:file "suite")
@@ -41,4 +43,6 @@
   :pathname "t/"
   :components ((:file "package")
                (:file "suite")
+               ;; Before "tests": RUN-TESTS calls the conformance suites.
+               (:file "conformance")
                (:file "tests")))

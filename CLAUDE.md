@@ -5,14 +5,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-make test    # Run all tests (SBCL, requires Quicklisp)
-make load    # Compile-check: load the system without running tests
-make clean   # Remove .fasl caches
+make test                 # Run all tests (SBCL, requires Quicklisp)
+make load                 # Compile-check: load the system without running tests
+make clean                # Remove .fasl caches
+make conformance-refresh  # Re-copy t/fixtures/ from an agento11y checkout
 ```
 
 Tests use a custom framework in `t/suite.lisp` (no external test library). Each suite is a `defun` (e.g., `run-recorder-tests`) called by `run-tests`. Add new test cases inside existing suites using `(check "label" condition)`. The `make test` output is filtered to show only pass/fail lines.
 
 The SBCL invocation uses `--no-userinit` and loads deps via Quicklisp. Set `QUICKLISP_HOME` if your Quicklisp is not at `~/quicklisp/`.
+
+### Conformance suites
+
+`t/conformance.lisp` checks this SDK against the cross-SDK fixtures vendored in `t/fixtures/`, in three suites: hooks, experiments, and redaction. `make conformance-refresh` re-copies the fixtures from an `agento11y` checkout, and `t/fixtures/README.md` maps each file to its upstream path and commit. Do not edit a fixture to make a suite green: a shape change belongs upstream in `grafana/agento11y`, run through the server's decoder first.
+
+The redaction engine and the content-capture rules are behind the fixtures. Every redaction check that fails for that reason is listed by id in `+cf-known-redaction-failures+`, so `make test` stays green and any other failure turns it red. A listed check that starts passing fails too, naming the id to drop from the list.
 
 ## Architecture
 

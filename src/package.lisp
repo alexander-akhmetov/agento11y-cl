@@ -179,6 +179,7 @@
    #:agento11y-hook-denied-error-rule-id
    #:agento11y-hook-denied-error-reason
    #:agento11y-hook-denied-error-evaluations
+   #:agento11y-hook-denied-error-transformed-input
    #:agento11y-hook-transport-error
    ;; Config
    #:agento11y-config

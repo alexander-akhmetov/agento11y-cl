@@ -13,6 +13,7 @@
                                (redact-input-messages nil)
                                (redact-email-addresses t)
                                (generation-endpoint "http://test-agento11y:4318/api/v1/generations:export")
+                               api-endpoint
                                eval-endpoint
                                (eval-path-prefix "/api/v1")
                                (scores-export-path "/api/v1/scores:export")
@@ -35,6 +36,7 @@
       (make-config
        :generation-endpoint generation-endpoint
        :generation-enabled generation-enabled
+       :api-endpoint api-endpoint
        :eval-endpoint eval-endpoint
        :eval-path-prefix eval-path-prefix
        :scores-export-path scores-export-path
@@ -140,7 +142,10 @@ experiment-runs branch, whose prefix they share."
       ((search "artifacts:upload" url)
        (values (or artifact-body (jzon:stringify (jobj "artifact_id" "art-1"))) 200))
       ((and (eq method :get) (search "/report" url))
-       (values (jzon:stringify (jobj "experiment_id" experiment-id)) 200))
+       ;; The backend keys the run under `experiment`; GET-EXPERIMENT-REPORT
+       ;; folds that onto `run`.
+       (values (jzon:stringify (jobj "experiment" (jobj "experiment_id" experiment-id)))
+               200))
       ((search "experiment-runs" url)
        (values (run-http-response experiment-id "running") 200))
       (t (values "{}" 200)))))
@@ -2495,23 +2500,33 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-rating-tests ()
   (with-test-suite ("Rating")
+    ;; The rating path hangs off scheme and host, so these read the whole URL:
+    ;; a suffix test passes on a URL no route answers.
+    (dolist (row (list (list "rating URL is derived from scheme and host"
+                             "http://test-agento11y:4318/api/v1/generations:export" nil
+                             "http://test-agento11y:4318/api/v1/conversations/conv-1/ratings")
+                       ;; :api-endpoint wins, the precedence hook evaluation uses
+                       (list "rating prefers :api-endpoint over generation-endpoint"
+                             "https://other.example/api/v1/generations:export"
+                             "https://ratings.example"
+                             "https://ratings.example/api/v1/conversations/conv-1/ratings")))
+      (destructuring-bind (label generation-endpoint api-endpoint expected) row
+        (multiple-value-bind (client get-requests)
+            (make-test-client :capture :full
+                              :generation-endpoint generation-endpoint
+                              :api-endpoint api-endpoint)
+          (submit-conversation-rating client "conv-1" :good :rating-id "rate-1")
+          (check label (equal (first (first (funcall get-requests))) expected)))))
+
     (flet ((submit (mode)
              (multiple-value-bind (client get-requests) (make-test-client :capture mode)
                (submit-conversation-rating client "conv-1" :good
                                            :rating-id "rate-1"
                                            :feedback "the answer named my customer"
                                            :user-id "u-7")
-               (let ((req (first (funcall get-requests))))
-                 (values (jzon:parse (second req)) (first req))))))
+               (jzon:parse (second (first (funcall get-requests)))))))
       ;; :full keeps the comment
-      (multiple-value-bind (payload url) (submit :full)
-        ;; The rating path is appended to :generation-endpoint as given, which is
-        ;; the full export URL. Asserted as-is; the URL shape is not this test's
-        ;; subject.
-        (check "rating URL ends with the conversation rating path"
-               (let ((suffix "/api/v1/conversations/conv-1/ratings"))
-                 (and (>= (length url) (length suffix))
-                      (string= suffix url :start2 (- (length url) (length suffix))))))
+      (let ((payload (submit :full)))
         (check "full: comment sent"
                (equal (jget payload "comment") "the answer named my customer"))
         (check "full: rating value"
@@ -2521,8 +2536,7 @@ experiment-runs branch, whose prefix they share."
 
       ;; Both redacting modes drop the comment and keep everything else
       (dolist (mode '(:metadata-only :metadata-with-system-prompt))
-        (multiple-value-bind (payload url) (submit mode)
-          (declare (ignore url))
+        (let ((payload (submit mode)))
           (check (format nil "~a: comment omitted" mode)
                  (null (nth-value 1 (gethash "comment" payload))))
           (check (format nil "~a: rating value unchanged" mode)
@@ -2535,8 +2549,7 @@ experiment-runs branch, whose prefix they share."
       ;; The comment follows the payload gate, so every mode that keeps payload
       ;; content keeps it. Only a redacting mode drops it.
       (dolist (mode '(:no-tool-content :full-with-metadata-spans))
-        (multiple-value-bind (payload url) (submit mode)
-          (declare (ignore url))
+        (let ((payload (submit mode)))
           (check (format nil "~a: comment sent" mode)
                  (equal (jget payload "comment") "the answer named my customer")))))
 
@@ -2647,7 +2660,8 @@ experiment-runs branch, whose prefix they share."
           (check "span: invalid tag cons skipped"
                  (null (span-attr span "agento11y.tag.1"))))))
 
-    ;; Cache-write span attr renamed; JSON payload keeps cache_creation_input_tokens
+    ;; Cache-write tokens: cache_write_input_tokens on both the span and the
+    ;; payload, and cache_creation_input_tokens on neither
     (flet ((span-int-attr (span key)
              (let ((found nil))
                (loop for a across (jget span "attributes")
@@ -2668,8 +2682,11 @@ experiment-runs branch, whose prefix they share."
                  (equal (span-int-attr span "gen_ai.usage.cache_write_input_tokens") "7"))
           (check "span: no cache_creation_input_tokens attr"
                  (null (span-int-attr span "gen_ai.usage.cache_creation_input_tokens")))
-          (check "payload: keeps cache_creation_input_tokens"
-                 (= (jget* gen "usage" "cache_creation_input_tokens") 7)))))))
+          (check "payload: cache_write_input_tokens set"
+                 (= (jget* gen "usage" "cache_write_input_tokens") 7))
+          (check "payload: no cache_creation_input_tokens key"
+                 (not (nth-value 1 (gethash "cache_creation_input_tokens"
+                                            (jget gen "usage"))))))))))
 
 (defun run-macro-tests ()
   (with-test-suite ("Macros")
@@ -3536,7 +3553,29 @@ experiment-runs branch, whose prefix they share."
           (check "deny: rule-id surfaced"
                  (equal (agento11y-hook-denied-error-rule-id c) "r1"))
           (check "deny: reason surfaced"
-                 (equal (agento11y-hook-denied-error-reason c) "PII")))))
+                 (equal (agento11y-hook-denied-error-reason c) "PII"))
+          (check "deny: no transform means no transformed-input"
+                 (null (agento11y-hook-denied-error-transformed-input c))))))
+
+    ;; --- Deny carries its transform on the condition ---
+    ;; EVALUATE-HOOK signals rather than returning the response, so this is the
+    ;; only path a denied transform reaches the caller by.
+    (let ((client (%make-hook-client
+                   :http-fn (lambda (&rest _) (declare (ignore _))
+                              (values (jzon:stringify
+                                       (jobj "action" "deny"
+                                             "rule_id" "r1"
+                                             "reason" "PII"
+                                             "transformed_input"
+                                             (jobj "system_prompt" "safer")))
+                                      200)))))
+      (handler-case
+          (progn (evaluate-hook client :phase :preflight)
+                 (check "deny with transform: signalled an error" nil))
+        (agento11y-hook-denied-error (c)
+          (check "deny with transform: transformed-input surfaced"
+                 (let ((ti (agento11y-hook-denied-error-transformed-input c)))
+                   (and ti (equal (hook-input-system-prompt ti) "safer")))))))
 
     ;; --- transformed_input parsed into hook-input ---
     (let* ((client (%make-hook-client
@@ -3548,6 +3587,40 @@ experiment-runs branch, whose prefix they share."
       (check "transformed-input present" (not (null ti)))
       (check "transformed-input system-prompt parsed"
              (equal (hook-input-system-prompt ti) "safer")))
+
+    ;; --- A transform that rewrites only the output is still a transform ---
+    (let* ((client (%make-hook-client
+                    :http-fn (lambda (&rest _) (declare (ignore _))
+                               (values (jzon:stringify
+                                        (jobj "action" "allow"
+                                              "transformed_input"
+                                              (jobj "output"
+                                                    (vector (jobj "role" "assistant"
+                                                                  "parts"
+                                                                  (vector (jobj "kind" "text"
+                                                                                "text" "ok")))))))
+                                       200))))
+           (ti (response-transformed-input (evaluate-hook client :phase :preflight))))
+      (check "an output-only transform parses" (not (null ti)))
+      (check "transformed output parses into messages"
+             (and ti (= (length (hook-input-output ti)) 1))))
+
+    ;; --- Blank optional fields are omitted from a serialized tool result ---
+    (let* ((part (make-tool-result-part :tool-call-id "call-1" :name "Bash"
+                                        :content "" :is-error nil))
+           (result (jget (agento11y-cl::%serialize-message-part part) "tool_result")))
+      (check "a false is_error is omitted"
+             (not (nth-value 1 (gethash "is_error" result))))
+      (check "an empty content is omitted"
+             (not (nth-value 1 (gethash "content" result))))
+      (check "tool_call_id and name still travel"
+             (and (equal (jget result "tool_call_id") "call-1")
+                  (equal (jget result "name") "Bash"))))
+    (let* ((part (make-tool-call-part :id "" :name "Bash"))
+           (call (jget (agento11y-cl::%serialize-message-part part) "tool_call")))
+      (check "an empty tool call id is omitted"
+             (not (nth-value 1 (gethash "id" call))))
+      (check "the tool name still travels" (equal (jget call "name") "Bash")))
 
     ;; --- Transport error + fail-open=t -> synthetic allow ---
     (let* ((client (%make-hook-client
@@ -4678,7 +4751,7 @@ experiment-runs branch, whose prefix they share."
             (check "run-experiment accepted both scores"
                    (= (getf result :accepted-scores) 2))
             (check "run-experiment fetches report"
-                   (equal (jget (getf result :report) "experiment_id") "exp-runner"))
+                   (equal (jget* (getf result :report) "run" "experiment_id") "exp-runner"))
             (check "run-experiment assigns stable per-item conversations"
                    (equal (reverse conversation-ids)
                           (list (stable-id "conv" "exp-runner" "it1")
@@ -6462,8 +6535,7 @@ experiment-runs branch, whose prefix they share."
         (let* ((judge (make-llm-judge
                        :evaluator-id "judge-1" :model-name "gpt-4"
                        :invoke (lambda (p) (declare (ignore p))
-                                 (values "{\"score\": 0.8, \"explanation\": \"fine\"}" nil))))
-               (grader-base nil))
+                                 (values "{\"score\": 0.8, \"explanation\": \"fine\"}" nil)))))
           (with-experiment (run client :run-id "exp-judge" :name "judge run"
                                 :print-url nil)
             (let ((trial (experiment-run-open-trial run "case-1")))
@@ -6472,17 +6544,19 @@ experiment-runs branch, whose prefix they share."
               (let ((rec (start-generation client :model-provider "openai"
                                                   :model-name "gpt-4")))
                 (recorder-end rec))
-              (setf grader-base (agento11y-cl::%grader-id-base run trial "final" "judge-1"))
               (setf (cdr calls) nil)
               (let ((result (evaluate-output judge (list :input "q" :output "a"))))
                 (trial-record-evaluation trial result))
               (setf graded-ids (experiment-run-produced-generation-ids run))
               (trial-close trial)))
-          (let* ((grader-generation-id (stable-id "gen" grader-base "grader"))
-                 (grader-conversation-id (stable-id "conv" grader-base "grader"))
-                 (ordered (reverse (cdr calls)))
+          (let* ((ordered (reverse (cdr calls)))
                  (score-call (find-if #'score-call-p ordered))
                  (score (aref (jget (payload score-call) "scores") 0))
+                 ;; The grader ids hang off the exported score id, so the
+                 ;; expectation is read off the wire. Deriving it from
+                 ;; %GRADER-ID-BASE would check that helper against itself.
+                 (grader-generation-id (stable-id "gen" (jget score "score_id") "grader"))
+                 (grader-conversation-id (stable-id "conv" (jget score "score_id") "grader"))
                  (grader-post (find-if (lambda (c)
                                          (and (search "generations:export" (second c))
                                               (search grader-generation-id (third c))))
@@ -7228,7 +7302,10 @@ experiment-runs branch, whose prefix they share."
                            #'run-suite-tests
                            #'run-conversations-tests
                            #'run-metrics-tests
-                           #'run-hooks-tests))
+                           #'run-hooks-tests
+                           #'run-hooks-conformance-tests
+                           #'run-experiments-conformance-tests
+                           #'run-redaction-conformance-tests))
       (multiple-value-bind (ok pass fail) (funcall test-fn)
         (declare (ignore ok))
         (incf total-pass pass)
