@@ -166,8 +166,16 @@ experiment-runs branch, whose prefix they share."
 
     ;; ISO 8601
     (let ((now (iso8601-now)))
-      (check "iso8601-now format" (and (stringp now) (= (length now) 20)
-                                       (char= (char now 19) #\Z))))
+      (check "iso8601-now format" (and (stringp now) (= (length now) 24)
+                                       (char= (char now 19) #\.)
+                                       (char= (char now 23) #\Z)
+                                       (every #'digit-char-p (subseq now 20 23))))
+      ;; The fraction has to survive the round trip, or the sub-second precision
+      ;; is decoration: every span start/end time is derived through this parse.
+      (check "iso8601-now round-trips its fraction"
+             (let ((nano (iso8601-to-unix-nano now)))
+               (and nano (= (mod (parse-integer nano) 1000000000)
+                            (* (parse-integer (subseq now 20 23)) 1000000))))))
 
     ;; iso8601-to-unix-nano
     (let ((nano (iso8601-to-unix-nano "2024-01-01T00:00:00Z")))
@@ -2274,10 +2282,10 @@ experiment-runs branch, whose prefix they share."
                  (equal (jget wfs "agent_version") "v1"))
           (check "wfs payload started_at present"
                  (and (stringp (jget wfs "started_at"))
-                      (= (length (jget wfs "started_at")) 20)))
+                      (= (length (jget wfs "started_at")) 24)))
           (check "wfs payload completed_at present"
                  (and (stringp (jget wfs "completed_at"))
-                      (= (length (jget wfs "completed_at")) 20)))
+                      (= (length (jget wfs "completed_at")) 24)))
           (check "wfs payload trace_id present"
                  (= (length (jget wfs "trace_id")) 32))
           (check "wfs payload span_id present"
@@ -2756,6 +2764,116 @@ experiment-runs branch, whose prefix they share."
           (check "every span carries agento11y.tag.env"
                  (every (lambda (s) (equal (span-attr s "agento11y.tag.env") "prod"))
                         spans)))))
+
+    ;; --- with-span publishes itself as the parent of its body ---
+    ;;
+    ;; Without this the macro minted its ids in the unwind and published
+    ;; nothing, so every span opened inside read the same ambient context the
+    ;; outer one did and came out a sibling. A caller that nests spans then
+    ;; gets a flat trace, and one that records a generation post-hoc gets the
+    ;; whole process chained onto whatever generation ran last.
+    (flet ((by-name (spans name)
+             (find name spans :key (lambda (s) (jget s "name")) :test #'equal))
+           (drain (client)
+             (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
+      (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
+                                              :traces-enabled t)
+                                 :env-fn (constantly nil)))
+            (inner-ctx nil))
+        (check "trace-context nil before with-span" (null *trace-context*))
+        (with-span (client "outer")
+          (setf inner-ctx *trace-context*)
+          (with-span (client "inner") nil)
+          (with-generation (g client :mode :sync :model-provider "openai" :model-name "gpt-4")
+            g)
+          (with-tool-execution (tr client :tool-name "search" :tool-call-id "tc1")
+            tr)
+          (with-embedding (e client :model-provider "openai" :model-name "emb")
+            e))
+        (check "with-span binds trace-context inside its body"
+               (and (getf inner-ctx :trace-id) (getf inner-ctx :span-id)))
+        (check "with-span restores trace-context after" (null *trace-context*))
+        (let* ((spans (drain client))
+               (outer (by-name spans "outer"))
+               (inner (by-name spans "inner"))
+               (gen (find-if (lambda (s) (search "gpt-4" (jget s "name"))) spans))
+               (tool (by-name spans "execute_tool search"))
+               (emb (by-name spans "embeddings emb")))
+          (check "with-span span-id matches the context it published"
+                 (equal (jget outer "spanId") (getf inner-ctx :span-id)))
+          (check "nested with-span parents to the outer span"
+                 (equal (jget inner "parentSpanId") (jget outer "spanId")))
+          (check "nested with-span shares the outer trace"
+                 (equal (jget inner "traceId") (jget outer "traceId")))
+          (check "generation inside with-span parents to it"
+                 (equal (jget gen "parentSpanId") (jget outer "spanId")))
+          (check "tool execution inside with-span parents to it"
+                 (equal (jget tool "parentSpanId") (jget outer "spanId")))
+          (check "embedding inside with-span parents to it"
+                 (equal (jget emb "parentSpanId") (jget outer "spanId")))
+          (check "every span inside with-span shares its trace"
+                 (every (lambda (s) (equal (jget s "traceId") (jget outer "traceId")))
+                        (list inner gen tool emb)))
+          (check "siblings inside with-span do not chain to each other"
+                 (= 1 (length (remove-duplicates
+                               (mapcar (lambda (s) (jget s "parentSpanId"))
+                                       (list inner gen tool emb))
+                               :test #'equal))))))
+      ;; An ambient context is still inherited: with-span takes its trace from
+      ;; the caller and parents under the caller's span.
+      (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
+                                              :traces-enabled t)
+                                 :env-fn (constantly nil))))
+        (let ((*trace-context* (list :trace-id "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                     :span-id "bbbbbbbbbbbbbbbb")))
+          (with-span (client "child") nil))
+        (let ((span (first (drain client))))
+          (check "with-span inherits an ambient trace-id"
+                 (equal (jget span "traceId") "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+          (check "with-span parents under an ambient span-id"
+                 (equal (jget span "parentSpanId") "bbbbbbbbbbbbbbbb"))))
+      ;; The body's own error still propagates and still marks the span, and
+      ;; the context is restored on the non-local exit.
+      (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
+                                              :traces-enabled t)
+                                 :env-fn (constantly nil))))
+        (handler-case (with-span (client "boom") (error "kaboom"))
+          (error () nil))
+        (check "trace-context restored after an error inside with-span"
+               (null *trace-context*))
+        (let ((span (first (drain client))))
+          (check "errored with-span still enqueues with status 2"
+                 (= (jget* span "status" "code") 2)))))
+
+    ;; --- Explicit recorder timestamps ---
+    ;;
+    ;; A caller that opens the recorder after the call returned has to be able
+    ;; to say when the call really ran, or started-at and completed-at both read
+    ;; "now", latency comes out zero, and the span is shifted forward by its own
+    ;; duration.
+    (let ((client (make-client (make-config :traces-endpoint "http://x/v1/traces"
+                                            :traces-enabled t)
+                               :env-fn (constantly nil))))
+      (let ((rec (start-generation client :mode :sync :model-provider "openai"
+                                          :model-name "gpt-4"
+                                          :started-at "2026-01-01T00:00:10.000Z")))
+        (set-result rec :stop-reason "end_turn"
+                        :completed-at "2026-01-01T00:00:12.500Z")
+        (recorder-end rec)
+        (check "explicit started-at survives to the recorder"
+               (equal (agento11y-cl::recorder-started-at rec) "2026-01-01T00:00:10.000Z"))
+        (check "explicit completed-at is not overwritten by recorder-end"
+               (equal (agento11y-cl::recorder-completed-at rec) "2026-01-01T00:00:12.500Z"))
+        (check "elapsed reflects the call, not the record write"
+               (= (agento11y-cl::recorder-elapsed-seconds rec) 2.5d0))
+        (let ((span (first (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))))
+          (check "span starts at the real call start"
+                 (equal (jget span "startTimeUnixNano")
+                        (iso8601-to-unix-nano "2026-01-01T00:00:10.000Z")))
+          (check "span ends at the real call end"
+                 (equal (jget span "endTimeUnixNano")
+                        (iso8601-to-unix-nano "2026-01-01T00:00:12.500Z"))))))
 
     ;; --- Telemetry context: capture and rebind ---
     ;;

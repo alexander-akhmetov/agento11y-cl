@@ -26,6 +26,20 @@ Each with-generation call binds this per-thread via LET.")
   (setf (recorder-call-error rec) error-string)
   rec)
 
+(defmethod set-result :around ((rec recorder) &key completed-at &allow-other-keys)
+  "Accept COMPLETED-AT on every recorder type, then hand the rest to the
+type-specific method.
+
+The slot lives on the base class and RECORDER-END only stamps it when it is
+still unset, so a caller recording after the fact supplies the real completion
+time here and the pair started-at/completed-at describes the call rather than
+the moment the record was written. It is an :around on the base class because
+that is where the slot is: repeating the keyword in all four primary methods
+would let a new recorder type silently not support it."
+  (when completed-at
+    (setf (recorder-completed-at rec) completed-at))
+  (call-next-method))
+
 ;;; --- recorder-end :around — shared lifecycle for all recorder types ---
 
 (defmethod recorder-end :around ((rec recorder))

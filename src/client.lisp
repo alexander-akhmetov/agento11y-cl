@@ -199,11 +199,16 @@ TELEMETRY-CONTEXT-THUNK.")
                                       temperature top-p max-tokens tool-choice
                                       (thinking-enabled :unset)
                                       parent-generation-ids
-                                      tags metadata generation-id)
+                                      tags metadata generation-id started-at)
   "Create and start a generation recorder.
 When called inside a `with-workflow-step` (or any other context that binds
 `*trace-context*`), the generation inherits the workflow's trace-id and uses
-its span-id as parent so spans nest under the workflow span."
+its span-id as parent so spans nest under the workflow span.
+
+STARTED-AT overrides the wall clock. Pass it when the recorder is opened after
+the call it describes has already returned: without it both timestamps are read
+at record time, the backend derives a zero latency, and the exported span is
+shifted forward by its own duration."
   (let* ((config (client-config client))
          (run *experiment-run*)
          (ctx *trace-context*)
@@ -224,7 +229,7 @@ its span-id as parent so spans nest under the workflow span."
               metadata (getf prepared :metadata metadata))))
     (let ((rec (make-instance 'generation-recorder
       :client client
-      :started-at (iso8601-now)
+      :started-at (or started-at (iso8601-now))
       :generation-id (or generation-id (generate-id))
       :trace-id (or inherited-trace-id (generate-trace-id))
       :span-id (generate-span-id)
@@ -254,12 +259,13 @@ its span-id as parent so spans nest under the workflow span."
 
 (defun start-tool-execution (client &key tool-name tool-call-id tool-type tool-description
                                           conversation-id agent-name agent-version
-                                          model-provider model-name)
-  "Create and start a tool execution recorder."
+                                          model-provider model-name started-at)
+  "Create and start a tool execution recorder.
+STARTED-AT overrides the wall clock; see START-GENERATION."
   (let ((config (client-config client)))
     (make-instance 'tool-execution-recorder
       :client client
-      :started-at (iso8601-now)
+      :started-at (or started-at (iso8601-now))
       :tool-name tool-name
       :tool-call-id tool-call-id
       :tool-type tool-type
@@ -272,14 +278,15 @@ its span-id as parent so spans nest under the workflow span."
 
 (defun start-embedding (client &key model-provider model-name
                                      agent-name agent-version source
-                                     dimensions encoding-format)
+                                     dimensions encoding-format started-at)
   "Create and start an embedding recorder.
 DIMENSIONS is the requested dimension count; a result dimension count set later
-via set-result takes precedence over it on the span."
+via set-result takes precedence over it on the span.
+STARTED-AT overrides the wall clock; see START-GENERATION."
   (let ((config (client-config client)))
     (make-instance 'embedding-recorder
       :client client
-      :started-at (iso8601-now)
+      :started-at (or started-at (iso8601-now))
       :model-provider model-provider
       :model-name model-name
       :agent-name (%resolve-agent-name config agent-name)
@@ -292,14 +299,16 @@ via set-result takes precedence over it on the span."
                                          agent-name agent-version
                                          input-state output-state
                                          tags metadata
-                                         linked-generation-ids parent-step-ids)
+                                         linked-generation-ids parent-step-ids
+                                         started-at)
   "Create and start a workflow step recorder.
 Auto-generates step-id, trace-id, span-id, and started-at so callers can read
-them immediately to build parent-step-id chains."
+them immediately to build parent-step-id chains.
+STARTED-AT overrides the wall clock; see START-GENERATION."
   (let ((config (client-config client)))
     (make-instance 'workflow-step-recorder
       :client client
-      :started-at (iso8601-now)
+      :started-at (or started-at (iso8601-now))
       :step-id (generate-workflow-step-id)
       :trace-id (generate-trace-id)
       :span-id (generate-span-id)

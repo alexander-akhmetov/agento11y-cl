@@ -77,39 +77,57 @@ thread constructor."
 (defmacro with-span ((client name &key (kind 1) attributes-var) &body body)
   "Execute BODY wrapped in an OTel span.
 Zero overhead when traces are disabled on CLIENT's config.
-NAME is a string (evaluated). KIND: 1=INTERNAL (default), 3=CLIENT.
-ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto."
+NAME is a string, evaluated once before BODY. KIND: 1=INTERNAL (default),
+3=CLIENT.
+ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto.
+
+The span's identifiers are minted BEFORE BODY runs, and *trace-context* is bound
+to them for BODY's extent, so anything opened inside -- a nested with-span, a
+generation, a tool execution, an embedding -- parents under this span. Minting
+them in the unwind instead published no context at all: every nested span read
+the same ambient value this one did and came out a sibling, so a caller that
+nested spans got a flat trace whose shape said nothing about what called what."
   (let ((attrs-var (or attributes-var (gensym "ATTRS-")))
         (start-nano (gensym "START-"))
         (ok (gensym "OK-"))
         (err-type (gensym "ERR-"))
         (vals (gensym "VALS-"))
-        (client-var (gensym "CLIENT-")))
+        (client-var (gensym "CLIENT-"))
+        (name-var (gensym "NAME-"))
+        (trace-id-var (gensym "TRACE-ID-"))
+        (span-id-var (gensym "SPAN-ID-"))
+        (parent-var (gensym "PARENT-SPAN-ID-")))
     `(let ((,attrs-var nil)
            (,client-var ,client))
        (declare (ignorable ,attrs-var))
        (if (not (config-traces-enabled (client-config ,client-var)))
            (progn ,@body)
-           (let ((,start-nano (current-unix-nano))
-                 (,ok t)
-                 (,err-type nil)
-                 (,vals nil))
+           (let* ((,name-var ,name)
+                  (,trace-id-var (or (getf *trace-context* :trace-id)
+                                     (generate-trace-id)))
+                  (,parent-var (getf *trace-context* :span-id))
+                  (,span-id-var (generate-span-id))
+                  (,start-nano (current-unix-nano))
+                  (,ok t)
+                  (,err-type nil)
+                  (,vals nil))
              (unwind-protect
-                  (handler-case
-                      (progn
-                        (setf ,vals (multiple-value-list (progn ,@body)))
-                        (values-list ,vals))
-                    (error (e)
-                      (setf ,ok nil
-                            ,err-type (princ-to-string (type-of e)))
-                      (error e)))
+                  (let ((*trace-context* (list :trace-id ,trace-id-var
+                                               :span-id ,span-id-var)))
+                    (handler-case
+                        (progn
+                          (setf ,vals (multiple-value-list (progn ,@body)))
+                          (values-list ,vals))
+                      (error (e)
+                        (setf ,ok nil
+                              ,err-type (princ-to-string (type-of e)))
+                        (error e))))
                (handler-case
                    (let* ((end-nano (current-unix-nano))
                           (cfg (client-config ,client-var))
-                          (trace-id (let ((ctx *trace-context*))
-                                      (or (getf ctx :trace-id) (generate-trace-id))))
-                          (span-id (generate-span-id))
-                          (parent-span-id (getf *trace-context* :span-id))
+                          (trace-id ,trace-id-var)
+                          (span-id ,span-id-var)
+                          (parent-span-id ,parent-var)
                           (base-attrs (list (otel-string-attr "agento11y.sdk.name" +sdk-name+))))
                      (let ((agent (or (config-agent-name cfg)
                                       (config-service-name cfg)))
@@ -128,7 +146,7 @@ ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto
                       (build-span :trace-id trace-id
                                   :span-id span-id
                                   :parent-span-id parent-span-id
-                                  :name ,name
+                                  :name ,name-var
                                   :kind ,kind
                                   :start-time-unix-nano ,start-nano
                                   :end-time-unix-nano end-nano
