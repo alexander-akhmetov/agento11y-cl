@@ -42,5 +42,11 @@ conformance-refresh:
 	for f in strings generations; do \
 		cp $(AGENTO11Y_REPO)/redaction/fixtures/$$f.json t/fixtures/redaction/$$f.json; \
 	done; \
-	cp $(AGENTO11Y_REPO)/redaction/patterns.json t/fixtures/redaction/patterns.json
+	cp $(AGENTO11Y_REPO)/redaction/patterns.json t/fixtures/redaction/patterns.json; \
+	for f in openai_sync anthropic_stream gemini_sync; do \
+		cp $(AGENTO11Y_REPO)/go/agento11y/testdata/otlpwire/$$f.generation.json \
+			t/fixtures/otlpwire/$$f.generation.json; \
+		cp $(AGENTO11Y_REPO)/go/agento11y/testdata/otlpwire/$$f.span.json \
+			t/fixtures/otlpwire/$$f.span.json; \
+	done
 	@git -C $(AGENTO11Y_REPO) log -1 --format='refreshed from agento11y %H'

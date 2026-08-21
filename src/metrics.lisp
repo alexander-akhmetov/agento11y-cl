@@ -46,6 +46,13 @@ appended as agento11y.tag.* attributes. Mirrors the reference SDK."
       (setf attrs (append attrs (prefixed-tag-pairs (config-tags config))))
       attrs)))
 
+(defparameter +genai-token-usage-unit+ "{token}"
+  "Unit of gen_ai.client.token.usage as the registry spells it. The SDK's own
+native metrics keep the plain \"token\" spelling they shipped with. A client is
+on one path or the other, never both: a repeated metric name under two units is
+a conflict for a collector, so every otel-mode recorder that reports tokens
+uses this one.")
+
 (defun record-histogram (registry metric-name unit bounds attrs-alist value)
   "Find or create the series for (METRIC-NAME, UNIT, ATTRS-ALIST) and add VALUE.
 Bumps count and sum, and increments the bucket for the first bound >= VALUE

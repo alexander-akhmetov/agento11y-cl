@@ -200,6 +200,7 @@
    #:config-scores-export-path
    #:config-ingest-actor
    #:config-experiment-url-template
+   #:config-generation-protocol
    #:config-content-capture-mode
    #:config-content-capture-resolver
    #:config-embedding-capture-input

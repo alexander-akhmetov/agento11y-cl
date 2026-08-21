@@ -4,6 +4,12 @@
   (;; Generation export
    (generation-endpoint :initarg :generation-endpoint :reader config-generation-endpoint :initform nil)
    (generation-enabled  :initarg :generation-enabled  :reader config-generation-enabled  :initform nil)
+   ;; How a generation leaves the process. :http POSTs the proprietary payload
+   ;; to generation-endpoint. :otel emits one GenAI-semconv span on the trace
+   ;; queue instead and makes no such POST; it is experimental, and
+   ;; otel-export.lisp holds the gate.
+   (generation-protocol :initarg :generation-protocol :reader config-generation-protocol
+                        :initform :http)
    ;; Eval control plane and score export.
    ;;
    ;; eval-path-prefix, scores-export-path, and ingest-actor hold NIL until a

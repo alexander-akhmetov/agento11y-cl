@@ -80,12 +80,22 @@ Returns (values success-p response-body) on 2xx, NIL on failure."
       ok)))
 
 (defun export-traces (config spans auth-headers)
-  "POST spans to the OTLP traces endpoint."
+  "POST spans to the OTLP traces endpoint.
+In otel generation mode every recorder builds a GenAI-semconv span, so the
+batch declares the conventions' scope and the schema version its attributes
+were written to. A span from WITH-SPAN rides the same declaration: the envelope
+carries one scope for the batch, and the alternative is to claim the SDK's own
+scope for spans that follow the conventions."
   (when (null spans) (return-from export-traces t))
   (let* ((url (config-traces-endpoint config))
-         (payload (jzon:stringify (build-otlp-payload spans
-                                                      (config-service-name config)
-                                                      (config-service-version config)))))
+         (genai (otel-generation-export-enabled-p config))
+         (payload (jzon:stringify
+                   (build-otlp-payload spans
+                                       (config-service-name config)
+                                       (config-service-version config)
+                                       :scope-name (when genai +genai-scope-name+)
+                                       :scope-version (when genai +genai-version+)
+                                       :schema-url (when genai +genai-schema-url+)))))
     (post-with-retry config url payload auth-headers "traces" (length spans))))
 
 (defun export-workflow-steps (config workflow-steps auth-headers)

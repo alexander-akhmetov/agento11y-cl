@@ -50,12 +50,17 @@ series on each recorder end."
           do (handler-case
                  (let ((gen-batch (queue-drain-batch (client-generation-queue client)
                                                      (config-batch-size config)))
-                       (trace-batch (queue-drain-all (client-trace-queue client)))
+                       ;; Batched like the other two queues. In otel mode this
+                       ;; queue carries whole generations with their message
+                       ;; content, so draining it whole made one POST as large
+                       ;; as the queue bound.
+                       (trace-batch (queue-drain-batch (client-trace-queue client)
+                                                       (config-batch-size config)))
                        (wfs-batch (queue-drain-batch (client-workflow-queue client)
                                                      (config-batch-size config))))
-                   (when (and gen-batch (config-generation-enabled config))
+                   (when (and gen-batch (generation-payload-export-p config))
                      (export-generations config gen-batch (build-auth-headers config)))
-                   (when (and trace-batch (config-traces-enabled config))
+                   (when (and trace-batch (spans-export-active-p config))
                      (export-traces config trace-batch (build-traces-auth-headers config)))
                    (when (and wfs-batch (config-workflow-steps-enabled config))
                      (export-workflow-steps config wfs-batch (build-auth-headers config)))
@@ -77,14 +82,37 @@ series on each recorder end."
 
 ;;; --- Lifecycle ---
 
+(defun %warn-otel-config (config)
+  "Report, once at start, the two otel-mode settings that do not do what their
+name says.
+
+:full-with-metadata-spans exists to keep content off the shared traces
+destination while the private generation ingest keeps it. In otel mode there is
+no second destination: the span is the generation. The recorder resolves the
+mode to :metadata-only rather than widening it, and a silent narrowing is hard
+to notice on a wire that only says metadata_only.
+
+A missing traces endpoint leaves the mode with nowhere to export to, so it
+exports nothing. This says so at start; the recorder says it again per
+generation."
+  (when (otel-generation-protocol-p config)
+    (when (eq (config-content-capture-mode config) :full-with-metadata-spans)
+      (agento11y-log config :warn "config"
+                     "generation-protocol :otel exports the generation as a span, so :full-with-metadata-spans has no private destination left and resolves to :metadata-only"))
+    (when (and (config-experimental-features config)
+               (null (config-traces-endpoint config)))
+      (agento11y-log config :warn "config"
+                     "generation-protocol :otel needs traces-endpoint (AGENTO11Y_TRACES_ENDPOINT); nothing is exported without it"))))
+
 (defun client-start (client)
   "Start the background export thread."
   (bt2:with-lock-held ((client-lock client))
     (when (client-running-p client)
       (return-from client-start client))
     (let ((config (client-config client)))
+      (%warn-otel-config config)
       (when (or (config-generation-enabled config)
-                (config-traces-enabled config)
+                (spans-export-active-p config)
                 (config-workflow-steps-enabled config)
                 (config-metrics-enabled config))
         (setf (client-running-p client) t)
@@ -127,7 +155,7 @@ series on each recorder end."
 (defun client-flush (client)
   "Synchronously flush all pending items from both queues."
   (let ((config (client-config client)))
-    (when (config-generation-enabled config)
+    (when (generation-payload-export-p config)
       (loop for batch = (queue-drain-batch (client-generation-queue client)
                                            (config-batch-size config))
             while batch
@@ -137,15 +165,16 @@ series on each recorder end."
                    (agento11y-log config :warn "flush"
                              (format nil "generation batch export failed: ~a"
                                      (princ-to-string e)))))))
-    (when (config-traces-enabled config)
-      (let ((spans (queue-drain-all (client-trace-queue client))))
-        (when spans
-          (handler-case
-              (export-traces config spans (build-traces-auth-headers config))
-            (error (e)
-              (agento11y-log config :warn "flush"
-                        (format nil "trace export failed: ~a"
-                                (princ-to-string e))))))))
+    (when (spans-export-active-p config)
+      (loop for spans = (queue-drain-batch (client-trace-queue client)
+                                           (config-batch-size config))
+            while spans
+            do (handler-case
+                   (export-traces config spans (build-traces-auth-headers config))
+                 (error (e)
+                   (agento11y-log config :warn "flush"
+                             (format nil "trace export failed: ~a"
+                                     (princ-to-string e)))))))
     (when (config-workflow-steps-enabled config)
       (loop for batch = (queue-drain-batch (client-workflow-queue client)
                                             (config-batch-size config))

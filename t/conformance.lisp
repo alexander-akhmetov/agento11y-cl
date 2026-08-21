@@ -702,29 +702,7 @@ which is what NIL does in %JOIN-STABLE-ID-PARTS."
 ;;; that starts passing fails too, so the list cannot outlive the gap.
 
 (defparameter +cf-known-redaction-failures+
-  '(;; Sequential tier-1 application, where upstream uses one alternation.
-    "strings/tier1-overlapping-bearer-and-token-full"
-    ;; cl-ppcre's \b is Unicode-aware, so a token pressed against a CJK
-    ;; character keeps its boundary and is left in clear text.
-    "strings/nonascii-token-after-cjk-full"
-    "strings/nonascii-token-after-cjk-light"
-    "strings/nonascii-email-before-cjk-light"
-    ;; \s does not cover NBSP.
-    "strings/nonascii-nbsp-separates-bearer-full"
-    "strings/nonascii-nbsp-ends-an-env-secret-value-full"
-    ;; The tier-2 assignment pattern has no left boundary.
-    "strings/tier2-boundary-monkey-full"
-    ;; The two tier-2 patterns the Lisp table does not carry.
-    "strings/json-quoted-env-value-keeps-quotes-full"
-    "strings/json-secret-field-keeps-key-full"
-    "patterns/json-secret-field"
-    "patterns/env-secret-quoted-value"
-    "patterns/tier2-count"
-    ;; The conversation title is scanned with redact-full where the fixture
-    ;; says light, and the call error is not scanned at all.
-    "generations/input-redaction-disabled/conversationTitle"
-    "generations/input-redaction-enabled/conversationTitle"
-    "generations/email-redaction-disabled/conversationTitle"
+  '(;; The call error is not scanned at all.
     "generations/input-redaction-disabled/callError"
     "generations/input-redaction-enabled/callError"
     "generations/email-redaction-disabled/callError"
@@ -878,9 +856,8 @@ which mode the SDK redacted each slot under."
                                :test #'string=)))))))
 
 (defun cf-lisp-pattern-ids (table)
-  "The pattern ids in one Lisp pattern table. A table is either a single
-(id . scanner) cons or a list of them, and the tier-2 table is a single cons
-until the two missing patterns are added."
+  "The pattern ids in one Lisp pattern table. A table is either a single entry
+whose first element is the id, or a list of such entries."
   (if (stringp (car table))
       (list (car table))
       (mapcar #'car table)))
@@ -896,8 +873,9 @@ upstream does not keep matching here under an id no other SDK writes.
 Regex text is deliberately not compared: cl-ppcre supports lookbehind and Go
 RE2 does not, so the two spellings differ by design."
   (let* ((upstream (jget (cf-fixture "redaction/patterns.json") "patterns"))
-         (tier1 (cf-lisp-pattern-ids agento11y-cl::+tier1-patterns+))
-         (tier2 (cf-lisp-pattern-ids agento11y-cl::+tier2-pattern+))
+         (tier1 (cf-lisp-pattern-ids
+                 (agento11y-cl::tier1-patterns agento11y-cl::+tier1+)))
+         (tier2 (cf-lisp-pattern-ids agento11y-cl::+tier2-patterns+))
          (email (cf-lisp-pattern-ids agento11y-cl::+email-pattern+)))
     (loop for pattern across upstream
           for id = (jget pattern "id")
@@ -924,3 +902,152 @@ RE2 does not, so the two spellings differ by design."
     (cf-run-redaction-strings-cases #'check)
     (cf-run-redaction-generations-cases #'check)
     (cf-run-redaction-patterns-drift #'check)))
+
+;;; ================================================================
+;;; GenAI-semconv wire conformance
+;;;
+;;; The fixtures in t/fixtures/otlpwire/ pin the generation span wire format.
+;;; Each generation.json is fed through the otel export path and the resulting
+;;; span is compared against its span.json counterpart: name, start and end
+;;; exactly, attributes as an unordered set.
+;;;
+;;; Unlike every other fixture this repo vendors, these come from a Go-private
+;;; testdata/ directory rather than agento11y's shared conformance/ contract.
+;;; t/fixtures/README.md says what that costs.
+;;; ================================================================
+
+(defparameter +cf-genai-fixtures+ '("openai_sync" "anthropic_stream" "gemini_sync"))
+
+(defun cf-genai-render-value (value)
+  "Render an OTLP attribute value as \"type:value\", so a type mismatch shows up
+as a value mismatch instead of passing silently. It reads both the camelCase
+keys this SDK writes and the snake_case keys protojson writes into a fixture."
+  (flet ((slot (camel snake)
+           (multiple-value-bind (found found-p) (gethash camel value)
+             (if found-p (values found t) (gethash snake value)))))
+    (multiple-value-bind (text found) (slot "stringValue" "string_value")
+      (when found (return-from cf-genai-render-value (format nil "string:~a" text))))
+    (multiple-value-bind (flag found) (slot "boolValue" "bool_value")
+      (when found
+        (return-from cf-genai-render-value
+          (format nil "bool:~a" (if (and flag (not (eq flag :false))) "true" "false")))))
+    (multiple-value-bind (number found) (slot "intValue" "int_value")
+      (when found (return-from cf-genai-render-value (format nil "int64:~a" number))))
+    (multiple-value-bind (number found) (slot "doubleValue" "double_value")
+      (when found (return-from cf-genai-render-value (format nil "double:~a" number))))
+    (multiple-value-bind (array found) (slot "arrayValue" "array_value")
+      (when found
+        (return-from cf-genai-render-value
+          (format nil "stringslice:~{~s~^,~}"
+                  (map 'list (lambda (item)
+                               (multiple-value-bind (text found-p)
+                                   (gethash "stringValue" item)
+                                 (if found-p text (gethash "string_value" item))))
+                       (gethash "values" array))))))
+    (format nil "unknown:~a" (jzon:stringify value))))
+
+(defun cf-genai-attribute-map (attributes)
+  "An OTLP attribute vector as a key -> rendered-value hash table."
+  (let ((out (make-hash-table :test 'equal)))
+    (map nil (lambda (attr)
+               (setf (gethash (jget attr "key") out)
+                     (cf-genai-render-value (jget attr "value"))))
+         attributes)
+    out))
+
+(defun cf-genai-metadata-superset-diffs (actual expected)
+  "Differences that keep the emitted metadata document from covering the
+fixture's. The SDK stamps its own keys on every export path, so the fixture's
+entries are a subset rather than the whole document."
+  (flet ((decode (rendered)
+           (let ((payload (subseq rendered (length "string:"))))
+             (handler-case (jzon:parse payload) (error () nil)))))
+    (let ((got (decode actual))
+          (want (decode expected))
+          (diffs nil))
+      (cond
+        ((null want) (list "fixture metadata is not a JSON object"))
+        ((null got) (list "emitted metadata is not a JSON object"))
+        (t (maphash (lambda (key value)
+                      (multiple-value-bind (found found-p) (gethash key got)
+                        (cond
+                          ((not found-p) (push (format nil "metadata is missing ~s" key) diffs))
+                          ((not (equal (jzon:stringify found) (jzon:stringify value)))
+                           (push (format nil "metadata[~s] = ~a, want ~a" key
+                                         (jzon:stringify found) (jzon:stringify value))
+                                 diffs)))))
+                    want)
+           (nreverse diffs))))))
+
+(defun cf-genai-expected-attributes (fixture)
+  "The fixture's attributes, with the carve-outs the otel path needs applied."
+  (let ((expected (cf-genai-attribute-map (jget fixture "attributes"))))
+    ;; 1. otel mode reports the conventions' operation, so the fixture's
+    ;;    proprietary generateText/streamText spelling cannot match. It is the
+    ;;    backend decoder's name, not what this mode emits.
+    (when (nth-value 1 (gethash "gen_ai.operation.name" expected))
+      (setf (gethash "gen_ai.operation.name" expected) "string:chat"))
+    ;; 2. agento11y.record is what makes the backend store a generation. This
+    ;;    SDK adds it; the fixtures do not carry it.
+    (setf (gethash "agento11y.record" expected) "string:true")
+    ;; 3. agento11y.agent.effective_version has no source in this SDK, which
+    ;;    has no effective-version concept. Leaving it out beats inventing one.
+    (remhash "agento11y.agent.effective_version" expected)
+    expected))
+
+(defun cf-genai-span-diffs (name)
+  "Differences between the span this SDK builds for a fixture generation and
+the fixture span beside it."
+  (let* ((generation (cf-fixture (format nil "otlpwire/~a.generation.json" name)))
+         (fixture (cf-fixture (format nil "otlpwire/~a.span.json" name)))
+         (span (agento11y-cl::build-genai-span (agento11y-cl::genai-invocation-from-generation generation :full)))
+         (expected (cf-genai-expected-attributes fixture))
+         (actual (cf-genai-attribute-map (jget span "attributes")))
+         (want-name (format nil "chat ~a" (jget* generation "model" "name")))
+         (diffs nil))
+    (unless (equal (jget span "name") want-name)
+      (push (format nil "name = ~s, want ~s" (jget span "name") want-name) diffs))
+    (unless (equal (jget span "startTimeUnixNano") (jget fixture "start_time_unix_nano"))
+      (push (format nil "start = ~s, want ~s" (jget span "startTimeUnixNano")
+                    (jget fixture "start_time_unix_nano"))
+            diffs))
+    (unless (equal (jget span "endTimeUnixNano") (jget fixture "end_time_unix_nano"))
+      (push (format nil "end = ~s, want ~s" (jget span "endTimeUnixNano")
+                    (jget fixture "end_time_unix_nano"))
+            diffs))
+    (maphash (lambda (key want)
+               (multiple-value-bind (got found-p) (gethash key actual)
+                 (cond
+                   ((not found-p) (push (format nil "missing attribute ~a" key) diffs))
+                   ;; 4. The SDK stamps its own metadata keys on every export
+                   ;;    path, so this one is a superset check.
+                   ((string= key "agento11y.generation.metadata")
+                    (setf diffs (append (reverse (cf-genai-metadata-superset-diffs got want))
+                                        diffs)))
+                   ((not (string= got want))
+                    (push (format nil "attribute ~a = ~a, want ~a" key got want) diffs)))))
+             expected)
+    ;; The metadata attribute is allowed even when the fixture has none: the
+    ;; SDK's own keys are enough to produce one.
+    (maphash (lambda (key got)
+               (declare (ignore got))
+               (unless (or (nth-value 1 (gethash key expected))
+                           (string= key "agento11y.generation.metadata"))
+                 (push (format nil "unexpected attribute ~a" key) diffs)))
+             actual)
+    (nreverse diffs)))
+
+(defun run-genai-conformance-tests ()
+  (with-test-suite ("GenAI wire conformance (t/fixtures/otlpwire)")
+    (dolist (name +cf-genai-fixtures+)
+      (let ((diffs (cf-genai-span-diffs name)))
+        (check (cf-label (format nil "~a span matches the fixture" name) diffs)
+               (null diffs))))
+    ;; The conventions leave the status unset on success; the native span path
+    ;; writes code 1. This is the one shape the fixtures cannot pin, because a
+    ;; protojson span with no status renders no status key either way.
+    (let ((span (agento11y-cl::build-genai-span
+                 (agento11y-cl::genai-invocation-from-generation
+                  (cf-fixture "otlpwire/openai_sync.generation.json") :full))))
+      (check "a successful generation span carries no status"
+             (not (nth-value 1 (gethash "status" span)))))))

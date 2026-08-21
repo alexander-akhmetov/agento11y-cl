@@ -351,6 +351,13 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
   (when ttft-seconds     (setf (gen-rec-ttft-seconds rec) ttft-seconds))
   rec)
 
+(defun generation-operation-name (rec)
+  "The SDK's operation name for a generation. The mode is the only thing that
+decides it, and the payload, the native span and the metrics all read it here
+so none of them can disagree with the others. OTEL-OPERATION-NAME maps both
+values onto the conventions' chat operation."
+  (if (eq (gen-rec-mode rec) :stream) "streamText" "generateText"))
+
 (defun build-generation-payload (rec config)
   "Build a generation JSON hash-table from the recorder state."
   (let* ((capture (recorder-capture-mode rec))
@@ -361,7 +368,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
          (redact-inputs (config-redact-input-messages config))
          (mode-str (if (eq (gen-rec-mode rec) :stream)
                        "GENERATION_MODE_STREAM" "GENERATION_MODE_SYNC"))
-         (op-name (if (eq (gen-rec-mode rec) :stream) "streamText" "generateText"))
+         (op-name (generation-operation-name rec))
          (stop (or (gen-rec-stop-reason rec)
                    (if (recorder-call-error rec) "error" "end_turn")))
          ;; Build metadata: SDK fields + caller metadata merged
@@ -496,7 +503,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
   "Build an OTel span for a generation. Returns span hash-table."
   (let* ((trace-id (gen-rec-trace-id rec))
          (span-id (gen-rec-span-id rec))
-         (op-name (if (eq (gen-rec-mode rec) :stream) "streamText" "generateText"))
+         (op-name (generation-operation-name rec))
          (provider (or (gen-rec-model-provider rec) ""))
          (model (or (gen-rec-model-name rec) ""))
          (attrs (common-span-attrs config
@@ -582,8 +589,249 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
                                           (redacted-error-text (recorder-call-error rec)))
                                       "")))))
 
+;;; ================================================================
+;;; GenAI-semconv spans (generation-protocol :otel)
+;;;
+;;; In this mode the span is the export: the proprietary generation payload is
+;;; built as the source the adapter reads and is not POSTed. The other three
+;;; recorder types keep exporting a span, but a semconv-shaped one, so a client
+;;; does not emit two span shapes at once.
+;;;
+;;; Every non-registry attribute these spans carry sits under the agento11y.
+;;; prefix, which is why the input count leaves as
+;;; agento11y.gen_ai.embeddings.input_count rather than the SDK's own
+;;; gen_ai.embeddings.input_count.
+;;; ================================================================
+
+(defun %genai-problem-reporter (config)
+  (lambda (problem) (agento11y-log config :warn "otel-genai" problem)))
+
+(defun %genai-end-nano (start-nano duration-seconds completed-at)
+  "End timestamp for a span: the caller's duration when they reported one,
+otherwise the recorded completion."
+  (if (and start-nano duration-seconds)
+      (unix-nano-plus-seconds start-nano duration-seconds)
+      (iso8601-to-unix-nano completed-at)))
+
+(defun build-genai-generation-span (rec config payload)
+  "Build the GenAI-semconv span that is a generation's whole export in otel
+mode. PAYLOAD is the generation payload, which the adapter reads as its source."
+  (let* ((capture (recorder-capture-mode rec))
+         (call-error (recorder-call-error rec))
+         (keeps-error-text (capture-keeps-span-content-p capture))
+         (inv (genai-invocation-from-generation
+               payload capture
+               :parent-span-id (gen-rec-parent-span-id rec)
+               :error-type (when call-error "provider_call_error")
+               :error-message (when call-error
+                                (if keeps-error-text
+                                    call-error
+                                    (redacted-error-text call-error)))
+               :error-category (classify-error call-error))))
+    (let ((start (genai-invocation-started-at-nano inv)))
+      (when start
+        (when (gen-rec-duration-seconds rec)
+          (setf (genai-invocation-completed-at-nano inv)
+                (unix-nano-plus-seconds start (gen-rec-duration-seconds rec))))
+        (when (gen-rec-ttft-seconds rec)
+          (setf (genai-invocation-first-chunk-at-nano inv)
+                (unix-nano-plus-seconds start (gen-rec-ttft-seconds rec))))))
+    (build-genai-span inv :on-problem (%genai-problem-reporter config))))
+
+(defun build-genai-tool-execution-span (rec config)
+  "Build the GenAI-semconv execute_tool span for a tool execution."
+  (let* ((capture (recorder-capture-mode rec))
+         (err (or (tool-rec-error-message rec) (recorder-call-error rec)))
+         (parent *trace-context*)
+         (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
+         (inv (make-genai-invocation
+               :operation "execute_tool"
+               :capture (otel-capture-mode capture)
+               :trace-id (or (getf parent :trace-id) (generate-trace-id))
+               :span-id (generate-span-id)
+               :parent-span-id (getf parent :span-id)
+               :provider (otel-provider-name (tool-rec-model-provider rec))
+               :request-model (tool-rec-model-name rec)
+               :conversation-id (tool-rec-conversation-id rec)
+               :agent-name (tool-rec-agent-name rec)
+               :agent-version (tool-rec-agent-version rec)
+               :tool-name (or (tool-rec-tool-name rec) "")
+               :tool-call-id (tool-rec-tool-call-id rec)
+               :tool-type (tool-rec-tool-type rec)
+               :tool-description (when (capture-keeps-span-content-p capture)
+                                   (tool-rec-tool-description rec))
+               :started-at-nano start-nano
+               :completed-at-nano (%genai-end-nano start-nano
+                                                   (tool-rec-duration-seconds rec)
+                                                   (recorder-completed-at rec))
+               :error-type (when err "tool_execution_error")
+               :error-message (when err
+                                (if (capture-keeps-span-content-p capture)
+                                    err
+                                    (redacted-error-text err)))
+               :extra-attributes (genai-vendor-config-attributes
+                                  config :error-category (classify-error err)))))
+    ;; The registry spells these two as JSON documents and has no counterpart
+    ;; for the .length keys the native span adds, so those are dropped here.
+    (when (capture-keeps-tool-span-content-p capture)
+      (let ((args (tool-rec-arguments rec)))
+        (when (%otel-string args)
+          (setf (genai-invocation-tool-call-arguments inv)
+                (otel-raw-or-json-string (truncate-for-span args)))))
+      (let ((result (tool-rec-result rec)))
+        (when (%otel-string result)
+          (setf (genai-invocation-tool-call-result inv)
+                (otel-raw-or-json-string (truncate-for-span result))))))
+    (build-genai-span inv :on-problem (%genai-problem-reporter config))))
+
+(defun build-genai-embedding-span (rec config)
+  "Build the GenAI-semconv embeddings span for an embedding call."
+  (let* ((capture (recorder-capture-mode rec))
+         (err (recorder-call-error rec))
+         (parent *trace-context*)
+         (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
+         (extras (genai-vendor-config-attributes config :error-category (classify-error err)))
+         (tokens (emb-rec-input-tokens rec))
+         (encoding (%trimmed-or-nil (emb-rec-encoding-format rec)))
+         (dimensions (or (emb-rec-dimensions rec) (emb-rec-request-dimensions rec))))
+    (let ((count (emb-rec-input-count rec)))
+      (when (and count (plusp count))
+        (setf extras (append extras
+                             (list (otel-int-attr
+                                    "agento11y.gen_ai.embeddings.input_count" count))))))
+    (let ((source (%otel-string (emb-rec-source rec))))
+      (when source
+        (setf extras (append extras
+                             (list (otel-string-attr "agento11y.embeddings.source" source))))))
+    (when (and (config-embedding-capture-input config)
+               (capture-keeps-span-content-p capture)
+               (emb-rec-input-texts rec))
+      (let ((texts (truncate-embedding-texts (emb-rec-input-texts rec)
+                                             (config-embedding-max-input-items config)
+                                             (config-embedding-max-text-length config))))
+        (when texts
+          (setf extras (append extras
+                               (list (otel-string-array-attr
+                                      "agento11y.gen_ai.embeddings.input_texts" texts)))))))
+    (build-genai-span
+     (make-genai-invocation
+      :operation "embeddings"
+      :capture (otel-capture-mode capture)
+      :trace-id (or (getf parent :trace-id) (generate-trace-id))
+      :span-id (generate-span-id)
+      :parent-span-id (getf parent :span-id)
+      :provider (otel-provider-name (emb-rec-model-provider rec))
+      :request-model (emb-rec-model-name rec)
+      :response-model (%trimmed-or-nil (emb-rec-response-model rec))
+      :agent-name (emb-rec-agent-name rec)
+      :agent-version (emb-rec-agent-version rec)
+      :encoding-formats (when encoding (list encoding))
+      :dimension-count (when (and dimensions (plusp dimensions)) dimensions)
+      :usage (when (and tokens (plusp tokens)) (make-genai-usage :input tokens))
+      :started-at-nano start-nano
+      :completed-at-nano (%genai-end-nano start-nano
+                                          (emb-rec-duration-seconds rec)
+                                          (recorder-completed-at rec))
+      :error-type (when err "provider_call_error")
+      :error-message (when err
+                       (if (capture-keeps-span-content-p capture)
+                           err
+                           (redacted-error-text err)))
+      :extra-attributes extras)
+     :on-problem (%genai-problem-reporter config))))
+
+(defun build-genai-workflow-step-span (rec config)
+  "Build the GenAI-semconv invoke_workflow span for a workflow step.
+This is a divergence from the Go SDK, which drops workflow steps in otel mode.
+Python models them and this SDK already exports a workflow-step span, so the
+step maps onto the conventions' workflow operation rather than disappearing."
+  (let* ((capture (config-content-capture-mode config))
+         (step-name (or (wfs-rec-step-name rec) "unknown"))
+         (err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
+         (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
+         (extras (genai-vendor-config-attributes config)))
+    (setf extras
+          (append extras
+                  (list (otel-string-attr "agento11y.workflow.step.id"
+                                          (or (wfs-rec-step-id rec) ""))
+                        (otel-string-attr "agento11y.workflow.step.name" step-name))))
+    (let ((framework (%otel-string (wfs-rec-framework rec))))
+      (when framework
+        (setf extras (append extras
+                             (list (otel-string-attr "agento11y.workflow.framework"
+                                                     framework))))))
+    (let ((parents (wfs-rec-parent-step-ids rec)))
+      (when parents
+        (setf extras (append extras
+                             (list (otel-string-array-attr
+                                    "agento11y.workflow.parent_step_ids" parents))))))
+    (let ((linked (wfs-rec-linked-generation-ids rec)))
+      (when linked
+        (setf extras (append extras
+                             (list (otel-string-array-attr
+                                    "agento11y.workflow.linked_generation_ids" linked))))))
+    (build-genai-span
+     (make-genai-invocation
+      :operation "invoke_workflow"
+      :capture (otel-capture-mode capture)
+      :trace-id (wfs-rec-trace-id rec)
+      :span-id (wfs-rec-span-id rec)
+      :workflow-name step-name
+      :conversation-id (wfs-rec-conversation-id rec)
+      :agent-name (wfs-rec-agent-name rec)
+      :agent-version (wfs-rec-agent-version rec)
+      :started-at-nano start-nano
+      :completed-at-nano (%genai-end-nano start-nano
+                                          (wfs-rec-duration-seconds rec)
+                                          (recorder-completed-at rec))
+      :error-type (when err "workflow_step_error")
+      :error-message (when err
+                       (if (capture-keeps-span-content-p capture)
+                           err
+                           (redacted-error-text err)))
+      :extra-attributes extras)
+     :on-problem (%genai-problem-reporter config))))
+
+(defun %otel-export-ready-p (config)
+  "True when otel generation export may run, logging why when it may not.
+A shut experimental gate exports nothing rather than falling back to the
+payload POST the caller did not ask for, and a missing traces endpoint has
+nowhere to export to. Every recorder type asks this, so a client in otel mode
+either exports the whole span tree or none of it."
+  (and (handler-case
+           (progn (%require-experimental config +feature-otel-generation-export+) t)
+         (agento11y-experimental-disabled-error (e)
+           (agento11y-log config :warn "otel-genai"
+                          (format nil "~a; nothing exported"
+                                  (agento11y-error-message e)))
+           nil))
+       (or (config-traces-endpoint config)
+           (progn
+             (agento11y-log config :warn "otel-genai"
+                            "otel generation export has no traces-endpoint; nothing exported")
+             nil))
+       t))
+
 (defmethod recorder-end ((rec generation-recorder))
-  (let ((config (client-config (recorder-client rec))))
+  (let* ((client (recorder-client rec))
+         (config (client-config client)))
+    (when (otel-generation-protocol-p config)
+      (when (%otel-export-ready-p config)
+        ;; :full-with-metadata-spans keeps the payload and strips the spans. In
+        ;; otel mode the span is the only generation export, so the mode has no
+        ;; private destination left and resolves to :metadata-only: it was
+        ;; picked to keep content off the shared traces destination, which is
+        ;; the one this protocol writes to. Setting it on the recorder is what
+        ;; makes the marker the payload stamps into its metadata say so too.
+        ;; CLIENT-START warns about the combination.
+        (when (eq (recorder-capture-mode rec) :full-with-metadata-spans)
+          (setf (recorder-content-capture-mode rec) :metadata-only))
+        ;; The payload is built whatever generation-enabled says: here it is the
+        ;; adapter's source rather than something that gets POSTed.
+        (let ((payload (build-generation-payload rec config)))
+          (queue-enqueue (client-trace-queue client)
+                         (build-genai-generation-span rec config payload))))
+      (return-from recorder-end nil))
     (let ((gen-payload nil)
           (span nil))
       (when (config-generation-enabled config)
@@ -591,9 +839,9 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
       (when (config-traces-enabled config)
         (setf span (build-generation-span rec config gen-payload)))
       (when gen-payload
-        (queue-enqueue (client-generation-queue (recorder-client rec)) gen-payload))
+        (queue-enqueue (client-generation-queue client) gen-payload))
       (when span
-        (queue-enqueue (client-trace-queue (recorder-client rec)) span)))))
+        (queue-enqueue (client-trace-queue client) span)))))
 
 ;;; ================================================================
 ;;; Tool execution recorder
@@ -627,6 +875,14 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
 
 (defmethod recorder-end ((rec tool-execution-recorder))
   (let ((config (client-config (recorder-client rec))))
+    (when (otel-generation-protocol-p config)
+      ;; The branch is on the protocol, not on the gate: with the gate shut the
+      ;; parent generation exports nothing, and a native child span would then
+      ;; carry a parentSpanId no one ever sent.
+      (when (%otel-export-ready-p config)
+        (queue-enqueue (client-trace-queue (recorder-client rec))
+                       (build-genai-tool-execution-span rec config)))
+      (return-from recorder-end nil))
     (when (config-traces-enabled config)
       (let* ((capture (recorder-capture-mode rec))
              (capture-tool (capture-keeps-tool-span-content-p capture))
@@ -777,6 +1033,11 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
 
 (defmethod recorder-end ((rec embedding-recorder))
   (let ((config (client-config (recorder-client rec))))
+    (when (otel-generation-protocol-p config)
+      (when (%otel-export-ready-p config)
+        (queue-enqueue (client-trace-queue (recorder-client rec))
+                       (build-genai-embedding-span rec config)))
+      (return-from recorder-end nil))
     (when (config-traces-enabled config)
       (let* ((capture (recorder-capture-mode rec))
              (capture-span (capture-keeps-span-content-p capture))
@@ -982,8 +1243,15 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
           (span nil))
       (when (config-workflow-steps-enabled config)
         (setf payload (build-workflow-step-payload rec config)))
-      (when (config-traces-enabled config)
-        (setf span (build-workflow-step-span rec config)))
+      ;; The workflow-step payload keeps its own destination in otel mode; only
+      ;; the span shape changes. A shut gate exports no span at all, so the
+      ;; step does not appear as a native span under a generation that fell
+      ;; silent.
+      (if (otel-generation-protocol-p config)
+          (when (%otel-export-ready-p config)
+            (setf span (build-genai-workflow-step-span rec config)))
+          (when (spans-export-active-p config)
+            (setf span (build-workflow-step-span rec config))))
       (when payload
         (queue-enqueue (client-workflow-queue (recorder-client rec)) payload))
       (when span
@@ -1005,8 +1273,90 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
           (incf total))))
     total))
 
+(defun genai-metric-attrs (config &key operation provider model response-model
+                                       agent-name agent-version error-type
+                                       error-category extra)
+  "Dimensions for the conventions' client instruments in otel mode.
+
+Unset values are left out rather than exported as the empty dimension the
+native path carries: a workflow step has no provider and no model, and an empty
+dimension is a series that says nothing. The provider takes the registry
+spelling its span uses, so a metric and a span agree on what a call was. The
+SDK's own tag series are appended, which otel mode would otherwise lose."
+  (append (list (cons "gen_ai.operation.name" operation))
+          (let ((wire (otel-provider-name provider)))
+            (when (%otel-string wire) (list (cons "gen_ai.provider.name" wire))))
+          (when (%otel-string model) (list (cons "gen_ai.request.model" model)))
+          (when (%otel-string response-model)
+            (list (cons "gen_ai.response.model" response-model)))
+          (when (%otel-string agent-name) (list (cons "gen_ai.agent.name" agent-name)))
+          (when (%otel-string agent-version)
+            (list (cons "gen_ai.agent.version" agent-version)))
+          (when (%otel-string error-type) (list (cons "error.type" error-type)))
+          (when (%otel-string error-category)
+            (list (cons "error.category" error-category)))
+          extra
+          (prefixed-tag-pairs (config-tags config))))
+
+(defun record-genai-generation-metrics (rec registry config)
+  "Record the conventions' client instruments for a generation in otel mode.
+
+The native generation instruments are skipped, so a client emits one shape of
+series rather than two. gen_ai.client.time_to_first_token and
+gen_ai.client.tool_calls_per_operation stay on the native path only: the first
+is this SDK's own spelling of time_to_first_chunk and the second has no
+registry counterpart.
+
+gen_ai.client.operation.time_per_output_chunk is not recorded either. It needs
+a timestamp per streamed chunk, and this SDK records only the time to the first
+one."
+  (let* ((err (recorder-call-error rec))
+         (operation (otel-operation-name (generation-operation-name rec)))
+         (base (genai-metric-attrs config
+                                   :operation operation
+                                   :provider (gen-rec-model-provider rec)
+                                   :model (gen-rec-model-name rec)
+                                   :response-model (gen-rec-response-model rec)
+                                   :agent-name (gen-rec-agent-name rec)
+                                   :agent-version (gen-rec-agent-version rec)
+                                   :error-category (when err (classify-error err))))
+         (usage (gen-rec-usage rec)))
+    (let ((duration (or (gen-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+      (when duration
+        (record-histogram registry "gen_ai.client.operation.duration" "s"
+                          +duration-buckets+
+                          (if err
+                              (append base (list (cons "error.type" "provider_call_error")))
+                              base)
+                          duration)))
+    (when (and (gen-rec-ttft-seconds rec) (eq (gen-rec-mode rec) :stream))
+      (record-histogram registry "gen_ai.client.operation.time_to_first_chunk" "s"
+                        +duration-buckets+ base (gen-rec-ttft-seconds rec)))
+    ;; Unreported usage stays off the histogram for the same reason it stays off
+    ;; the span: a count the provider never returned is not a zero, and summing
+    ;; it would understate the average.
+    (when (and usage
+               (some #'plusp (list (token-usage-input-tokens usage)
+                                   (token-usage-output-tokens usage)
+                                   (token-usage-cache-read-tokens usage)
+                                   (token-usage-cache-creation-tokens usage)
+                                   (token-usage-reasoning-tokens usage))))
+      (dolist (pair (list (cons "input" (token-usage-input-tokens usage))
+                          (cons "output" (token-usage-output-tokens usage))
+                          (cons "cache_read" (token-usage-cache-read-tokens usage))
+                          (cons "cache_creation" (token-usage-cache-creation-tokens usage))
+                          (cons "reasoning" (token-usage-reasoning-tokens usage))))
+        (when (plusp (cdr pair))
+          (record-histogram registry "gen_ai.client.token.usage" +genai-token-usage-unit+
+                            +token-buckets+
+                            (append base (list (cons "gen_ai.token.type" (car pair))))
+                            (cdr pair)))))))
+
 (defmethod record-builtin-metrics ((rec generation-recorder) registry config)
-  (let* ((op (if (eq (gen-rec-mode rec) :stream) "streamText" "generateText"))
+  (when (otel-generation-export-enabled-p config)
+    (record-genai-generation-metrics rec registry config)
+    (return-from record-builtin-metrics nil))
+  (let* ((op (generation-operation-name rec))
          (err (recorder-call-error rec))
          (id (metric-identity-attrs config
                                     (gen-rec-model-provider rec)
@@ -1041,7 +1391,72 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
     (record-histogram registry "gen_ai.client.tool_calls_per_operation" "count"
                       +tool-call-buckets+ id (count-output-tool-calls rec))))
 
+(defun record-genai-embedding-metrics (rec registry config)
+  "The conventions' client instruments for an embedding in otel mode."
+  (let* ((err (recorder-call-error rec))
+         (base (genai-metric-attrs config
+                                   :operation "embeddings"
+                                   :provider (emb-rec-model-provider rec)
+                                   :model (emb-rec-model-name rec)
+                                   :response-model (emb-rec-response-model rec)
+                                   :agent-name (emb-rec-agent-name rec)
+                                   :agent-version (emb-rec-agent-version rec)
+                                   :error-type (when err "provider_call_error")
+                                   :error-category (when err (classify-error err))))
+         (tokens (emb-rec-input-tokens rec)))
+    (let ((dur (or (emb-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+      (when dur
+        (record-histogram registry "gen_ai.client.operation.duration" "s"
+                          +duration-buckets+ base dur)))
+    (when (and tokens (plusp tokens))
+      ;; The registry unit, the same one the generation path uses. Two units
+      ;; under one metric name is a conflict for a collector, not two series.
+      (record-histogram registry "gen_ai.client.token.usage" +genai-token-usage-unit+
+                        +token-buckets+
+                        (append base (list (cons "gen_ai.token.type" "input")))
+                        tokens))))
+
+(defun record-genai-tool-execution-metrics (rec registry config)
+  "The conventions' client instruments for a tool execution in otel mode."
+  (let* ((err (or (tool-rec-error-message rec) (recorder-call-error rec)))
+         (name (let ((n (tool-rec-tool-name rec)))
+                 (if (stringp n)
+                     (string-trim '(#\Space #\Tab #\Newline #\Return) n)
+                     "")))
+         (base (genai-metric-attrs config
+                                   :operation "execute_tool"
+                                   :provider (tool-rec-model-provider rec)
+                                   :model (tool-rec-model-name rec)
+                                   :agent-name (tool-rec-agent-name rec)
+                                   :agent-version (tool-rec-agent-version rec)
+                                   :error-type (when err "tool_execution_error")
+                                   :error-category (when err (classify-error err))
+                                   :extra (list (cons "gen_ai.tool.name" name))))
+         (dur (or (tool-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+    (when dur
+      (record-histogram registry "gen_ai.client.operation.duration" "s"
+                        +duration-buckets+ base dur))))
+
+(defun record-genai-workflow-step-metrics (rec registry config)
+  "The conventions' client instruments for a workflow step in otel mode.
+The operation is the one its span carries, invoke_workflow, rather than the
+SDK's own workflow_step."
+  (let* ((err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
+         (base (genai-metric-attrs config
+                                   :operation "invoke_workflow"
+                                   :agent-name (wfs-rec-agent-name rec)
+                                   :agent-version (wfs-rec-agent-version rec)
+                                   :error-type (when err "workflow_step_error")
+                                   :error-category (when err (classify-error err))))
+         (dur (or (wfs-rec-duration-seconds rec) (recorder-elapsed-seconds rec))))
+    (when dur
+      (record-histogram registry "gen_ai.client.operation.duration" "s"
+                        +duration-buckets+ base dur))))
+
 (defmethod record-builtin-metrics ((rec embedding-recorder) registry config)
+  (when (otel-generation-export-enabled-p config)
+    (record-genai-embedding-metrics rec registry config)
+    (return-from record-builtin-metrics nil))
   (let* ((err (recorder-call-error rec))
          (id (metric-identity-attrs config
                                     (emb-rec-model-provider rec)
@@ -1066,6 +1481,9 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                           tokens)))))
 
 (defmethod record-builtin-metrics ((rec tool-execution-recorder) registry config)
+  (when (otel-generation-export-enabled-p config)
+    (record-genai-tool-execution-metrics rec registry config)
+    (return-from record-builtin-metrics nil))
   (let* ((err (or (tool-rec-error-message rec) (recorder-call-error rec)))
          (id (metric-identity-attrs config
                                     (tool-rec-model-provider rec)
@@ -1087,6 +1505,9 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                           +duration-buckets+ dur-attrs dur)))))
 
 (defmethod record-builtin-metrics ((rec workflow-step-recorder) registry config)
+  (when (otel-generation-export-enabled-p config)
+    (record-genai-workflow-step-metrics rec registry config)
+    (return-from record-builtin-metrics nil))
   (let* ((err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
          (id (metric-identity-attrs config
                                     ""

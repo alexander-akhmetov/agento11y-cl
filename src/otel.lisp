@@ -40,32 +40,45 @@ An integer or a ratio is widened, so the wire value reads as a double."
                         start-time-unix-nano end-time-unix-nano
                         attributes status-code status-message)
   "Build an OTLP-compatible span JSON object.
-KIND: 1=INTERNAL, 3=CLIENT. STATUS-CODE: 1=OK, 2=ERROR."
+KIND: 1=INTERNAL, 3=CLIENT. STATUS-CODE: 1=OK, 2=ERROR, or :UNSET to leave the
+status object off the span. The GenAI conventions want an unset status on
+success, where Ok is the application's to set; the SDK's own span types report
+Ok and pass 1."
   (let ((span (jobj "traceId" trace-id
                      "spanId" span-id
                      "name" name
                      "kind" kind
                      "startTimeUnixNano" (or start-time-unix-nano "0")
                      "endTimeUnixNano" (or end-time-unix-nano "0")
-                     "attributes" (or attributes (vector))
-                     "status" (jobj "code" (or status-code 1)
-                                    "message" (or status-message "")))))
+                     "attributes" (or attributes (vector)))))
+    (unless (eq status-code :unset)
+      (setf (gethash "status" span)
+            (jobj "code" (or status-code 1) "message" (or status-message ""))))
     (when parent-span-id
       (setf (gethash "parentSpanId" span) parent-span-id))
     span))
 
-(defun build-otlp-payload (spans service-name service-version)
-  "Wrap spans in the OTLP resourceSpans envelope."
-  (let ((resource-attrs (list (otel-string-attr "service.name" (or service-name "unknown")))))
+(defun build-otlp-payload (spans service-name service-version
+                           &key scope-name scope-version schema-url)
+  "Wrap spans in the OTLP resourceSpans envelope.
+SCOPE-NAME, SCOPE-VERSION and SCHEMA-URL declare which instrumentation built
+the spans and which semantic-convention version they follow. They default to
+this SDK's own name and no schema URL; the GenAI export passes the conventions'
+scope and schema instead, which is how a receiver tells which version of the
+conventions the attributes were written to."
+  (let ((resource-attrs (list (otel-string-attr "service.name" (or service-name "unknown"))))
+        (scope (jobj "name" (or scope-name +sdk-name+))))
     (when service-version
       (push (otel-string-attr "service.version" service-version) resource-attrs))
-    (jobj "resourceSpans"
-          (vector
-           (jobj "resource" (jobj "attributes" (coerce (nreverse resource-attrs) 'vector))
-                 "scopeSpans"
-                 (vector
-                  (jobj "scope" (jobj "name" +sdk-name+)
-                        "spans" (coerce spans 'vector))))))))
+    (when scope-version
+      (setf (gethash "version" scope) scope-version))
+    (let ((scope-spans (jobj "scope" scope "spans" (coerce spans 'vector))))
+      (when schema-url
+        (setf (gethash "schemaUrl" scope-spans) schema-url))
+      (jobj "resourceSpans"
+            (vector
+             (jobj "resource" (jobj "attributes" (coerce (nreverse resource-attrs) 'vector))
+                   "scopeSpans" (vector scope-spans)))))))
 
 ;;; --- Metric histogram buckets ---
 ;;; Duration and token bucket boundaries match the current OTel GenAI semantic

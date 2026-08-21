@@ -78,7 +78,11 @@ thread constructor."
 
 (defmacro with-span ((client name &key (kind 1) attributes-var) &body body)
   "Execute BODY wrapped in an OTel span.
-Zero overhead when traces are disabled on CLIENT's config.
+Zero overhead when CLIENT exports no spans at all. The test is
+SPANS-EXPORT-ACTIVE-P rather than the traces-enabled flag, because in otel
+generation mode the traces endpoint is the generation destination and the flag
+is unset: reading the flag alone left BODY without a *trace-context* and every
+generation inside it a root span.
 NAME is a string, evaluated once before BODY. KIND: 1=INTERNAL (default),
 3=CLIENT.
 ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto.
@@ -102,7 +106,7 @@ nested spans got a flat trace whose shape said nothing about what called what."
     `(let ((,attrs-var nil)
            (,client-var ,client))
        (declare (ignorable ,attrs-var))
-       (if (not (config-traces-enabled (client-config ,client-var)))
+       (if (not (spans-export-active-p (client-config ,client-var)))
            (progn ,@body)
            (let* ((,name-var ,name)
                   (,trace-id-var (or (getf *trace-context* :trace-id)

@@ -25,6 +25,7 @@
                                (workflow-steps-endpoint
                                 "http://test-agento11y:4318/api/v1/workflow-steps:export")
                                (metrics-endpoint "http://test-agento11y:4318/v1/metrics")
+                               (generation-protocol :http)
                                (auth-mode :bearer)
                                (auth-password "test-token")
                                (max-retries 5)
@@ -37,6 +38,7 @@
       (make-config
        :generation-endpoint generation-endpoint
        :generation-enabled generation-enabled
+       :generation-protocol generation-protocol
        :api-endpoint api-endpoint
        :eval-endpoint eval-endpoint
        :eval-path-prefix eval-path-prefix
@@ -7659,6 +7661,646 @@ experiment-runs branch, whose prefix they share."
 ;;; Main test runner
 ;;; ================================================================
 
+
+;;; --- OTel GenAI-semconv export ---
+
+(defun genai-attr (span key)
+  "The rendered value of SPAN's attribute KEY, or NIL when it carries none."
+  (loop for attr across (jget span "attributes")
+        when (equal (jget attr "key") key)
+          return (jget attr "value")))
+
+(defun genai-attr-string (span key)
+  (jget (genai-attr span key) "stringValue"))
+
+(defun genai-only-span (client)
+  (let ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
+    (values (first spans) (length spans))))
+
+(defun genai-otel-client (&rest args)
+  (apply #'make-test-client :generation-protocol :otel :experimental-features t args))
+
+(defun genai-encoded-part (&rest args)
+  "The JSON one part encodes to."
+  (multiple-value-bind (raw problems)
+      (agento11y-cl::encode-genai-part (apply #'agento11y-cl::make-genai-part args))
+    (values (and raw (agento11y-cl::genai-raw-json-text raw)) problems)))
+
+(defun run-otel-genai-tests ()
+  (with-test-suite ("OTel GenAI export")
+
+    ;; --- Part encoding: field order, the empty-not-omitted rule, and the
+    ;; --- null for an absent arguments or response document.
+    (dolist (case (list
+                   (list "text part"
+                         '(:part-type "text" :content "hi")
+                         "{\"type\":\"text\",\"content\":\"hi\"}")
+                   (list "text part with unset content emits it empty"
+                         '(:part-type "text")
+                         "{\"type\":\"text\",\"content\":\"\"}")
+                   (list "reasoning part"
+                         '(:part-type "reasoning" :content "think")
+                         "{\"type\":\"reasoning\",\"content\":\"think\"}")
+                   (list "tool_call part"
+                         '(:part-type "tool_call" :id "c1" :name "weather"
+                           :arguments "{\"city\":\"Paris\"}")
+                         "{\"type\":\"tool_call\",\"id\":\"c1\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}")
+                   (list "tool_call part with no arguments emits null"
+                         '(:part-type "tool_call" :id "c1" :name "weather")
+                         "{\"type\":\"tool_call\",\"id\":\"c1\",\"name\":\"weather\",\"arguments\":null}")
+                   (list "tool_call_response part"
+                         '(:part-type "tool_call_response" :id "c1" :response "\"ok\"")
+                         "{\"type\":\"tool_call_response\",\"id\":\"c1\",\"response\":\"ok\"}")
+                   (list "server_tool_call part"
+                         '(:part-type "server_tool_call" :id "s1" :name "search"
+                           :arguments "{\"q\":1}")
+                         "{\"type\":\"server_tool_call\",\"id\":\"s1\",\"name\":\"search\",\"server_tool_call\":{\"q\":1}}")
+                   (list "server_tool_call_response part"
+                         '(:part-type "server_tool_call_response" :id "s1")
+                         "{\"type\":\"server_tool_call_response\",\"id\":\"s1\",\"server_tool_call_response\":null}")
+                   (list "compaction part omits unset content"
+                         '(:part-type "compaction" :id "k1")
+                         "{\"type\":\"compaction\",\"id\":\"k1\"}")
+                   (list "blob part"
+                         '(:part-type "blob" :content "AAAA" :mime-type "image/png"
+                           :modality "image")
+                         "{\"type\":\"blob\",\"content\":\"AAAA\",\"mime_type\":\"image/png\",\"modality\":\"image\"}")
+                   (list "uri part"
+                         '(:part-type "uri" :uri "https://x/y" :mime-type "image/png"
+                           :modality "image")
+                         "{\"type\":\"uri\",\"mime_type\":\"image/png\",\"modality\":\"image\",\"uri\":\"https://x/y\"}")
+                   (list "file part with unset file_id emits it empty"
+                         '(:part-type "file" :modality "image")
+                         "{\"type\":\"file\",\"modality\":\"image\",\"file_id\":\"\"}")
+                   (list "an unknown type keeps only its type"
+                         '(:part-type "mystery" :content "dropped")
+                         "{\"type\":\"mystery\"}")
+                   (list "extension keys splice in sorted"
+                         '(:part-type "text" :content "hi"
+                           :extensions (("z.key" . "last") ("a.key" . "first")))
+                         "{\"type\":\"text\",\"content\":\"hi\",\"a.key\":\"first\",\"z.key\":\"last\"}")))
+      (destructuring-bind (label args expected) case
+        (check label (equal (apply #'genai-encoded-part args) expected))))
+
+    (check "a part with no type is dropped"
+           (null (genai-encoded-part :part-type nil :content "x")))
+    (check "a blob with no modality omits the key and reports it"
+           (multiple-value-bind (json problems)
+               (genai-encoded-part :part-type "blob" :content "AAAA")
+             (and (equal json "{\"type\":\"blob\",\"content\":\"AAAA\"}")
+                  (= 1 (length problems))
+                  (search "modality" (first problems)))))
+    (check "an extension colliding with a schema key is dropped and reported"
+           (multiple-value-bind (json problems)
+               (genai-encoded-part :part-type "text" :content "hi"
+                                   :extensions '(("content" . "sneak")))
+             (and (equal json "{\"type\":\"text\",\"content\":\"hi\"}")
+                  (= 1 (length problems)))))
+    (check "an unknown type carrying other fields reports the drop"
+           (multiple-value-bind (json problems)
+               (genai-encoded-part :part-type "mystery" :id "x")
+             (and (equal json "{\"type\":\"mystery\"}") (= 1 (length problems)))))
+    (check "invalid JSON in arguments is dropped, not embedded"
+           (multiple-value-bind (json problems)
+               (genai-encoded-part :part-type "tool_call" :name "t" :arguments "{oops")
+             (and (equal json "{\"type\":\"tool_call\",\"name\":\"t\",\"arguments\":null}")
+                  (= 1 (length problems)))))
+
+    ;; --- Message and tool-definition encoding
+    (check "an output message always carries finish_reason"
+           (equal (agento11y-cl::encode-genai-messages
+                   (list (agento11y-cl::make-genai-message
+                          :role "assistant"
+                          :parts (list (agento11y-cl::make-genai-text-part "hi"))))
+                   :output t)
+                  "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"hi\"}],\"finish_reason\":\"\"}]"))
+    (check "an input message omits an unset finish_reason"
+           (equal (agento11y-cl::encode-genai-messages
+                   (list (agento11y-cl::make-genai-message
+                          :role "user"
+                          :parts (list (agento11y-cl::make-genai-text-part "hi")))))
+                  "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"hi\"}]}]"))
+    (check "system instructions encode as a bare parts array"
+           (equal (agento11y-cl::encode-genai-system-instructions
+                   (agento11y-cl::genai-system-instructions-from-text "Be brief."))
+                  "[{\"type\":\"text\",\"content\":\"Be brief.\"}]"))
+    (check "a blank system prompt produces no parts"
+           (null (agento11y-cl::genai-system-instructions-from-text "   ")))
+    (check "a tool definition defaults its type to function"
+           (equal (agento11y-cl::encode-genai-tool-definitions
+                   (list (agento11y-cl::make-genai-tool-definition
+                          :name "weather" :description "look up"
+                          :parameters "{\"type\":\"object\"}")))
+                  "[{\"type\":\"function\",\"name\":\"weather\",\"description\":\"look up\",\"parameters\":{\"type\":\"object\"}}]"))
+
+    ;; --- Span name and kind
+    (dolist (case (list
+                   (list "chat takes the request model" '(:operation "chat" :request-model "gpt-4o")
+                         "chat gpt-4o" 3)
+                   (list "execute_tool takes the tool name"
+                         '(:operation "execute_tool" :tool-name "bash" :request-model "gpt-4o")
+                         "execute_tool bash" 1)
+                   (list "invoke_agent takes the agent name"
+                         '(:operation "invoke_agent" :agent-name "planner")
+                         "invoke_agent planner" 3)
+                   (list "retrieval takes the data source"
+                         '(:operation "retrieval" :data-source-id "docs")
+                         "retrieval docs" 3)
+                   (list "invoke_workflow takes the workflow name"
+                         '(:operation "invoke_workflow" :workflow-name "step-1")
+                         "invoke_workflow step-1" 1)
+                   (list "fetch_response has no subject"
+                         '(:operation "fetch_response" :request-model "gpt-4o")
+                         "fetch_response" 3)
+                   (list "an empty subject falls back to the request model"
+                         '(:operation "execute_tool" :request-model "gpt-4o")
+                         "execute_tool gpt-4o" 1)
+                   (list "an empty subject and model leave the operation alone"
+                         '(:operation "execute_tool") "execute_tool" 1)
+                   (list "an unset operation defaults to chat" '(:request-model "gpt-4o")
+                         "chat gpt-4o" 3)))
+      (destructuring-bind (label args name kind) case
+        (let ((inv (apply #'agento11y-cl::make-genai-invocation args)))
+          (check (format nil "span name: ~a" label)
+                 (equal (agento11y-cl::genai-span-name inv) name))
+          (check (format nil "span kind: ~a" label)
+                 (eql (agento11y-cl::genai-span-kind inv) kind)))))
+
+    ;; --- Capture translation
+    (dolist (case '((:full . :span-only)
+                    (:no-tool-content . :span-only)
+                    (:full-with-metadata-spans . :span-only)
+                    (:metadata-only . :no-content)
+                    (:nonsense . :no-content)))
+      (check (format nil "capture ~a translates to ~a" (car case) (cdr case))
+             (eq (agento11y-cl::otel-capture-mode (car case)) (cdr case))))
+
+    ;; --- Operation and provider rewrites
+    (dolist (case '(("" . "chat") ("generateText" . "chat") ("streamText" . "chat")
+                    ("embeddings" . "embeddings")))
+      (check (format nil "operation ~s maps to ~s" (car case) (cdr case))
+             (equal (agento11y-cl::otel-operation-name (car case)) (cdr case))))
+    (dolist (case '(("gemini" . "gcp.gemini") ("mistral" . "mistral_ai")
+                    ("moonshotai" . "moonshot_ai") ("vertex" . "gcp.vertex_ai")
+                    ("bedrock" . "aws.bedrock") ("azure-openai" . "azure.ai.openai")
+                    ("azure-ai-inference" . "azure.ai.inference")
+                    ("watsonx" . "ibm.watsonx.ai") ("x-ai" . "x_ai")
+                    ("openai" . "openai") ("anthropic" . "anthropic")))
+      (check (format nil "provider ~s maps to ~s" (car case) (cdr case))
+             (equal (agento11y-cl::otel-provider-name (car case)) (cdr case))))
+
+    ;; --- The base64 escape hatch
+    (check "compact JSON goes on the wire raw"
+           (equal (agento11y-cl::otel-embeddable-json "{\"a\":1}") "{\"a\":1}"))
+    (check "JSON with whitespace does not survive a round trip"
+           (null (agento11y-cl::otel-embeddable-json "{\"a\": 1}")))
+    (check "a JSON null reads as an absent payload"
+           (null (agento11y-cl::otel-embeddable-json "null")))
+    (check "invalid JSON is not embeddable"
+           (null (agento11y-cl::otel-embeddable-json "{oops")))
+    (let ((spaced (cl-base64:string-to-base64-string "{\"a\": 1}")))
+      (multiple-value-bind (raw b64) (agento11y-cl::otel-json-document spaced)
+        (check "a document that would be rewritten falls back to base64"
+               (and (null raw) (equal b64 spaced)))))
+    (multiple-value-bind (raw b64)
+        (agento11y-cl::otel-json-document (cl-base64:string-to-base64-string "{\"a\":1}"))
+      (check "a compact document embeds and needs no base64"
+             (and (equal raw "{\"a\":1}") (null b64))))
+
+    ;; --- Media part mapping
+    (flet ((media-part (&key (url "") (mime "") (name "") (kind "image"))
+             (agento11y-cl::otel-part
+              (jobj "media" (jobj "kind" kind "url" url "mime_type" mime "name" name)))))
+      (let ((part (media-part :url "data:image/png;base64,AAAA")))
+        (check "a data URL becomes a blob"
+               (and (equal (agento11y-cl::genai-part-type part) "blob")
+                    (equal (agento11y-cl::genai-part-content part) "AAAA")
+                    (equal (agento11y-cl::genai-part-mime-type part) "image/png"))))
+      (check "a data URL mime is compared case-insensitively"
+             (equal (agento11y-cl::genai-part-type
+                     (media-part :url "data:image/PNG;base64,AAAA" :mime "image/png"))
+                    "blob"))
+      (check "a mislabeled mime type becomes a uri"
+             (equal (agento11y-cl::genai-part-type
+                     (media-part :url "data:image/png;base64,AAAA" :mime "image/jpeg"))
+                    "uri"))
+      (check "any other URL becomes a uri"
+             (equal (agento11y-cl::genai-part-type (media-part :url "https://x/y.png"))
+                    "uri"))
+      (let ((part (media-part :name "chart.png")))
+        (check "an empty URL becomes a file keyed by name"
+               (and (equal (agento11y-cl::genai-part-type part) "file")
+                    (equal (agento11y-cl::genai-part-file-id part) "chart.png")))))
+
+    ;; --- The synthesized provider_type is not republished as an extension
+    (check "a synthesized provider_type produces no extension"
+           (null (agento11y-cl::genai-part-extensions
+                  (agento11y-cl::otel-part
+                   (jobj "thinking" "why"
+                         "metadata" (jobj "provider_type" "thinking"))))))
+    (check "a caller provider_type does produce an extension"
+           (equal (agento11y-cl::genai-part-extensions
+                   (agento11y-cl::otel-part
+                    (jobj "thinking" "why"
+                          "metadata" (jobj "provider_type" "redacted_thinking"))))
+                  '(("agento11y.provider_type" . "redacted_thinking"))))
+
+    ;; --- The environment cannot overrule the SDK's content policy
+    ;;
+    ;; The SDK mode alone decides what a generation span carries: in otel mode
+    ;; the span is the export, so the conventions' traces-side capture variable
+    ;; must not widen it. Nothing in this SDK reads that variable.
+    (multiple-value-bind (client get-requests)
+        (genai-otel-client :capture :metadata-only)
+      (declare (ignore get-requests))
+      (recorder-end (start-generation client :model-provider "openai" :model-name "gpt-4o"))
+      (check "a metadata_only generation span carries no messages"
+             (null (genai-attr (genai-only-span client) "gen_ai.input.messages"))))
+    (dolist (file '("src/otel-genai.lisp" "src/otel-genai-hook.lisp" "src/otel-export.lisp"
+                    "src/recorder.lisp" "src/env.lisp"))
+      (let ((source (uiop:read-file-string
+                     (asdf:system-relative-pathname :agento11y-cl file))))
+        (check (format nil "~a reads no traces-side capture variable" file)
+               (null (search "(funcall env-fn \"OTEL_" source)))))
+
+    ;; --- The experimental gate
+    (multiple-value-bind (client get-requests)
+        (make-test-client :generation-protocol :otel :experimental-features t
+                          :capture :full)
+      (recorder-end (start-generation client :model-provider "openai" :model-name "gpt-4o"))
+      (multiple-value-bind (span count) (genai-only-span client)
+        (check "gate open: one span on the trace queue" (= count 1))
+        (check "gate open: the span is named for the conventions' operation"
+               (equal (jget span "name") "chat gpt-4o"))
+        (check "gate open: the span kind is CLIENT" (eql (jget span "kind") 3))
+        (check "gate open: no status on success"
+               (not (nth-value 1 (gethash "status" span))))
+        (check "gate open: the generation queue stays empty"
+               (agento11y-cl::queue-empty-p
+                (agento11y-cl::client-generation-queue client))))
+      (client-shutdown client)
+      (check "gate open: nothing is POSTed to the generation endpoint"
+             (notany (lambda (call) (search "generations:export" (first call)))
+                     (funcall get-requests))))
+
+    (multiple-value-bind (client get-requests)
+        (make-test-client :generation-protocol :otel :experimental-features nil
+                          :capture :full)
+      (recorder-end (start-generation client :model-provider "openai" :model-name "gpt-4o"))
+      (check "gate shut: no span enqueued"
+             (agento11y-cl::queue-empty-p (agento11y-cl::client-trace-queue client)))
+      (check "gate shut: no generation payload enqueued"
+             (agento11y-cl::queue-empty-p (agento11y-cl::client-generation-queue client)))
+      (client-shutdown client)
+      (check "gate shut: nothing is POSTed anywhere"
+             (null (funcall get-requests))))
+
+    (multiple-value-bind (client get-requests) (make-test-client :capture :full)
+      (declare (ignore get-requests))
+      (recorder-end (start-generation client :model-provider "openai" :model-name "gpt-4o"))
+      (check "protocol unset: the native span is still named generateText"
+             (equal (jget (genai-only-span client) "name") "generateText gpt-4o"))
+      (check "protocol unset: the generation payload is still enqueued"
+             (not (agento11y-cl::queue-empty-p
+                   (agento11y-cl::client-generation-queue client)))))
+
+    ;; --- Capture modes on a real generation
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "gemini"
+                                          :model-name "gemini-2.5-pro")))
+        (set-result rec
+                    :input-messages (list (make-message :role :user
+                                                        :parts (list (make-text-part "hi"))))
+                    :output-messages
+                    (list (make-message :role :assistant
+                                        :parts (list (make-tool-call-part
+                                                      :id "call_weather" :name "weather"
+                                                      :input-json "{\"city\":\"Paris\"}"))))
+                    :usage (make-token-usage :input 120 :output 40 :total 170
+                                             :cache-read 100 :cache-creation 20
+                                             :reasoning 30)
+                    :stop-reason "tool_calls")
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "full: the provider name is rewritten to its registry spelling"
+               (equal (genai-attr-string span "gen_ai.provider.name") "gcp.gemini"))
+        (check "full: a tool call encodes with its arguments embedded"
+               (equal (genai-attr-string span "gen_ai.output.messages")
+                      "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"call_weather\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}],\"finish_reason\":\"tool_calls\"}]"))
+        (check "full: input messages are present"
+               (genai-attr span "gen_ai.input.messages"))
+        (dolist (key '("gen_ai.usage.cache_read.input_tokens"
+                       "gen_ai.usage.cache_creation.input_tokens"
+                       "gen_ai.usage.reasoning.output_tokens"))
+          (check (format nil "full: ~a uses the registry spelling" key)
+                 (genai-attr span key)))
+        (dolist (key '("gen_ai.usage.cache_read_input_tokens"
+                       "gen_ai.usage.cache_write_input_tokens"
+                       "gen_ai.usage.reasoning_tokens"))
+          (check (format nil "full: ~a is not emitted" key)
+                 (null (genai-attr span key))))))
+
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :metadata-only)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "openai" :model-name "gpt-4o")))
+        (set-result rec
+                    :input-messages (list (make-message :role :user
+                                                        :parts (list (make-text-part "hi"))))
+                    :system-prompt "Be brief."
+                    :usage (make-token-usage :input 10 :output 5))
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (dolist (key '("gen_ai.input.messages" "gen_ai.output.messages"
+                       "gen_ai.system_instructions" "gen_ai.tool.definitions"))
+          (check (format nil "metadata_only: no ~a" key) (null (genai-attr span key))))
+        (check "metadata_only: the generation id survives"
+               (genai-attr span "agento11y.generation.id"))
+        (check "metadata_only: the usage attributes survive"
+               (and (genai-attr span "gen_ai.usage.input_tokens")
+                    (genai-attr span "gen_ai.usage.output_tokens")))))
+
+    ;; The mode keeps content off the shared traces destination. In otel mode
+    ;; that destination is the only one, so the mode narrows rather than widens.
+    (multiple-value-bind (client get-requests)
+        (genai-otel-client :capture :full-with-metadata-spans)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "openai" :model-name "gpt-4o")))
+        (set-result rec :input-messages
+                    (list (make-message :role :user :parts (list (make-text-part "hi")))))
+        (recorder-end rec))
+      (let* ((span (genai-only-span client))
+             (metadata (jzon:parse (genai-attr-string span "agento11y.generation.metadata"))))
+        (check "full_with_metadata_spans: no content reaches the span"
+               (null (genai-attr span "gen_ai.input.messages")))
+        (check "full_with_metadata_spans: the metadata marker reads metadata_only"
+               (equal (jget metadata "agento11y.sdk.content_capture_mode")
+                      "metadata_only"))))
+
+    ;; --- :no-tool-content strips the tool documents but keeps the call
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :no-tool-content)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "openai" :model-name "gpt-4o")))
+        (set-result rec
+                    :input-messages
+                    (list (make-message :role :user
+                                        :parts (list (make-tool-result-part
+                                                      :tool-call-id "c1"
+                                                      :content "/etc/shadow contents"))))
+                    :output-messages
+                    (list (make-message :role :assistant
+                                        :parts (list (make-tool-call-part
+                                                      :id "c1" :name "sh"
+                                                      :input-json "{\"cmd\":\"cat /etc/shadow\"}"))))
+                    :stop-reason "tool_calls")
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "no_tool_content: the tool call keeps its id and name"
+               (equal (genai-attr-string span "gen_ai.output.messages")
+                      "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"c1\",\"name\":\"sh\",\"arguments\":null}],\"finish_reason\":\"tool_calls\"}]"))
+        (check "no_tool_content: the tool result document is gone"
+               (null (search "/etc/shadow"
+                             (genai-attr-string span "gen_ai.input.messages"))))))
+
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :no-tool-content)
+      (declare (ignore get-requests))
+      (let ((rec (start-tool-execution client :tool-name "sh" :tool-call-id "c1")))
+        (set-result rec :arguments "{\"cmd\":\"cat /etc/shadow\"}" :result "root:x:0:0")
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "no_tool_content: an execute_tool span carries no arguments"
+               (and (null (genai-attr span "gen_ai.tool.call.arguments"))
+                    (null (genai-attr span "gen_ai.tool.call.result"))))))
+
+    ;; --- The usage-reported guard
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "openai" :model-name "gpt-4o")))
+        (set-result rec :usage (make-token-usage :input 0 :output 0))
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "an all-zero usage emits no token attributes"
+               (and (null (genai-attr span "gen_ai.usage.input_tokens"))
+                    (null (genai-attr span "gen_ai.usage.output_tokens"))))))
+
+    ;; --- Failure
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "openai" :model-name "gpt-4o")))
+        (set-call-error rec "provider returned status=429")
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "a failed generation sets the error status"
+               (eql (jget* span "status" "code") 2))
+        (check "a failed generation carries error.type"
+               (equal (genai-attr-string span "error.type") "provider_call_error"))
+        (check "a failed generation carries the SDK's error category"
+               (equal (genai-attr-string span "error.category") "rate_limit"))))
+
+    ;; --- The other recorder types map onto the conventions' operations
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-tool-execution client :tool-name "bash" :tool-call-id "c1")))
+        (set-result rec :arguments "{\"command\":\"ls\"}" :result "ok")
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "a tool execution is an execute_tool span"
+               (and (equal (jget span "name") "execute_tool bash")
+                    (eql (jget span "kind") 1)))
+        (check "a tool execution carries the arguments as a JSON document"
+               (equal (genai-attr-string span "gen_ai.tool.call.arguments")
+                      "{\"command\":\"ls\"}"))
+        (check "a tool execution drops the non-registry length keys"
+               (and (null (genai-attr span "gen_ai.tool.call.arguments.length"))
+                    (null (genai-attr span "gen_ai.tool.call.result.length"))))))
+
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-embedding client :model-provider "openai"
+                                         :model-name "text-embedding-3-small")))
+        (set-result rec :input-count 3 :input-tokens 12 :dimensions 1536)
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "an embedding is an embeddings span"
+               (equal (jget span "name") "embeddings text-embedding-3-small"))
+        (check "an embedding keeps the registry dimension count"
+               (genai-attr span "gen_ai.embeddings.dimension.count"))
+        (check "an embedding namespaces its non-registry input count"
+               (and (genai-attr span "agento11y.gen_ai.embeddings.input_count")
+                    (null (genai-attr span "gen_ai.embeddings.input_count"))))))
+
+    (multiple-value-bind (client get-requests)
+        (genai-otel-client :capture :full :workflow-steps-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (start-workflow-step client :step-name "plan")))
+        (recorder-end rec))
+      (let ((span (genai-only-span client)))
+        (check "a workflow step is an invoke_workflow span"
+               (and (equal (jget span "name") "invoke_workflow plan")
+                    (eql (jget span "kind") 1)))
+        (check "a workflow step carries the workflow name"
+               (equal (genai-attr-string span "gen_ai.workflow.name") "plan"))))
+
+    ;; --- Metrics
+    (multiple-value-bind (client get-requests)
+        (genai-otel-client :capture :full :metrics-enabled t)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :mode :stream :model-provider "openai"
+                                          :model-name "gpt-4o")))
+        (set-result rec :usage (make-token-usage :input 10 :output 5 :cache-read 3)
+                        :duration-seconds 1.5 :ttft-seconds 0.25)
+        (recorder-end rec))
+      (let ((names nil)
+            (units nil)
+            (token-types nil))
+        (maphash (lambda (key state)
+                   (declare (ignore key))
+                   (pushnew (agento11y-cl::hist-state-name state) names :test #'equal)
+                   (pushnew (cons (agento11y-cl::hist-state-name state)
+                                  (agento11y-cl::hist-state-unit state))
+                            units :test #'equal)
+                   (let ((type (cdr (assoc "gen_ai.token.type"
+                                           (agento11y-cl::hist-state-attrs state)
+                                           :test #'equal))))
+                     (when type (pushnew type token-types :test #'equal))))
+                 (agento11y-cl::metric-registry-table
+                  (agento11y-cl::client-metric-registry client)))
+        (check "otel metrics record the operation duration"
+               (member "gen_ai.client.operation.duration" names :test #'equal))
+        (check "otel metrics record the time to first chunk"
+               (member "gen_ai.client.operation.time_to_first_chunk" names :test #'equal))
+        (check "otel metrics drop the native time_to_first_token"
+               (not (member "gen_ai.client.time_to_first_token" names :test #'equal)))
+        (check "otel metrics drop the native tool_calls_per_operation"
+               (not (member "gen_ai.client.tool_calls_per_operation" names :test #'equal)))
+        (check "otel token usage uses the registry unit"
+               (member '("gen_ai.client.token.usage" . "{token}") units :test #'equal))
+        (check "otel token types use the registry spellings"
+               (and (member "cache_read" token-types :test #'equal)
+                    (not (member "cache_write" token-types :test #'equal))))))
+
+    ;; --- A missing traces endpoint exports nothing rather than stalling
+    (multiple-value-bind (client get-requests)
+        (genai-otel-client :capture :full :traces-endpoint nil)
+      (let ((rec (start-generation client :model-provider "openai" :model-name "gpt-4o")))
+        (recorder-end rec)
+        (recorder-end (start-tool-execution client :tool-name "sh" :tool-call-id "c1")))
+      (check "no traces endpoint: nothing is queued"
+             (and (agento11y-cl::queue-empty-p (agento11y-cl::client-trace-queue client))
+                  (agento11y-cl::queue-empty-p (agento11y-cl::client-generation-queue client))))
+      (client-shutdown client)
+      (check "no traces endpoint: nothing is POSTed" (null (funcall get-requests))))
+
+    ;; --- A shut gate silences the children too, so no span is orphaned
+    (multiple-value-bind (client get-requests)
+        (make-test-client :generation-protocol :otel :experimental-features nil
+                          :capture :full :workflow-steps-enabled nil)
+      (declare (ignore get-requests))
+      (recorder-end (start-generation client :model-provider "openai" :model-name "gpt-4o"))
+      (recorder-end (start-tool-execution client :tool-name "sh" :tool-call-id "c1"))
+      (recorder-end (start-embedding client :model-provider "openai" :model-name "emb"))
+      (recorder-end (start-workflow-step client :step-name "plan"))
+      (check "gate shut: no child span is exported either"
+             (agento11y-cl::queue-empty-p (agento11y-cl::client-trace-queue client))))
+
+    ;; --- with-span parents the tree in otel mode, where traces-enabled is off
+    (multiple-value-bind (client get-requests)
+        (genai-otel-client :capture :full :traces-enabled nil)
+      (declare (ignore get-requests))
+      (let ((inner nil))
+        (with-span (client "outer")
+          (setf inner (getf agento11y-cl::*trace-context* :span-id)))
+        (check "with-span publishes a context in otel mode" inner)
+        (let ((spans (agento11y-cl::queue-drain-all
+                      (agento11y-cl::client-trace-queue client))))
+          (check "with-span exports its span in otel mode" (= 1 (length spans))))))
+
+    ;; --- The OTLP envelope declares the conventions and their schema
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :full)
+      (recorder-end (start-generation client :model-provider "openai" :model-name "gpt-4o"))
+      (client-flush client)
+      (let* ((call (find-if (lambda (r) (search "/v1/traces" (first r)))
+                            (funcall get-requests)))
+             (scope-spans (aref (jget* (jzon:parse (second call))
+                                       "resourceSpans" 0 "scopeSpans")
+                                0)))
+        (check "the batch declares the conventions' scope"
+               (equal (jget* scope-spans "scope" "name") "otel-genai-cl"))
+        (check "the batch declares the semconv schema"
+               (equal (jget scope-spans "schemaUrl")
+                      "https://opentelemetry.io/schemas/1.41.0"))))
+
+    ;; --- Nested metadata stays JSON rather than a printed Lisp object
+    (multiple-value-bind (client get-requests) (genai-otel-client :capture :full)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "openai" :model-name "gpt-4o"
+                                          :metadata (jobj "nested" (jobj "k" "v")
+                                                          "list" (vector 1 2)))))
+        (recorder-end rec))
+      (let* ((span (genai-only-span client))
+             (metadata (jzon:parse (genai-attr-string span "agento11y.generation.metadata"))))
+        (check "a nested metadata object stays an object"
+               (equal (jget* metadata "nested" "k") "v"))
+        (check "a metadata array stays an array"
+               (equalp (jget metadata "list") (vector 1 2)))))
+
+    ;; --- Every otel-mode recorder reports the registry token unit
+    (multiple-value-bind (client get-requests)
+        (genai-otel-client :capture :full :metrics-enabled t :workflow-steps-enabled nil)
+      (declare (ignore get-requests))
+      (let ((rec (start-generation client :model-provider "gemini" :model-name "gemini-2.5-pro")))
+        (set-result rec :usage (make-token-usage :input 10 :output 5) :duration-seconds 1.0d0)
+        (recorder-end rec))
+      (let ((rec (start-embedding client :model-provider "gemini" :model-name "emb")))
+        (set-result rec :input-count 2 :input-tokens 7 :duration-seconds 0.5d0)
+        (recorder-end rec))
+      (let ((rec (start-tool-execution client :tool-name "sh" :tool-call-id "c1")))
+        (set-result rec :result "ok" :duration-seconds 0.2d0)
+        (recorder-end rec))
+      (let ((rec (start-workflow-step client :step-name "plan")))
+        (set-result rec :duration-seconds 0.3d0)
+        (recorder-end rec))
+      (let ((units nil)
+            (providers nil)
+            (empty-error-type nil)
+            (operations nil))
+        (maphash (lambda (key state)
+                   (declare (ignore key))
+                   (pushnew (cons (agento11y-cl::hist-state-name state)
+                                  (agento11y-cl::hist-state-unit state))
+                            units :test #'equal)
+                   (let ((attrs (agento11y-cl::hist-state-attrs state)))
+                     (let ((provider (cdr (assoc "gen_ai.provider.name" attrs :test #'equal))))
+                       (when provider (pushnew provider providers :test #'equal)))
+                     (pushnew (cdr (assoc "gen_ai.operation.name" attrs :test #'equal))
+                              operations :test #'equal)
+                     (when (equal "" (cdr (assoc "error.type" attrs :test #'equal)))
+                       (setf empty-error-type t))))
+                 (agento11y-cl::metric-registry-table
+                  (agento11y-cl::client-metric-registry client)))
+        (check "one token.usage unit across every otel recorder"
+               (equal (remove-if-not (lambda (u)
+                                       (equal (car u) "gen_ai.client.token.usage"))
+                                     units)
+                      (list (cons "gen_ai.client.token.usage" "{token}"))))
+        (check "every otel metric provider uses the registry spelling"
+               (equal providers (list "gcp.gemini")))
+        (check "no otel metric carries an empty error.type" (not empty-error-type))
+        (check "a workflow step reports the operation its span carries"
+               (member "invoke_workflow" operations :test #'equal))))
+
+    ;; --- The neutral core stays liftable
+    ;;
+    ;; Go pins this with an import check. Common Lisp has no per-file import
+    ;; list, so the check is textual: the file may not name the vendor or read
+    ;; the SDK configuration. Its (in-package :agento11y-cl) form is exempt,
+    ;; because every file in this system carries it.
+    (let* ((source (uiop:read-file-string
+                    (asdf:system-relative-pathname :agento11y-cl "src/otel-genai.lisp")))
+           (body (subseq source (1+ (position #\Newline source)))))
+      (check "the neutral core names no vendor" (null (search "agento11y" body)))
+      (check "the neutral core reads no configuration" (null (search "(config-" body))))))
+
 (defun run-tests ()
   "Run all agento11y-cl tests. Returns (values ok-p total-pass total-fail)."
   (let ((total-pass 0)
@@ -7685,9 +8327,11 @@ experiment-runs branch, whose prefix they share."
                            #'run-conversations-tests
                            #'run-metrics-tests
                            #'run-hooks-tests
+                           #'run-otel-genai-tests
                            #'run-hooks-conformance-tests
                            #'run-experiments-conformance-tests
-                           #'run-redaction-conformance-tests))
+                           #'run-redaction-conformance-tests
+                           #'run-genai-conformance-tests))
       (multiple-value-bind (ok pass fail) (funcall test-fn)
         (declare (ignore ok))
         (incf total-pass pass)

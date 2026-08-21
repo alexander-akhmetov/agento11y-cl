@@ -156,9 +156,9 @@ Resolution precedence per slot: caller value (explicit) > env > schema default.
 
 Recognized suffixes, each read as AGENTO11Y_<SUFFIX> with a legacy
 SIGIL_<SUFFIX> fallback:
-  ENDPOINT, EVAL_ENDPOINT, EVAL_PATH_PREFIX, EVAL_AUTH_TOKEN, INGEST_ACTOR,
-  EXPERIMENT_URL_TEMPLATE, HEADERS, AUTH_MODE, AUTH_TENANT_ID, AUTH_TOKEN,
-  AGENT_NAME, AGENT_VERSION, USER_ID, TAGS, CONTENT_CAPTURE_MODE,
+  ENDPOINT, TRACES_ENDPOINT, EVAL_ENDPOINT, EVAL_PATH_PREFIX, EVAL_AUTH_TOKEN,
+  INGEST_ACTOR, EXPERIMENT_URL_TEMPLATE, HEADERS, AUTH_MODE, AUTH_TENANT_ID,
+  AUTH_TOKEN, AGENT_NAME, AGENT_VERSION, USER_ID, TAGS, CONTENT_CAPTURE_MODE,
   REDACT_SECRETS, REDACT_INPUT_MESSAGES, DEBUG,
   ENABLE_EXPERIMENTAL_FEATURES.
 
@@ -167,9 +167,12 @@ before parsing, so a stale SIGIL_ value cannot resurface when the preferred one
 fails validation. The two spellings are never merged: the selected value is
 used whole, including for TAGS and HEADERS.
 
-AGENTO11Y_PROTOCOL is not supported (agento11y-cl is HTTP-only); a warning is
-logged when set to anything other than http/https. AGENTO11Y_INSECURE is a
-no-op since TLS is controlled by the URL scheme.
+AGENTO11Y_PROTOCOL selects the generation export protocol: http/https keep the
+proprietary payload POST, and otel emits a GenAI-semconv span instead. Any
+other value is ignored with a warning. otel needs AGENTO11Y_TRACES_ENDPOINT
+too, because that span is the generation and the traces endpoint is where it
+goes. AGENTO11Y_INSECURE is a no-op since TLS
+is controlled by the URL scheme.
 
 Note: an explicit caller value that equals the slot's schema default is
 indistinguishable from \"unset\" and WILL be overridden by env. This applies to
@@ -182,6 +185,7 @@ set the matching variable or unset it.
 NIL until a caller sets them, so an explicit value equal to the default still
 wins over env."
   (let* ((endpoint  (env-branded env-fn "ENDPOINT"))
+         (traces-endpoint (env-branded env-fn "TRACES_ENDPOINT"))
          (eval-endpoint (env-branded env-fn "EVAL_ENDPOINT"))
          (eval-path-prefix (env-branded env-fn "EVAL_PATH_PREFIX"))
          (eval-auth-token (env-branded env-fn "EVAL_AUTH_TOKEN"))
@@ -215,15 +219,21 @@ wins over env."
          (protocol-var (cdr protocol-pair)))
     ;; Warn when the protocol var is set to something we don't support.
     (when (and protocol
-               (not (member (string-downcase protocol) '("http" "https") :test #'string=)))
+               (not (member (string-downcase protocol) '("http" "https" "otel")
+                            :test #'string=)))
       (agento11y-log config :warn "env"
-                 (format nil "ignoring ~a=~a (agento11y-cl is HTTP-only)"
+                 (format nil "ignoring ~a=~a (supported values are http, https, and otel)"
                          protocol-var protocol)))
     (let ((overrides nil))
       (flet ((override (k v) (push k overrides) (push v overrides)))
         ;; Endpoint.
         (when (and endpoint (null (config-generation-endpoint config)))
           (override :generation-endpoint endpoint))
+        ;; OTLP traces endpoint. It is not derived from the generation
+        ;; endpoint: that one is the generation ingest API and an OTLP
+        ;; collector is a different service on a different path.
+        (when (and traces-endpoint (null (config-traces-endpoint config)))
+          (override :traces-endpoint traces-endpoint))
         ;; Eval endpoint and links.
         (when (and eval-endpoint (null (config-eval-endpoint config)))
           (override :eval-endpoint eval-endpoint))
@@ -295,6 +305,11 @@ wins over env."
             (override :extra-headers
                       (%merge-alist-env-base env-headers (config-extra-headers config)
                                              #'string-equal))))
+        ;; Generation export protocol (caller :http, the schema default, is
+        ;; treated as "not set"). http and https both mean the payload POST.
+        (when (and protocol (eq (config-generation-protocol config) :http)
+                   (string= (string-downcase protocol) "otel"))
+          (override :generation-protocol :otel))
         ;; Debug.
         (when (and debug (null (config-debug config)))
           (override :debug (parse-bool debug)))

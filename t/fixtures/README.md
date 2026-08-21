@@ -22,6 +22,16 @@ commit that touched `conformance/`, `redaction/patterns.json`, or
 | `redaction/strings.json` | `redaction/fixtures/strings.json` |
 | `redaction/generations.json` | `redaction/fixtures/generations.json` |
 | `redaction/patterns.json` | `redaction/patterns.json` |
+| `otlpwire/*.generation.json` | `go/agento11y/testdata/otlpwire/*.generation.json` |
+| `otlpwire/*.span.json` | `go/agento11y/testdata/otlpwire/*.span.json` |
+
+`otlpwire/` differs from every other row. The rest come from the shared
+`conformance/` and `redaction/` directories, which are a cross-SDK contract.
+The six `otlpwire/` files come from Go-private `testdata/`: they can change
+upstream without notice, and no other SDK checks itself against them. They were
+copied at agento11y commit `0137e0ef04f857c0922405c7a262800914f0a094`, the last
+commit that touched them. Proposing them for a shared `conformance/genai/`
+upstream is the right follow-up.
 
 `conformance/pi-sessions/` is not vendored: it pins a pi plugin this repo does
 not ship.
