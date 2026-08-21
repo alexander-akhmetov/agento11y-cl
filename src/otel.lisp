@@ -36,14 +36,44 @@ An integer or a ratio is widened, so the wire value reads as a double."
 
 ;;; --- Span building ---
 
+(defun build-span-link (context)
+  "Build one OTLP span link from CONTEXT, a (:trace-id ... :span-id ...) plist,
+or NIL when it names no usable span.
+
+Both identifiers are revalidated here rather than trusted from whatever produced
+them. A malformed traceId is rejected by the collector for the WHOLE OTLP batch,
+taking every unrelated span in that flush with it, and a link context typically
+originates outside this process.
+
+CONTEXT is checked for being a cons before GETF reads it, so a caller passing
+one plist where a LIST of plists belongs gets no link rather than a type error
+out of GETF."
+  (when (consp context)
+    (let ((trace-id (getf context :trace-id))
+          (span-id (getf context :span-id)))
+      (when (and (trace-hex-id-p trace-id 32) (trace-hex-id-p span-id 16))
+        (jobj "traceId" trace-id "spanId" span-id)))))
+
+(defun build-span-links (contexts)
+  "The OTLP links vector for CONTEXTS, or NIL when none of them is usable.
+Returning NIL rather than an empty vector is what keeps the key off the span."
+  (let ((links (loop for context in contexts
+                     for link = (build-span-link context)
+                     when link collect link)))
+    (when links (coerce links 'vector))))
+
 (defun build-span (&key trace-id span-id parent-span-id name kind
                         start-time-unix-nano end-time-unix-nano
-                        attributes status-code status-message)
+                        attributes status-code status-message links)
   "Build an OTLP-compatible span JSON object.
 KIND: 1=INTERNAL, 3=CLIENT. STATUS-CODE: 1=OK, 2=ERROR, or :UNSET to leave the
 status object off the span. The GenAI conventions want an unset status on
 success, where Ok is the application's to set; the SDK's own span types report
-Ok and pass 1."
+Ok and pass 1.
+
+LINKS is a list of trace-context plists pointing at related spans in other
+traces. A link is not a parent: it never changes this span's trace id, its
+parent or its sampling, so an unusable one costs the link and nothing else."
   (let ((span (jobj "traceId" trace-id
                      "spanId" span-id
                      "name" name
@@ -51,6 +81,9 @@ Ok and pass 1."
                      "startTimeUnixNano" (or start-time-unix-nano "0")
                      "endTimeUnixNano" (or end-time-unix-nano "0")
                      "attributes" (or attributes (vector)))))
+    (let ((link-vector (build-span-links links)))
+      (when link-vector
+        (setf (gethash "links" span) link-vector)))
     (unless (eq status-code :unset)
       (setf (gethash "status" span)
             (jobj "code" (or status-code 1) "message" (or status-message ""))))

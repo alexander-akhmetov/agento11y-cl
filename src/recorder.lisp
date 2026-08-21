@@ -15,15 +15,22 @@ with LIST carries no capture mode, and a tool execution under it exports content
 the enclosing generation withholds.")
 
 (defun child-trace-context (trace-id span-id
-                            &key (content-capture-mode
+                            &key parent-span-id
+                                 (content-capture-mode
                                   (getf *trace-context* :content-capture-mode)))
   "Build the *trace-context* plist for a span opened under TRACE-ID and SPAN-ID.
 The capture mode defaults to the one in force at the call, so a context built
 inside a generation keeps that generation's mode for the tool executions under
 it. Call it before rebinding *trace-context*, which is where the default reads
-from."
+from.
+
+Every key is present from the start, PARENT-SPAN-ID included, so a caller that
+has to re-root the span it is inside can SETF them in place. An inbound server
+span is the case: it opens before the request is authenticated and can only
+adopt the caller's trace once it is."
   (list :trace-id trace-id
         :span-id span-id
+        :parent-span-id parent-span-id
         :content-capture-mode content-capture-mode))
 
 ;;; --- Base recorder ---

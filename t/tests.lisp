@@ -893,6 +893,106 @@ experiment-runs branch, whose prefix they share."
                    (make-condition 'simple-error :format-control "socket closed"))
                   "sdk_error"))
 
+    ;; Identifiers go out lowercase, because the traceparent header naming them
+    ;; is lowercase by specification and the two have to match in the backend.
+    (let ((trace-id (agento11y-cl::generate-trace-id))
+          (span-id (agento11y-cl::generate-span-id)))
+      (check "a generated trace id is 32 lowercase hex characters"
+             (and (= 32 (length trace-id))
+                  (string= trace-id (string-downcase trace-id))
+                  (agento11y-cl::trace-hex-id-p trace-id 32)))
+      (check "a generated span id is 16 lowercase hex characters"
+             (and (= 16 (length span-id))
+                  (string= span-id (string-downcase span-id))
+                  (agento11y-cl::trace-hex-id-p span-id 16))))
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (with-span (client "lowercase") nil)
+      (let ((span (first (agento11y-cl::queue-drain-all
+                          (agento11y-cl::client-trace-queue client)))))
+        (check "an exported span carries lowercase identifiers"
+               (and (string= (jget span "traceId")
+                             (string-downcase (jget span "traceId")))
+                    (string= (jget span "spanId")
+                             (string-downcase (jget span "spanId")))))))
+
+    ;; Span status follows the conventions: Unset on success, Error with the
+    ;; condition's own message on failure.
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (with-span (client "quiet") :fine)
+      (let ((span (first (agento11y-cl::queue-drain-all
+                          (agento11y-cl::client-trace-queue client)))))
+        (check "a span that completes reports no status"
+               (null (nth-value 1 (gethash "status" span)))))
+      (ignore-errors
+       (with-span (client "loud")
+         (error "upstream refused the request")))
+      (let ((span (first (agento11y-cl::queue-drain-all
+                          (agento11y-cl::client-trace-queue client)))))
+        (check "a span whose body signalled reports Error"
+               (= 2 (jget (jget span "status") "code")))
+        (check "the status description is the condition's message"
+               (equal (jget (jget span "status") "message")
+                      "upstream refused the request"))))
+
+    ;; A body that re-roots its own span is exported re-rooted
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (with-span (client "server" :kind 2)
+        (setf (getf *trace-context* :trace-id) "0123456789abcdef0123456789abcdef"
+              (getf *trace-context* :parent-span-id) "fedcba9876543210"))
+      (let ((span (first (agento11y-cl::queue-drain-all
+                          (agento11y-cl::client-trace-queue client)))))
+        (check "re-rooted span takes the adopted trace id"
+               (equal (jget span "traceId") "0123456789abcdef0123456789abcdef"))
+        (check "re-rooted span takes the adopted parent"
+               (equal (jget span "parentSpanId") "fedcba9876543210"))
+        (check "re-rooting leaves the span's own id alone"
+               (= (length (jget span "spanId")) 16))))
+
+    ;; An untouched context still exports what was minted
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (let ((*trace-context* (list :trace-id "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                   :span-id "bbbbbbbbbbbbbbbb")))
+        (with-span (client "child") nil))
+      (let ((span (first (agento11y-cl::queue-drain-all
+                          (agento11y-cl::client-trace-queue client)))))
+        (check "untouched span inherits the ambient trace"
+               (equal (jget span "traceId") "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+        (check "untouched span parents under the ambient span"
+               (equal (jget span "parentSpanId") "bbbbbbbbbbbbbbbb"))))
+
+    ;; Span links
+    (let* ((good (list :trace-id "0123456789abcdef0123456789abcdef"
+                       :span-id "0123456789abcdef"))
+           (span (agento11y-cl::build-span :trace-id "aa" :span-id "bb" :name "n"
+                                           :kind 1 :links (list good))))
+      (check "link vector present" (= (length (jget span "links")) 1))
+      (check "link traceId" (equal (jget (aref (jget span "links") 0) "traceId")
+                                   "0123456789abcdef0123456789abcdef"))
+      (check "link spanId" (equal (jget (aref (jget span "links") 0) "spanId")
+                                  "0123456789abcdef")))
+
+    ;; No links key at all when nothing is linkable
+    (dolist (bad (list nil
+                       (list (list :trace-id "short" :span-id "0123456789abcdef"))
+                       (list (list :trace-id "0123456789abcdef0123456789abcdef"))
+                       (list :trace-id "0123456789abcdef0123456789abcdef")))
+      (let ((span (agento11y-cl::build-span :trace-id "aa" :span-id "bb" :name "n"
+                                            :kind 1 :links bad)))
+        (check (format nil "no links key for ~s" bad)
+               (null (nth-value 1 (gethash "links" span))))))
+
+    ;; One unusable link does not discard the usable ones
+    (let* ((span (agento11y-cl::build-span
+                  :trace-id "aa" :span-id "bb" :name "n" :kind 1
+                  :links (list (list :trace-id "nope" :span-id "nope")
+                               (list :trace-id "0123456789abcdef0123456789abcdef"
+                                     :span-id "0123456789abcdef")))))
+      (check "unusable link dropped, usable kept" (= (length (jget span "links")) 1)))
+
     ;; Withheld error text keeps the classification
     (check "redacted-error-text 429"
            (equal (agento11y-cl::redacted-error-text "status=429") "rate_limit"))
@@ -1019,6 +1119,50 @@ experiment-runs branch, whose prefix they share."
           (check "traces off: ambient trace-id reaches payload"
                  (equal (jget gen "trace_id")
                         "0123456789abcdef0123456789abcdef")))))
+
+    ;; Caller-supplied span identifiers
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (let* ((*trace-context* (list :trace-id "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                    :span-id "bbbbbbbbbbbbbbbb"))
+             (rec (start-generation client :mode :sync
+                                           :trace-id "cccccccccccccccccccccccccccccccc"
+                                           :span-id "dddddddddddddddd")))
+        (check "caller trace-id wins over the ambient one"
+               (equal (gen-rec-trace-id rec) "cccccccccccccccccccccccccccccccc"))
+        (check "caller span-id replaces the generated one"
+               (equal (gen-rec-span-id rec) "dddddddddddddddd"))
+        (check "caller identifiers do not move the parent"
+               (equal (agento11y-cl::gen-rec-parent-span-id rec) "bbbbbbbbbbbbbbbb"))
+        (recorder-end rec)))
+
+    ;; Each supplied identifier falls back on its own
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (let* ((*trace-context* (list :trace-id "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+             (rec (start-generation client :mode :sync
+                                           :span-id "dddddddddddddddd")))
+        (check "span-id alone leaves the trace-id inherited"
+               (equal (gen-rec-trace-id rec) "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+        (check "span-id alone is still taken"
+               (equal (gen-rec-span-id rec) "dddddddddddddddd"))
+        (recorder-end rec)))
+
+    ;; A malformed identifier is ignored rather than exported
+    (multiple-value-bind (client get-requests) (make-test-client)
+      (declare (ignore get-requests))
+      (dolist (bad (list "" "zzzz" "dddddddddddddd" "ddddddddddddddddd" 42 nil))
+        (let ((rec (start-generation client :mode :sync :span-id bad)))
+          (check (format nil "malformed span-id ~s falls back to a generated one" bad)
+                 (and (stringp (gen-rec-span-id rec))
+                      (= (length (gen-rec-span-id rec)) 16)
+                      (not (equal (gen-rec-span-id rec) bad))))
+          (recorder-end rec)))
+      (let ((rec (start-generation client :mode :sync :trace-id "tooshort")))
+        (check "malformed trace-id falls back to a generated one"
+               (and (stringp (gen-rec-trace-id rec))
+                    (= (length (gen-rec-trace-id rec)) 32)))
+        (recorder-end rec)))
 
     ;; Idempotent end
     (multiple-value-bind (client2 get-requests2) (make-test-client)

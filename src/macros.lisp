@@ -76,7 +76,7 @@ thread constructor."
       (with-telemetry-context (context)
         (funcall thunk)))))
 
-(defmacro with-span ((client name &key (kind 1) attributes-var) &body body)
+(defmacro with-span ((client name &key (kind 1) attributes-var links) &body body)
   "Execute BODY wrapped in an OTel span.
 Zero overhead when CLIENT exports no spans at all. The test is
 SPANS-EXPORT-ACTIVE-P rather than the traces-enabled flag, because in otel
@@ -86,18 +86,42 @@ generation inside it a root span.
 NAME is a string, evaluated once before BODY. KIND: 1=INTERNAL (default),
 3=CLIENT.
 ATTRIBUTES-VAR: lexical variable (list) the body can push otel-*-attr items onto.
+LINKS: a form yielding a list of trace-context plists naming related spans in
+other traces. It is evaluated once, in the unwind, so a caller can build it from
+whatever BODY learned. A link never changes this span's trace, parent or
+sampling, so an unusable one costs the link alone.
 
 The span's identifiers are minted BEFORE BODY runs, and *trace-context* is bound
 to them for BODY's extent, so anything opened inside -- a nested with-span, a
 generation, a tool execution, an embedding -- parents under this span. Minting
 them in the unwind instead published no context at all: every nested span read
 the same ambient value this one did and came out a sibling, so a caller that
-nested spans got a flat trace whose shape said nothing about what called what."
+nested spans got a flat trace whose shape said nothing about what called what.
+
+A span that completes reports status Unset, not Ok. The conventions reserve Ok
+for an application that has decided the operation succeeded on its own terms;
+an instrumentation library reporting it for every span that did not signal
+leaves a caller no way to say otherwise. A span whose body signalled reports
+Error, with the condition's own message as the status description -- the type
+name alone said only that something of that class was raised, which for a
+caller that signals one condition type to mark its spans is no information at
+all. Rendering the condition can itself signal -- a report method that reads a
+slot the condition was built without does -- so the type name remains the
+fallback.
+
+The exported span reads its trace id, span id and parent back OUT of that bound
+context rather than from the lexicals it was minted into, so BODY can re-root
+the span it is inside by SETF-ing the plist. A server span that must adopt an
+inbound trace only after authenticating the caller is why: reading the lexicals
+made such a write a silent no-op, exporting the span under the local trace while
+the caller was told it had been adopted."
   (let ((attrs-var (or attributes-var (gensym "ATTRS-")))
         (start-nano (gensym "START-"))
         (ok (gensym "OK-"))
-        (err-type (gensym "ERR-"))
+        (err-message (gensym "ERR-"))
         (vals (gensym "VALS-"))
+        (ctx-var (gensym "CTX-"))
+        (links-var (gensym "LINKS-"))
         (client-var (gensym "CLIENT-"))
         (name-var (gensym "NAME-"))
         (trace-id-var (gensym "TRACE-ID-"))
@@ -113,27 +137,29 @@ nested spans got a flat trace whose shape said nothing about what called what."
                                      (generate-trace-id)))
                   (,parent-var (getf *trace-context* :span-id))
                   (,span-id-var (generate-span-id))
+                  (,ctx-var (child-trace-context ,trace-id-var ,span-id-var
+                                                 :parent-span-id ,parent-var))
                   (,start-nano (current-unix-nano))
                   (,ok t)
-                  (,err-type nil)
+                  (,err-message nil)
                   (,vals nil))
              (unwind-protect
-                  (let ((*trace-context* (child-trace-context
-                                          ,trace-id-var ,span-id-var)))
+                  (let ((*trace-context* ,ctx-var))
                     (handler-case
                         (progn
                           (setf ,vals (multiple-value-list (progn ,@body)))
                           (values-list ,vals))
                       (error (e)
                         (setf ,ok nil
-                              ,err-type (princ-to-string (type-of e)))
+                              ,err-message (condition-status-message e))
                         (error e))))
                (handler-case
                    (let* ((end-nano (current-unix-nano))
+                          (,links-var ,links)
                           (cfg (client-config ,client-var))
-                          (trace-id ,trace-id-var)
-                          (span-id ,span-id-var)
-                          (parent-span-id ,parent-var)
+                          (trace-id (getf ,ctx-var :trace-id))
+                          (span-id (getf ,ctx-var :span-id))
+                          (parent-span-id (getf ,ctx-var :parent-span-id))
                           (base-attrs (list (otel-string-attr "agento11y.sdk.name" +sdk-name+))))
                      (let ((agent (or (config-agent-name cfg)
                                       (config-service-name cfg)))
@@ -157,8 +183,9 @@ nested spans got a flat trace whose shape said nothing about what called what."
                                   :start-time-unix-nano ,start-nano
                                   :end-time-unix-nano end-nano
                                   :attributes (coerce (nreverse base-attrs) 'vector)
-                                  :status-code (if ,ok 1 2)
-                                  :status-message (or ,err-type "")))
+                                  :status-code (if ,ok :unset 2)
+                                  :status-message (or ,err-message "")
+                                  :links ,links-var))
                      (bt2:with-lock-held ((client-lock ,client-var))
                        (bt2:condition-notify (client-wake-cv ,client-var))))
                  (error (e)

@@ -98,14 +98,44 @@ Parses fractional seconds if present. Returns NIL for invalid input."
     (format nil "wfs_~8,'0x~4,'0x" ts (mod seq #xFFFF))))
 
 (defun generate-trace-id ()
-  "Generate a 32-hex-char trace ID (128-bit random)."
+  "Generate a 32-hex-char lowercase trace ID (128-bit random).
+
+Lowercase because the W3C traceparent header a peer receives is lowercase by
+specification, and the exported span has to carry the identifier that header
+named or the two never join in the backend. ~X alone formats uppercase."
   (bt2:with-lock-held (*id-lock*)
-    (format nil "~32,'0x" (random (expt 2 128) *id-random-state*))))
+    (format nil "~(~32,'0x~)" (random (expt 2 128) *id-random-state*))))
 
 (defun generate-span-id ()
-  "Generate a 16-hex-char span ID (64-bit random)."
+  "Generate a 16-hex-char lowercase span ID (64-bit random).
+Lowercase for the reason GENERATE-TRACE-ID gives."
   (bt2:with-lock-held (*id-lock*)
-    (format nil "~16,'0x" (random (expt 2 64) *id-random-state*))))
+    (format nil "~(~16,'0x~)" (random (expt 2 64) *id-random-state*))))
+
+(defun condition-status-message (condition)
+  "CONDITION rendered for a span's status description, never signalling.
+
+PRINC-TO-STRING runs the condition's report method, which is arbitrary code
+belonging to whichever library raised it: dexador's HTTP-REQUEST-FAILED reader
+signals when the condition carries no response, and a span built around such a
+call would take the whole request down while recording telemetry about it. The
+type name is the fallback, which is what this used to report unconditionally."
+  (or (ignore-errors (princ-to-string condition))
+      (ignore-errors (princ-to-string (type-of condition)))
+      "error"))
+
+(defun trace-hex-id-p (value width)
+  "True when VALUE is a WIDTH-character trace or span identifier.
+Both cases are accepted on the way in: what a caller hands over comes from
+another tracer, and the specification only constrains what goes out. This SDK's
+own identifiers are lowercase."
+  (and (stringp value)
+       (= (length value) width)
+       (every (lambda (ch)
+                (or (char<= #\0 ch #\9)
+                    (char<= #\a ch #\f)
+                    (char<= #\A ch #\F)))
+              value)))
 
 ;;; --- UTF-8 + SHA-1 ---
 ;;;

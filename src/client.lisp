@@ -229,7 +229,7 @@ TELEMETRY-CONTEXT-THUNK.")
                                       (thinking-enabled :unset)
                                       parent-generation-ids
                                       tags metadata generation-id started-at
-                                      content-capture)
+                                      content-capture trace-id span-id)
   "Create and start a generation recorder.
 When called inside a `with-workflow-step` (or any other context that binds
 `*trace-context*`), the generation inherits the workflow's trace-id and uses
@@ -242,12 +242,29 @@ shifted forward by its own duration.
 
 CONTENT-CAPTURE sets the capture mode for this generation only, ahead of the
 capture-mode resolver and the client-level mode. A tool execution opened inside
-`with-generation` inherits the mode resolved here."
+`with-generation` inherits the mode resolved here.
+
+TRACE-ID and SPAN-ID name the span this generation will export, for a caller
+that has to know the identifiers BEFORE the recorder opens. A recorder opened
+after the provider returned is the case that needs them: at request time the
+generation span does not exist, so a caller propagating W3C context to the
+provider can only name the enclosing span, and the provider's server span comes
+back a sibling of this one rather than its child. Minting the pair up front and
+passing it here is what nests it.
+
+Both are optional and independent, each falling back to the inherited or
+generated value. PARENT-SPAN-ID is never overridden: the pair names this span,
+not its place in the tree, which stays whatever *TRACE-CONTEXT* says. A value
+that is not hex of the right width is ignored in favor of the generated one,
+because a malformed identifier is rejected by the collector for the whole OTLP
+batch rather than for the one span that carried it."
   (let* ((config (client-config client))
          (run *experiment-run*)
          (ctx *trace-context*)
          (inherited-trace-id (getf ctx :trace-id))
-         (inherited-parent-span-id (getf ctx :span-id)))
+         (inherited-parent-span-id (getf ctx :span-id))
+         (caller-trace-id (when (trace-hex-id-p trace-id 32) trace-id))
+         (caller-span-id (when (trace-hex-id-p span-id 16) span-id)))
     (when run
       (let ((prepared (%experiment-run-prepare-generation-options
                        run client
@@ -267,8 +284,8 @@ capture-mode resolver and the client-level mode. A tool execution opened inside
       :content-capture-mode (resolve-content-capture-mode
                              config :override content-capture :metadata metadata)
       :generation-id (or generation-id (generate-id))
-      :trace-id (or inherited-trace-id (generate-trace-id))
-      :span-id (generate-span-id)
+      :trace-id (or caller-trace-id inherited-trace-id (generate-trace-id))
+      :span-id (or caller-span-id (generate-span-id))
       :parent-span-id inherited-parent-span-id
       :mode mode
       :conversation-id conversation-id
