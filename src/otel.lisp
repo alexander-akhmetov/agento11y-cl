@@ -52,7 +52,7 @@ out of GETF."
     (let ((trace-id (getf context :trace-id))
           (span-id (getf context :span-id)))
       (when (and (trace-hex-id-p trace-id 32) (trace-hex-id-p span-id 16))
-        (jobj "traceId" trace-id "spanId" span-id)))))
+        (jobj "traceId" (string-downcase trace-id) "spanId" (string-downcase span-id))))))
 
 (defun build-span-links (contexts)
   "The OTLP links vector for CONTEXTS, or NIL when none of them is usable.
@@ -66,6 +66,8 @@ Returning NIL rather than an empty vector is what keeps the key off the span."
                         start-time-unix-nano end-time-unix-nano
                         attributes status-code status-message links)
   "Build an OTLP-compatible span JSON object.
+This low-level serializer does not apply capture policy to caller-owned status,
+attributes or names. Use SPAN-ERROR-STATUS-MESSAGE before passing error text.
 KIND: 1=INTERNAL, 3=CLIENT. STATUS-CODE: 1=OK, 2=ERROR, or :UNSET to leave the
 status object off the span. The GenAI conventions want an unset status on
 success, where Ok is the application's to set; the SDK's own span types report
@@ -195,10 +197,13 @@ value gets it printed rather than an error: callers include payload and span
 builders, where signalling here would drop the whole record."
   (when (null error-string) (return-from classify-error nil))
   (unless (stringp error-string)
-    (setf error-string (princ-to-string error-string)))
+    (setf error-string (condition-status-message error-string)))
   (let ((status (extract-http-status error-string))
         (lower (string-downcase error-string)))
     (cond
+      ((member lower '("rate_limit" "auth_error" "server_error" "timeout"
+                       "client_error" "sdk_error") :test #'string=)
+       lower)
       ((and status (= status 429)) "rate_limit")
       ((and status (or (= status 401) (= status 403))) "auth_error")
       ((and status (>= status 500)) "server_error")
@@ -212,6 +217,15 @@ builders, where signalling here would drop the whole record."
   "Error text to export when capture mode withholds the provider's message.
 Returns the classified category so consumers keep the classification."
   (or (classify-error error-string) "sdk_error"))
+
+(defun span-error-status-message (error mode)
+  "Render ERROR under the resolved SDK span capture MODE. NIL means no error.
+Tool errors use the span gate, not the stricter gate for tool arguments."
+  (if error
+      (if (capture-keeps-span-content-p mode)
+          (condition-status-message error)
+          (redacted-error-text error))
+      ""))
 
 ;;; --- Common span attributes ---
 

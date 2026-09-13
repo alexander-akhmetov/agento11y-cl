@@ -258,6 +258,9 @@
    #:gen-rec-generation-id
    #:gen-rec-trace-id
    #:gen-rec-span-id
+   #:emb-rec-trace-id
+   #:emb-rec-span-id
+   #:emb-rec-parent-span-id
    #:wfs-rec-step-id
    #:wfs-rec-trace-id
    #:wfs-rec-span-id
@@ -275,6 +278,8 @@
    #:jget
    #:jget*
    ;; Utility
+   #:condition-status-message
+   #:trace-hex-id-p
    #:current-unix-nano
    #:iso8601-now
    #:iso8601-to-unix-nano

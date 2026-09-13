@@ -101,6 +101,21 @@ count wins over the requested one on the span.
 or `:no-tool-content`. The SDK keeps the first `:embedding-max-input-items`
 texts in order and cuts each one to `:embedding-max-text-length` characters.
 
+`start-embedding` and `with-embedding` accept optional `:trace-id` and `:span-id`,
+like `start-generation`. Read the resolved values before the provider call with
+`emb-rec-trace-id`, `emb-rec-span-id`, and `emb-rec-parent-span-id`.
+Both protocols export these stored identifiers, even if the ambient context changes before `recorder-end`.
+
+Each override is independent. A valid trace override wins over the ambient trace;
+an invalid one falls back to that trace or a generated identifier.
+An invalid span override gets a generated identifier. The parent remains the ambient span at start.
+`trace-hex-id-p` is exported: use width 32 for traces and 16 for spans.
+It rejects nonhex, wrong-width and all-zero values. Accepted identifiers are normalized to lowercase by both recorder factories.
+
+A workflow step opens a new trace. The SDK accepts valid ID overrides inside a step, including overrides from another trace.
+If your integration requires workflow grouping, reject stale cross-trace handles before sending a trace header.
+Propagate the recorder's resolved IDs, or pass a validated pair unchanged to the recorder after the request.
+
 ### Message parts
 
 A message carries a list of parts. There are five kinds:
@@ -395,15 +410,18 @@ recorder, so it reads the client-level mode and not a per-call one.
 
 #### Resolving the mode per call
 
-A generation takes `:content-capture` on `start-generation` or
-`with-generation`; a tool execution takes it on `start-tool-execution` or
-`with-tool-execution`. Precedence matches the reference SDKs:
+Generation, tool execution and generic spans accept per-call `:content-capture`.
+Set it on `start-generation`, `start-tool-execution`, their `with-*` macros, or `with-span`.
 
 | Recording | Precedence, highest first |
 |-----------|---------------------------|
-| Generation | per-call `:content-capture` > `:content-capture-resolver` > `:content-capture-mode` |
-| Tool execution | per-call `:content-capture` > the enclosing generation's resolved mode > `:content-capture-resolver` > `:content-capture-mode` |
-| Embedding | `:content-capture-resolver` > `:content-capture-mode` |
+| Generation, tool execution, generic span | per-call `:content-capture` > resolved parent mode > `:content-capture-resolver` > `:content-capture-mode` |
+| Embedding, workflow step | resolved parent mode > `:content-capture-resolver` > `:content-capture-mode` |
+
+All factories resolve capture at start. Generic spans resolve it before the body.
+Workflow payloads and spans use the same frozen mode, with separate payload and span gates.
+Changing client configuration during a call cannot widen these recordings.
+Ratings still use the client-level mode.
 
 ```lisp
 (agento11y-cl:with-generation (rec *client*
@@ -415,22 +433,55 @@ A generation takes `:content-capture` on `start-generation` or
   )
 ```
 
-A tool execution inherits through `*trace-context*`, so it has to run inside the
-generation's dynamic extent. On a thread the caller spawns, carry the context
-over with `capture-telemetry-context` / `with-telemetry-context` or
-`telemetry-context-thunk`. Without a carried context the tool execution resolves
-from `:content-capture-resolver` and then the client-level
-`:content-capture-mode`. Code that binds `*trace-context*` by hand builds the
-plist with `child-trace-context`, which carries the mode; a plist built with
-`list` drops it and lands the tool execution on the same two-step fallback.
+Children inherit through `*trace-context*` inside `with-span`, `with-generation`, or `with-workflow-step`.
+`with-span` resolves and passes on capture policy even when span export is disabled.
+In that case, it keeps ambient trace identifiers without creating a span or new identifiers.
+Native generation payloads inside the body still inherit the resolved mode.
+On a spawned thread, carry that context with `capture-telemetry-context` / `with-telemetry-context` or `telemetry-context-thunk`.
+Without a parent mode, recorders use the resolver and then the client mode.
+Use `child-trace-context` for manual bindings so you do not drop the inherited mode.
 
 `:content-capture-resolver` runs at most once per recording, and not at all when
 a per-call `:content-capture` or an inherited parent mode already decided the
-mode. It receives the metadata supplied at start; a tool execution and an
-embedding carry none, so it gets `nil`. A per-call mode or a resolver return
+mode. It receives generation or workflow metadata supplied at start; other recording types pass `nil`.
+A per-call mode, inherited mode, or resolver return
 outside the four supported keywords logs a warning and resolves to
 `:metadata-only`. So does a resolver that signals: a resolver that cannot decide
 must not widen what leaves the process.
+
+#### Error status and application conditions
+
+Generic, native and GenAI spans apply capture policy to error descriptions.
+`:full` and `:no-tool-content` keep formatted error text. The other modes export a bounded error category.
+Tool errors use this span gate, not the stricter gate for tool arguments and results.
+The GenAI `build-genai-span` builder also gates direct invocations:
+`:span-only` and `:span-and-event` keep text; other values withhold it.
+Already-classified categories such as `rate_limit` survive repeated redaction.
+
+`condition-status-message` is an exported generic of one argument, also accepting strings.
+Applications can specialize it to withhold details from a library condition in every mode:
+
+```lisp
+(define-condition my-database-error (error) ())
+
+(defmethod agento11y-cl:condition-status-message ((condition my-database-error))
+  (declare (ignore condition))
+  "client_error")
+```
+
+Replace `my-database-error` with your application's condition class.
+Return a string without reading sensitive fields or calling the condition's report method.
+A wrapper condition should delegate to `condition-status-message` on its original detail.
+Keep typed errors separate from model-visible tool output; a specialization cannot recognize a condition after conversion to a string.
+`set-call-error` and tool/workflow `set-result :error-message` accept these condition objects without replacing them.
+Payload errors retain their separate capture gate, and use the same formatter when text is permitted.
+
+The default method prints the object. Failed report or primary methods, and non-string results, fall back to the type name.
+`with-span` preserves original conditions, multiple values, and nonlocal exits.
+Native success status remains OK; generic and GenAI success status remains Unset. Errors remain code 2.
+
+Capture policy is not a general sanitizer. Caller-supplied names, attributes, tags, arbitrary metadata, scores and artifacts remain caller-owned.
+The low-level `build-span` serializer also leaves status policy to its caller.
 
 Every exported generation carries `agento11y.sdk.content_capture_mode`, holding
 `full`, `no_tool_content`, `full_with_metadata_spans`, or `metadata_only`. It is

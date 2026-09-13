@@ -104,38 +104,47 @@ Lowercase because the W3C traceparent header a peer receives is lowercase by
 specification, and the exported span has to carry the identifier that header
 named or the two never join in the backend. ~X alone formats uppercase."
   (bt2:with-lock-held (*id-lock*)
-    (format nil "~(~32,'0x~)" (random (expt 2 128) *id-random-state*))))
+    (format nil "~(~32,'0x~)" (1+ (random (1- (expt 2 128)) *id-random-state*)))))
 
 (defun generate-span-id ()
   "Generate a 16-hex-char lowercase span ID (64-bit random).
 Lowercase for the reason GENERATE-TRACE-ID gives."
   (bt2:with-lock-held (*id-lock*)
-    (format nil "~(~16,'0x~)" (random (expt 2 64) *id-random-state*))))
+    (format nil "~(~16,'0x~)" (1+ (random (1- (expt 2 64)) *id-random-state*)))))
 
-(defun condition-status-message (condition)
-  "CONDITION rendered for a span's status description, never signalling.
+(defgeneric condition-status-message (condition)
+  (:documentation "Return telemetry error text for CONDITION (strings are also accepted).
+Specialize this generic to withhold library-specific details in every capture
+mode. Return a string; do not modify or re-signal the original condition.
+Primary method failures and non-string results fall back to the type name."))
 
-PRINC-TO-STRING runs the condition's report method, which is arbitrary code
-belonging to whichever library raised it: dexador's HTTP-REQUEST-FAILED reader
-signals when the condition carries no response, and a span built around such a
-call would take the whole request down while recording telemetry about it. The
-type name is the fallback, which is what this used to report unconditionally."
-  (or (ignore-errors (princ-to-string condition))
-      (ignore-errors (princ-to-string (type-of condition)))
-      "error"))
+(defmethod condition-status-message ((condition t))
+  (princ-to-string condition))
+
+(defmethod condition-status-message :around ((condition t))
+  (let ((message (ignore-errors (call-next-method))))
+    (if (stringp message)
+        message
+        (or (ignore-errors (princ-to-string (type-of condition))) "error"))))
 
 (defun trace-hex-id-p (value width)
-  "True when VALUE is a WIDTH-character trace or span identifier.
+  "True when VALUE is a nonzero WIDTH-character hex trace or span identifier.
 Both cases are accepted on the way in: what a caller hands over comes from
 another tracer, and the specification only constrains what goes out. This SDK's
 own identifiers are lowercase."
   (and (stringp value)
        (= (length value) width)
+       (some (lambda (ch) (char/= ch #\0)) value)
        (every (lambda (ch)
                 (or (char<= #\0 ch #\9)
                     (char<= #\a ch #\f)
                     (char<= #\A ch #\F)))
               value)))
+
+(defun normalized-trace-id (value width)
+  "Return a lowercase, nonzero hex identifier, or NIL for invalid input."
+  (when (trace-hex-id-p value width)
+    (string-downcase value)))
 
 ;;; --- UTF-8 + SHA-1 ---
 ;;;

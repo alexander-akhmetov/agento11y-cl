@@ -41,9 +41,7 @@ adopt the caller's trace once it is."
    (completed-at :initarg :completed-at :accessor recorder-completed-at :initform nil)
    (call-error  :initarg :call-error  :accessor recorder-call-error  :initform nil)
    (ended-p     :initarg :ended-p     :accessor recorder-ended-p     :initform nil)
-   ;; Capture mode resolved when this recorder started. Workflow steps leave it
-   ;; NIL and stay on the client-level mode; generation, tool-execution and
-   ;; embedding recorders resolve it at start.
+   ;; Factories resolve capture at start. NIL retains direct-instance compatibility.
    (content-capture-mode :initarg :content-capture-mode
                          :accessor recorder-content-capture-mode :initform nil)))
 
@@ -54,7 +52,9 @@ mode when it carries none."
       (config-content-capture-mode (client-config (recorder-client rec)))))
 
 (defgeneric set-result (recorder &key &allow-other-keys))
-(defgeneric set-call-error (recorder error-string))
+(defgeneric set-call-error (recorder error-string)
+  (:documentation "Store an error string or condition without replacing it.
+Serialization applies CONDITION-STATUS-MESSAGE and the payload or span capture gate."))
 (defgeneric recorder-end (recorder))
 
 (defmethod set-call-error ((rec recorder) error-string)
@@ -443,7 +443,7 @@ values onto the conventions' chat operation."
     (when (recorder-call-error rec)
       (setf (gethash "call_error" gen)
             (if capture-content
-                (recorder-call-error rec)
+                (condition-status-message (recorder-call-error rec))
                 (redacted-error-text (recorder-call-error rec)))))
     (when (gen-rec-response-id rec)
       (setf (gethash "response_id" gen) (gen-rec-response-id rec)))
@@ -576,7 +576,6 @@ values onto the conventions' chat operation."
           (push (otel-string-attr "error.category" category) attrs))))
     ;; Build span
     (let* ((capture (recorder-capture-mode rec))
-           (capture-span (capture-keeps-span-content-p capture))
            (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
            (end-nano (if (and start-nano (gen-rec-duration-seconds rec))
                          (unix-nano-plus-seconds start-nano (gen-rec-duration-seconds rec))
@@ -590,11 +589,8 @@ values onto the conventions' chat operation."
                   :end-time-unix-nano end-nano
                   :attributes (coerce (nreverse attrs) 'vector)
                   :status-code (if (recorder-call-error rec) 2 1)
-                  :status-message (if (recorder-call-error rec)
-                                      (if capture-span
-                                          (recorder-call-error rec)
-                                          (redacted-error-text (recorder-call-error rec)))
-                                      "")))))
+                  :status-message (span-error-status-message
+                                   (recorder-call-error rec) capture)))))
 
 ;;; ================================================================
 ;;; GenAI-semconv spans (generation-protocol :otel)
@@ -625,15 +621,12 @@ otherwise the recorded completion."
 mode. PAYLOAD is the generation payload, which the adapter reads as its source."
   (let* ((capture (recorder-capture-mode rec))
          (call-error (recorder-call-error rec))
-         (keeps-error-text (capture-keeps-span-content-p capture))
          (inv (genai-invocation-from-generation
                payload capture
                :parent-span-id (gen-rec-parent-span-id rec)
                :error-type (when call-error "provider_call_error")
                :error-message (when call-error
-                                (if keeps-error-text
-                                    call-error
-                                    (redacted-error-text call-error)))
+                                (span-error-status-message call-error capture))
                :error-category (classify-error call-error))))
     (let ((start (genai-invocation-started-at-nano inv)))
       (when start
@@ -672,10 +665,7 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
                                                    (tool-rec-duration-seconds rec)
                                                    (recorder-completed-at rec))
                :error-type (when err "tool_execution_error")
-               :error-message (when err
-                                (if (capture-keeps-span-content-p capture)
-                                    err
-                                    (redacted-error-text err)))
+               :error-message (when err (span-error-status-message err capture))
                :extra-attributes (genai-vendor-config-attributes
                                   config :error-category (classify-error err)))))
     ;; The registry spells these two as JSON documents and has no counterpart
@@ -695,7 +685,6 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
   "Build the GenAI-semconv embeddings span for an embedding call."
   (let* ((capture (recorder-capture-mode rec))
          (err (recorder-call-error rec))
-         (parent *trace-context*)
          (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
          (extras (genai-vendor-config-attributes config :error-category (classify-error err)))
          (tokens (emb-rec-input-tokens rec))
@@ -724,9 +713,9 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
      (make-genai-invocation
       :operation "embeddings"
       :capture (otel-capture-mode capture)
-      :trace-id (or (getf parent :trace-id) (generate-trace-id))
-      :span-id (generate-span-id)
-      :parent-span-id (getf parent :span-id)
+      :trace-id (emb-rec-trace-id rec)
+      :span-id (emb-rec-span-id rec)
+      :parent-span-id (emb-rec-parent-span-id rec)
       :provider (otel-provider-name (emb-rec-model-provider rec))
       :request-model (emb-rec-model-name rec)
       :response-model (%trimmed-or-nil (emb-rec-response-model rec))
@@ -740,10 +729,7 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
                                           (emb-rec-duration-seconds rec)
                                           (recorder-completed-at rec))
       :error-type (when err "provider_call_error")
-      :error-message (when err
-                       (if (capture-keeps-span-content-p capture)
-                           err
-                           (redacted-error-text err)))
+      :error-message (when err (span-error-status-message err capture))
       :extra-attributes extras)
      :on-problem (%genai-problem-reporter config))))
 
@@ -752,7 +738,7 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
 This is a divergence from the Go SDK, which drops workflow steps in otel mode.
 Python models them and this SDK already exports a workflow-step span, so the
 step maps onto the conventions' workflow operation rather than disappearing."
-  (let* ((capture (config-content-capture-mode config))
+  (let* ((capture (recorder-capture-mode rec))
          (step-name (or (wfs-rec-step-name rec) "unknown"))
          (err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
          (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
@@ -792,10 +778,7 @@ step maps onto the conventions' workflow operation rather than disappearing."
                                           (wfs-rec-duration-seconds rec)
                                           (recorder-completed-at rec))
       :error-type (when err "workflow_step_error")
-      :error-message (when err
-                       (if (capture-keeps-span-content-p capture)
-                           err
-                           (redacted-error-text err)))
+      :error-message (when err (span-error-status-message err capture))
       :extra-attributes extras)
      :on-problem (%genai-problem-reporter config))))
 
@@ -961,18 +944,22 @@ either exports the whole span tree or none of it."
                        ;; redacts a span error only under metadata_only and
                        ;; full_with_metadata_spans (redactSpanErrors, go/agento11y
                        ;; client.go), and this matches the other span types here.
-                       :status-message (let ((err (or (tool-rec-error-message rec)
-                                                      (recorder-call-error rec))))
-                                         (if err
-                                             (if capture-span err (redacted-error-text err))
-                                             "")))))))))
+                       :status-message (span-error-status-message
+                                        (or (tool-rec-error-message rec)
+                                            (recorder-call-error rec)) capture))))))))
 
 ;;; ================================================================
 ;;; Embedding recorder
 ;;; ================================================================
 
 (defclass embedding-recorder (recorder)
-  ((model-provider   :initarg :model-provider   :accessor emb-rec-model-provider   :initform nil)
+  ((trace-id :initarg :trace-id :accessor emb-rec-trace-id
+              :initform (or (normalized-trace-id (getf *trace-context* :trace-id) 32)
+                            (generate-trace-id)))
+   (span-id :initarg :span-id :accessor emb-rec-span-id :initform (generate-span-id))
+   (parent-span-id :initarg :parent-span-id :accessor emb-rec-parent-span-id
+                   :initform (normalized-trace-id (getf *trace-context* :span-id) 16))
+   (model-provider   :initarg :model-provider   :accessor emb-rec-model-provider   :initform nil)
    (model-name       :initarg :model-name       :accessor emb-rec-model-name       :initform nil)
    (agent-name       :initarg :agent-name       :accessor emb-rec-agent-name       :initform nil)
    (agent-version    :initarg :agent-version    :accessor emb-rec-agent-version    :initform nil)
@@ -1048,10 +1035,9 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
     (when (config-traces-enabled config)
       (let* ((capture (recorder-capture-mode rec))
              (capture-span (capture-keeps-span-content-p capture))
-             (parent *trace-context*)
-             (trace-id (or (getf parent :trace-id) (generate-trace-id)))
-             (parent-span-id (getf parent :span-id))
-             (span-id (generate-span-id))
+             (trace-id (emb-rec-trace-id rec))
+             (parent-span-id (emb-rec-parent-span-id rec))
+             (span-id (emb-rec-span-id rec))
              (provider (or (emb-rec-model-provider rec) ""))
              (model (or (emb-rec-model-name rec) ""))
              (attrs (common-span-attrs config :provider provider :model model
@@ -1109,11 +1095,8 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                            (or (iso8601-to-unix-nano (recorder-completed-at rec)) "0"))
                        :attributes (coerce (nreverse attrs) 'vector)
                        :status-code (if (recorder-call-error rec) 2 1)
-                       :status-message (if (recorder-call-error rec)
-                                           (if capture-span
-                                               (recorder-call-error rec)
-                                               (redacted-error-text (recorder-call-error rec)))
-                                           ""))))))))
+                       :status-message (span-error-status-message
+                                        (recorder-call-error rec) capture))))))))
 
 ;;; ================================================================
 ;;; Workflow step recorder
@@ -1158,7 +1141,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
 
 (defun build-workflow-step-payload (rec config)
   "Build a workflow-step JSON hash-table from the recorder state."
-  (let* ((capture (config-content-capture-mode config))
+  (let* ((capture (recorder-capture-mode rec))
          (capture-content (capture-keeps-payload-content-p capture))
          (step (jobj "id" (wfs-rec-step-id rec)
                      "conversation_id" (or (wfs-rec-conversation-id rec) "")
@@ -1182,7 +1165,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
     (let ((err (or (wfs-rec-error-message rec) (recorder-call-error rec))))
       (when err
         (setf (gethash "error" step)
-              (if capture-content err (redacted-error-text err)))))
+              (if capture-content (condition-status-message err) (redacted-error-text err)))))
     (when (wfs-rec-linked-generation-ids rec)
       (setf (gethash "linked_generation_ids" step)
             (coerce (wfs-rec-linked-generation-ids rec) 'vector)))
@@ -1206,8 +1189,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
          (span-id (wfs-rec-span-id rec))
          (step-name (or (wfs-rec-step-name rec) "unknown"))
          (err (or (wfs-rec-error-message rec) (recorder-call-error rec)))
-         (capture (config-content-capture-mode config))
-         (capture-span (capture-keeps-span-content-p capture))
+         (capture (recorder-capture-mode rec))
          (attrs (common-span-attrs config
                   :provider ""
                   :model ""
@@ -1240,9 +1222,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                   :end-time-unix-nano end-nano
                   :attributes (coerce (nreverse attrs) 'vector)
                   :status-code (if err 2 1)
-                  :status-message (if err
-                                      (if capture-span err (redacted-error-text err))
-                                      "")))))
+                  :status-message (span-error-status-message err capture)))))
 
 (defmethod recorder-end ((rec workflow-step-recorder))
   (let ((config (client-config (recorder-client rec))))

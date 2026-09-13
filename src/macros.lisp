@@ -35,7 +35,8 @@ Binds *trace-context* per-thread so child generation/tool/embedding spans
 are correctly parented to this workflow step."
   `(let ((,var (start-workflow-step ,client ,@initargs)))
      (let ((*trace-context* (child-trace-context
-                             (wfs-rec-trace-id ,var) (wfs-rec-span-id ,var))))
+                             (wfs-rec-trace-id ,var) (wfs-rec-span-id ,var)
+                             :content-capture-mode (recorder-capture-mode ,var))))
        (unwind-protect
             (progn ,@body)
          (recorder-end ,var)))))
@@ -76,10 +77,11 @@ thread constructor."
       (with-telemetry-context (context)
         (funcall thunk)))))
 
-(defmacro with-span ((client name &key (kind 1) attributes-var links) &body body)
+(defmacro with-span ((client name &key (kind 1) attributes-var links content-capture) &body body)
   "Execute BODY wrapped in an OTel span.
-Zero overhead when CLIENT exports no spans at all. The test is
-SPANS-EXPORT-ACTIVE-P rather than the traces-enabled flag, because in otel
+When CLIENT exports no spans, bind only the resolved capture mode and keep
+ambient identifiers. Native generation payloads can still export in this scope.
+The export test is SPANS-EXPORT-ACTIVE-P rather than traces-enabled, because in otel
 generation mode the traces endpoint is the generation destination and the flag
 is unset: reading the flag alone left BODY without a *trace-context* and every
 generation inside it a root span.
@@ -102,12 +104,9 @@ A span that completes reports status Unset, not Ok. The conventions reserve Ok
 for an application that has decided the operation succeeded on its own terms;
 an instrumentation library reporting it for every span that did not signal
 leaves a caller no way to say otherwise. A span whose body signalled reports
-Error, with the condition's own message as the status description -- the type
-name alone said only that something of that class was raised, which for a
-caller that signals one condition type to mark its spans is no information at
-all. Rendering the condition can itself signal -- a report method that reads a
-slot the condition was built without does -- so the type name remains the
-fallback.
+Error. CONTENT-CAPTURE resolves before BODY: per-call, parent, resolver, client.
+Restricted modes report an error category; other modes use CONDITION-STATUS-MESSAGE.
+The resolved mode is also carried to child recorders.
 
 The exported span reads its trace id, span id and parent back OUT of that bound
 context rather than from the lexicals it was minted into, so BODY can re-root
@@ -116,6 +115,7 @@ inbound trace only after authenticating the caller is why: reading the lexicals
 made such a write a silent no-op, exporting the span under the local trace while
 the caller was told it had been adopted."
   (let ((attrs-var (or attributes-var (gensym "ATTRS-")))
+        (capture-var (gensym "CAPTURE-"))
         (start-nano (gensym "START-"))
         (ok (gensym "OK-"))
         (err-message (gensym "ERR-"))
@@ -131,14 +131,27 @@ the caller was told it had been adopted."
            (,client-var ,client))
        (declare (ignorable ,attrs-var))
        (if (not (spans-export-active-p (client-config ,client-var)))
-           (progn ,@body)
+           (let* ((,capture-var (resolve-content-capture-mode
+                                (client-config ,client-var)
+                                :override ,content-capture
+                                :parent-mode (getf *trace-context* :content-capture-mode)))
+                  (*trace-context* (copy-list *trace-context*)))
+             ;; No span exists here to parent under. Copy the context so the
+             ;; capture override cannot change the enclosing scope's policy.
+             (setf (getf *trace-context* :content-capture-mode) ,capture-var)
+             ,@body)
            (let* ((,name-var ,name)
+                  (,capture-var (resolve-content-capture-mode
+                                 (client-config ,client-var)
+                                 :override ,content-capture
+                                 :parent-mode (getf *trace-context* :content-capture-mode)))
                   (,trace-id-var (or (getf *trace-context* :trace-id)
                                      (generate-trace-id)))
                   (,parent-var (getf *trace-context* :span-id))
                   (,span-id-var (generate-span-id))
                   (,ctx-var (child-trace-context ,trace-id-var ,span-id-var
-                                                 :parent-span-id ,parent-var))
+                                                 :parent-span-id ,parent-var
+                                                 :content-capture-mode ,capture-var))
                   (,start-nano (current-unix-nano))
                   (,ok t)
                   (,err-message nil)
@@ -151,7 +164,7 @@ the caller was told it had been adopted."
                           (values-list ,vals))
                       (error (e)
                         (setf ,ok nil
-                              ,err-message (condition-status-message e))
+                              ,err-message (span-error-status-message e ,capture-var))
                         (error e))))
                (handler-case
                    (let* ((end-nano (current-unix-nano))

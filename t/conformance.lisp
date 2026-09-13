@@ -1039,6 +1039,26 @@ the fixture span beside it."
 
 (defun run-genai-conformance-tests ()
   (with-test-suite ("GenAI wire conformance (t/fixtures/otlpwire)")
+    ;; Direct callers do not pass through a recorder's capture gate.
+    (dolist (capture '(:no-content :span-only :event-only :span-and-event :invalid))
+      (dolist (error '("status=429 DIRECT-SECRET-SENTINEL" "rate_limit"))
+        (let* ((inv (agento11y-cl::make-genai-invocation
+                     :capture capture :error-message error
+                     :trace-id "123456789abcdef0123456789abcdef0"
+                     :span-id "123456789abcdef0"))
+               (span (agento11y-cl::build-genai-span inv))
+               (wire (jzon:stringify
+                      (agento11y-cl::build-otlp-payload (list span) "test" nil))))
+          (check "direct builder retains error status" (eql (jget* span "status" "code") 2))
+          (check "direct builder retains error type"
+                 (find "error.type" (jget span "attributes")
+                       :key (lambda (attr) (jget attr "key")) :test #'equal))
+          (check "direct status obeys GenAI span capture vocabulary"
+                 (equal (jget* span "status" "message")
+                        (if (member capture '(:span-only :span-and-event)) error "rate_limit")))
+          (check "direct no-content export has no sentinel anywhere"
+                 (or (member capture '(:span-only :span-and-event))
+                     (not (search "DIRECT-SECRET-SENTINEL" wire)))))))
     (dolist (name +cf-genai-fixtures+)
       (let ((diffs (cf-genai-span-diffs name)))
         (check (cf-label (format nil "~a span matches the fixture" name) diffs)

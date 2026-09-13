@@ -241,8 +241,8 @@ at record time, the backend derives a zero latency, and the exported span is
 shifted forward by its own duration.
 
 CONTENT-CAPTURE sets the capture mode for this generation only, ahead of the
-capture-mode resolver and the client-level mode. A tool execution opened inside
-`with-generation` inherits the mode resolved here.
+enclosing span's resolved mode, the resolver and the client-level mode.
+Children opened inside `with-generation` inherit the mode resolved here.
 
 TRACE-ID and SPAN-ID name the span this generation will export, for a caller
 that has to know the identifiers BEFORE the recorder opens. A recorder opened
@@ -255,16 +255,17 @@ passing it here is what nests it.
 Both are optional and independent, each falling back to the inherited or
 generated value. PARENT-SPAN-ID is never overridden: the pair names this span,
 not its place in the tree, which stays whatever *TRACE-CONTEXT* says. A value
-that is not hex of the right width is ignored in favor of the generated one,
-because a malformed identifier is rejected by the collector for the whole OTLP
-batch rather than for the one span that carried it."
+that is zero, nonhex, or the wrong width is ignored. Accepted IDs are normalized
+to lowercase. Invalid trace overrides fall back to the ambient trace, then a
+generated trace; invalid span overrides get a generated span. Ambient IDs are
+also validated because malformed identifiers can invalidate an entire OTLP batch."
   (let* ((config (client-config client))
          (run *experiment-run*)
          (ctx *trace-context*)
-         (inherited-trace-id (getf ctx :trace-id))
-         (inherited-parent-span-id (getf ctx :span-id))
-         (caller-trace-id (when (trace-hex-id-p trace-id 32) trace-id))
-         (caller-span-id (when (trace-hex-id-p span-id 16) span-id)))
+         (inherited-trace-id (normalized-trace-id (getf ctx :trace-id) 32))
+         (inherited-parent-span-id (normalized-trace-id (getf ctx :span-id) 16))
+         (caller-trace-id (normalized-trace-id trace-id 32))
+         (caller-span-id (normalized-trace-id span-id 16)))
     (when run
       (let ((prepared (%experiment-run-prepare-generation-options
                        run client
@@ -282,7 +283,8 @@ batch rather than for the one span that carried it."
       :client client
       :started-at (or started-at (iso8601-now))
       :content-capture-mode (resolve-content-capture-mode
-                             config :override content-capture :metadata metadata)
+                             config :override content-capture :metadata metadata
+                             :parent-mode (getf ctx :content-capture-mode))
       :generation-id (or generation-id (generate-id))
       :trace-id (or caller-trace-id inherited-trace-id (generate-trace-id))
       :span-id (or caller-span-id (generate-span-id))
@@ -340,19 +342,27 @@ capture-mode resolver, then the client-level mode."
 
 (defun start-embedding (client &key model-provider model-name
                                      agent-name agent-version source
-                                     dimensions encoding-format started-at)
+                                     dimensions encoding-format started-at
+                                     trace-id span-id)
   "Create and start an embedding recorder.
 DIMENSIONS is the requested dimension count; a result dimension count set later
 via set-result takes precedence over it on the span.
 STARTED-AT overrides the wall clock; see START-GENERATION.
 
-An embedding has no per-call capture mode, matching the reference SDKs: its
-mode comes from the capture-mode resolver, then the client-level mode."
+Capture inherits the enclosing span's resolved mode, then the resolver and
+client mode. TRACE-ID and SPAN-ID follow START-GENERATION's independent override
+rules. IDs and the ambient parent are snapshotted here, not at RECORDER-END."
   (let ((config (client-config client)))
     (make-instance 'embedding-recorder
       :client client
       :started-at (or started-at (iso8601-now))
-      :content-capture-mode (resolve-content-capture-mode config)
+      :content-capture-mode (resolve-content-capture-mode
+                             config :parent-mode (getf *trace-context* :content-capture-mode))
+      :trace-id (or (normalized-trace-id trace-id 32)
+                    (normalized-trace-id (getf *trace-context* :trace-id) 32)
+                    (generate-trace-id))
+      :span-id (or (normalized-trace-id span-id 16) (generate-span-id))
+      :parent-span-id (normalized-trace-id (getf *trace-context* :span-id) 16)
       :model-provider model-provider
       :model-name model-name
       :agent-name (%resolve-agent-name config agent-name)
@@ -369,12 +379,17 @@ mode comes from the capture-mode resolver, then the client-level mode."
                                          started-at)
   "Create and start a workflow step recorder.
 Auto-generates step-id, trace-id, span-id, and started-at so callers can read
-them immediately to build parent-step-id chains.
+them immediately to build parent-step-id chains. The step opens a new trace but
+inherits the ambient capture mode. Without a parent mode, it uses the resolver
+(with METADATA) then the client mode. Payload and span gates use this frozen mode.
 STARTED-AT overrides the wall clock; see START-GENERATION."
   (let ((config (client-config client)))
     (make-instance 'workflow-step-recorder
       :client client
       :started-at (or started-at (iso8601-now))
+      :content-capture-mode (resolve-content-capture-mode
+                             config :metadata metadata
+                             :parent-mode (getf *trace-context* :content-capture-mode))
       :step-id (generate-workflow-step-id)
       :trace-id (generate-trace-id)
       :span-id (generate-span-id)

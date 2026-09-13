@@ -158,8 +158,50 @@ experiment-runs branch, whose prefix they share."
 ;;; Test suites
 ;;; ================================================================
 
+(define-condition broken-status-report (error) ()
+  (:report (lambda (condition stream)
+             (declare (ignore condition stream))
+             (error "report failed"))))
+
+(define-condition private-status-error (error) ()
+  (:report (lambda (condition stream)
+             (declare (ignore condition))
+             (write-string "SQL-SECRET-SENTINEL" stream))))
+
+(defmethod condition-status-message ((condition private-status-error))
+  (declare (ignore condition))
+  "client_error")
+
+(define-condition marked-status-error (error)
+  ((detail :initarg :detail :reader marked-status-detail)))
+
+(defmethod condition-status-message ((condition marked-status-error))
+  (condition-status-message (marked-status-detail condition)))
+
+(define-condition broken-status-method (error) ())
+
+(defmethod condition-status-message ((condition broken-status-method))
+  (declare (ignore condition))
+  (error "formatter failed"))
+
 (defun run-util-tests ()
   (with-test-suite ("Util")
+    (dolist (width '(16 32))
+      (dolist (bad (list nil 12 "abc" (make-string width :initial-element #\0)
+                        (make-string width :initial-element #\g)
+                        (make-string (1+ width) :initial-element #\a)))
+        (check "IDs reject wrong width, nonhex and zero" (not (trace-hex-id-p bad width)))))
+    (dolist (condition (list (make-condition 'broken-status-report)
+                            (make-condition 'broken-status-method)))
+      (check "formatting failure falls back to the type name"
+             (equal (condition-status-message condition) (princ-to-string (type-of condition))))
+      (check "classification tolerates broken formatting"
+             (equal (agento11y-cl::classify-error condition) "sdk_error")))
+    (check "application specialization protects all-mode text"
+           (equal (condition-status-message (make-condition 'private-status-error)) "client_error"))
+    (dolist (category '("rate_limit" "auth_error" "server_error" "client_error" "timeout" "sdk_error"))
+      (check "category survives repeated redaction"
+             (equal (agento11y-cl::redacted-error-text category) category)))
     ;; ID generation
     (let ((id1 (agento11y-cl::generate-id))
           (id2 (agento11y-cl::generate-id)))
@@ -926,7 +968,7 @@ experiment-runs branch, whose prefix they share."
         (check "a span that completes reports no status"
                (null (nth-value 1 (gethash "status" span)))))
       (ignore-errors
-       (with-span (client "loud")
+       (with-span (client "loud" :content-capture :full)
          (error "upstream refused the request")))
       (let ((span (first (agento11y-cl::queue-drain-all
                           (agento11y-cl::client-trace-queue client)))))
@@ -1003,6 +1045,109 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-recorder-tests ()
   (with-test-suite ("Recorder")
+    ;; Inspect the whole mocked OTLP request, not only selected attributes.
+    (dolist (protocol '(:http :otel))
+      (dolist (mode '(:full :no-tool-content :full-with-metadata-spans :metadata-only :invalid))
+        (dolist (failure (list nil "status=429 WIRE-SECRET-SENTINEL"
+                              (make-condition 'broken-status-report)
+                              (make-condition 'private-status-error)
+                              (make-condition 'marked-status-error
+                                              :detail (make-condition 'private-status-error))))
+          (multiple-value-bind (client requests)
+              (make-test-client :capture mode :generation-protocol protocol
+                                :experimental-features t :workflow-steps-enabled t)
+            (let* ((config (agento11y-cl::client-config client))
+                   (recs (list (start-generation client :model-name "m")
+                               (start-tool-execution client :tool-name "tool")
+                               (start-embedding client :model-name "m")
+                               (start-workflow-step client :step-name "step"))))
+              ;; Changing the client after start must not widen any recorder.
+              (setf (slot-value config 'agento11y-cl::content-capture-mode) :full)
+              (dolist (rec recs)
+                (when failure
+                  (set-call-error rec failure)
+                  (when (or (typep rec 'agento11y-cl::tool-execution-recorder)
+                            (typep rec 'agento11y-cl::workflow-step-recorder))
+                    (set-result rec :error-message failure)))
+                (recorder-end rec)
+                (recorder-end rec)
+                (check "recording retains the original error object"
+                       (eq failure (agento11y-cl::recorder-call-error rec))))
+              (let ((spans (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client))))
+                (check "four recorders export exactly once" (= (length spans) 4))
+                (dolist (span spans)
+                  (check "protocol success status is unchanged; errors remain code 2"
+                         (if failure
+                             (eql (jget* span "status" "code") 2)
+                             (if (eq protocol :http)
+                                 (eql (jget* span "status" "code") 1)
+                                 (null (jget span "status"))))))
+                (agento11y-cl::export-traces config spans nil)
+                (let ((wire (second (first (funcall requests)))))
+                  (check "wire error text obeys the start-time span gate"
+                         (eq (not (null (search "WIRE-SECRET-SENTINEL" wire)))
+                             (and (stringp failure)
+                                  (not (null (member mode '(:full :no-tool-content)))))))
+                  (check "typed error specialization protects the complete wire"
+                         (not (search "SQL-SECRET-SENTINEL" wire)))))
+              (when (stringp failure)
+                (let ((workflow (first (agento11y-cl::queue-drain-all
+                                        (agento11y-cl::client-workflow-queue client)))))
+                  (check "workflow payload uses the frozen payload gate"
+                         (equal (jget workflow "error")
+                                (if (member mode '(:full :no-tool-content :full-with-metadata-spans))
+                                    failure "rate_limit"))))))))))
+    ;; Both builders must export the identity visible before the provider call.
+    (dolist (protocol '(:http :otel))
+      (let* ((client (make-test-client :generation-protocol protocol :experimental-features t))
+             (trace "ABCDEF0123456789ABCDEF0123456789")
+             (span "ABCDEF0123456789")
+             (parent "123456789abcdef0")
+             (rec (let ((*trace-context* (list :trace-id trace :span-id parent)))
+                    (start-embedding client :trace-id trace :span-id span))))
+        (check "embedding IDs are available and lowercase at start"
+               (and (equal (emb-rec-trace-id rec) (string-downcase trace))
+                    (equal (emb-rec-span-id rec) (string-downcase span))
+                    (equal (emb-rec-parent-span-id rec) parent)))
+        (let ((*trace-context* nil)) (recorder-end rec))
+        (let ((wire (first (agento11y-cl::queue-drain-all
+                           (agento11y-cl::client-trace-queue client)))))
+          (check "embedding export ignores end-time ambient context"
+                 (and (equal (jget wire "traceId") (emb-rec-trace-id rec))
+                      (equal (jget wire "spanId") (emb-rec-span-id rec))
+                      (equal (jget wire "parentSpanId") parent))))
+        (dolist (factory (list #'start-generation #'start-embedding))
+          (dolist (bad '("0000000000000000" "not-hex" "00000000000000000000000000000000"))
+            (let* ((rec (funcall factory client :trace-id bad :span-id bad))
+                   (embedding (typep rec 'agento11y-cl::embedding-recorder)))
+              (check "invalid caller IDs fall back to valid nonzero IDs"
+                     (and (trace-hex-id-p (if embedding (emb-rec-trace-id rec) (gen-rec-trace-id rec)) 32)
+                          (trace-hex-id-p (if embedding (emb-rec-span-id rec) (gen-rec-span-id rec)) 16))))))))
+    (dolist (protocol '(:http :otel))
+      (let ((client (make-test-client :generation-protocol protocol :experimental-features t)))
+        (with-workflow-step (w client :step-name "identity")
+          (let* ((trace (wfs-rec-trace-id w))
+                 (span "abcdef0123456789")
+                 (rec (start-embedding client :trace-id trace :span-id span)))
+            (check "workflow-local pre-minted embedding identity is accepted"
+                   (and (equal (emb-rec-trace-id rec) trace)
+                        (equal (emb-rec-span-id rec) span)
+                        (equal (emb-rec-parent-span-id rec) (wfs-rec-span-id w))))
+            (recorder-end rec))
+          (dolist (factory (list #'start-generation #'start-embedding))
+            (let* ((rec (funcall factory client :trace-id "invalid" :span-id "ABCDEF0123456789"))
+                   (embedding (typep rec 'agento11y-cl::embedding-recorder)))
+              (check "overrides are independent; invalid trace retains workflow trace"
+                     (and (equal (if embedding (emb-rec-trace-id rec) (gen-rec-trace-id rec))
+                                 (wfs-rec-trace-id w))
+                          (equal (if embedding (emb-rec-span-id rec) (gen-rec-span-id rec))
+                                 "abcdef0123456789"))))
+            (let* ((rec (funcall factory client :trace-id "123456789abcdef0123456789abcdef0"))
+                   (embedding (typep rec 'agento11y-cl::embedding-recorder)))
+              (check "SDK preserves explicit cross-trace override compatibility inside workflows"
+                     (equal (if embedding (emb-rec-trace-id rec) (gen-rec-trace-id rec))
+                            "123456789abcdef0123456789abcdef0")))))))
     ;; Generation recorder lifecycle
     (multiple-value-bind (client get-requests) (make-test-client)
       (let ((rec (start-generation client
@@ -3187,6 +3332,258 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-macro-tests ()
   (with-test-suite ("Macros")
+    ;; Native generations still export when generic spans are disabled.
+    (let ((client (make-test-client :capture :full :traces-enabled nil))
+          (*trace-context* nil))
+      (with-span (client "private" :content-capture :metadata-only)
+        (with-generation (rec client)
+          (set-call-error rec "SECRET")))
+      (check "disabled with-span withholds SECRET from native call_error"
+             (equal (jget (first (agento11y-cl::queue-drain-all
+                                  (agento11y-cl::client-generation-queue client)))
+                          "call_error") "sdk_error")))
+    (dolist (traces-enabled '(nil t))
+      (dolist (protocol '(:http :otel))
+        (dolist (mode '(:metadata-only :full-with-metadata-spans))
+          (multiple-value-bind (client requests)
+              (make-test-client :capture :full :traces-enabled traces-enabled
+                                :generation-protocol protocol :experimental-features t
+                                :workflow-steps-enabled t :embedding-capture-input t)
+            (let ((failure "status=429 DISABLED-SPAN-SECRET")
+                  (*trace-context* nil))
+              (flet ((record-error (rec)
+                       (check (format nil "~a traces=~a ~a: ~a inherits generic capture"
+                                      protocol traces-enabled mode (type-of rec))
+                              (eq (agento11y-cl::recorder-capture-mode rec) mode))
+                       (set-call-error rec failure)
+                       (when (or (typep rec 'agento11y-cl::tool-execution-recorder)
+                                 (typep rec 'agento11y-cl::workflow-step-recorder))
+                         (set-result rec :error-message failure))))
+                (ignore-errors
+                  (with-span (client "private" :content-capture mode)
+                    (with-span (client "nested")
+                      (with-generation (g client :model-name "m" :system-prompt failure)
+                        (record-error g)
+                        (with-tool-execution (tool client :tool-name "tool" :tool-description failure)
+                          (record-error tool)
+                          (set-result tool :arguments failure :result failure))
+                        (with-embedding (emb client :model-name "m")
+                          (record-error emb)
+                          (set-result emb :input-texts (list failure)))
+                        (with-workflow-step (step client :step-name "step" :input-state failure)
+                          (record-error step)
+                          (with-generation (child client :model-name "child")
+                            (record-error child))))
+                      (error failure)))))
+              (let ((generations (agento11y-cl::queue-drain-all
+                                  (agento11y-cl::client-generation-queue client)))
+                    (workflows (agento11y-cl::queue-drain-all
+                                (agento11y-cl::client-workflow-queue client)))
+                    (spans (agento11y-cl::queue-drain-all
+                            (agento11y-cl::client-trace-queue client)))
+                    (payload-error (if (eq mode :metadata-only) "rate_limit" failure)))
+                (check "nested generation payload count follows protocol"
+                       (= (length generations) (if (eq protocol :http) 2 0)))
+                (dolist (generation generations)
+                  (check "nested native call_error follows inherited payload gate"
+                         (equal (jget generation "call_error") payload-error)))
+                (check "workflow payload keeps its separate capture gate"
+                       (and (= (length workflows) 1)
+                            (equal (jget (first workflows) "error") payload-error)))
+                (check "disabled native spans are not fabricated; GenAI still exports"
+                       (= (length spans) (if (or traces-enabled (eq protocol :otel)) 7 0)))
+                (dolist (span spans)
+                  (check "nested restricted span errors keep code and category"
+                         (and (eql (jget* span "status" "code") 2)
+                              (equal (jget* span "status" "message") "rate_limit"))))
+                (when spans
+                  (agento11y-cl::export-traces (agento11y-cl::client-config client) spans nil)
+                  (check "neither restricted mode leaks content in the complete OTLP request"
+                         (not (search "DISABLED-SPAN-SECRET"
+                                      (second (first (funcall requests)))))))))))))
+    ;; A capture-only scope keeps the ambient identifiers and other context keys.
+    (dolist (ambient (list nil
+                          (list :trace-id "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                :span-id "bbbbbbbbbbbbbbbb"
+                                :parent-span-id "cccccccccccccccc"
+                                :content-capture-mode :full :caller-data (list :token))))
+      (let* ((client (make-test-client :capture :full :traces-enabled nil))
+             (*trace-context* ambient)
+             (snapshot (copy-list ambient))
+             (options 0) (bodies 0))
+        (check "capture-only scope preserves multiple values"
+               (equal
+                (multiple-value-list
+                 (with-span ((progn (incf options) client) (error "name must stay unevaluated")
+                             :kind (error "kind must stay unevaluated")
+                             :links (error "links must stay unevaluated")
+                             :attributes-var attrs
+                             :content-capture (progn (incf options) :metadata-only))
+                   (incf bodies)
+                   (push (otel-string-attr "local" "value") attrs)
+                   (check "capture-only scope does not change trace identity or caller data"
+                          (every (lambda (key) (eq (getf *trace-context* key) (getf ambient key)))
+                                 '(:trace-id :span-id :parent-span-id :caller-data)))
+                   (check "capture-only scope publishes the resolved mode"
+                          (eq (getf *trace-context* :content-capture-mode) :metadata-only))
+                   (with-generation (g client)
+                     (check "generation keeps the real ambient parent, or remains a root"
+                            (equal (agento11y-cl::gen-rec-parent-span-id g) (getf ambient :span-id))))
+                   (values 1 nil 3)))
+                '(1 nil 3)))
+        (check "capture-only scope evaluates client, override and body once"
+               (and (= options 2) (= bodies 1)))
+        (check "capture-only scope preserves zero values"
+               (null (multiple-value-list (with-span (client "zero") (values)))))
+        (check "capture-only scope preserves nonlocal exit values"
+               (equal (multiple-value-list
+                       (catch 'exit
+                         (with-span (client "exit" :content-capture :metadata-only)
+                           (throw 'exit (values 4 5))))) '(4 5)))
+        (dolist (condition (list (make-condition 'broken-status-report)
+                                (make-condition 'private-status-error)
+                                (make-condition 'broken-status-method)))
+          (check "capture-only scope preserves the original condition object"
+                 (eq condition
+                     (handler-case
+                         (with-span (client "error" :content-capture :metadata-only)
+                           (error condition))
+                       (error (e) e)))))
+        (check "capture-only exits restore the same unmodified ambient context"
+               (and (eq *trace-context* ambient) (equal ambient snapshot)))
+        (check "capture-only scope never queues a generic span"
+               (null (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))))
+    (dolist (source '(:override :parent :resolver :client :invalid :resolver-error))
+      (let* ((calls 0)
+             (client (make-test-client
+                      :traces-enabled nil
+                      :capture (if (eq source :client) :metadata-only :full)
+                      :content-capture-resolver
+                      (unless (eq source :client)
+                        (lambda (metadata)
+                          (check "capture-only resolver receives nil metadata" (null metadata))
+                          (incf calls)
+                          (if (eq source :resolver-error) (error "resolver failed") :metadata-only)))))
+             (*trace-context* (when (eq source :parent) (list :content-capture-mode :metadata-only))))
+        (with-span (client "resolve" :content-capture
+                           (case source (:override :metadata-only) (:invalid :invalid)))
+          (setf (slot-value (agento11y-cl::client-config client) 'agento11y-cl::content-capture-mode) :full)
+          (with-span (client "inherit")
+            (dolist (factory (list #'start-generation #'start-tool-execution
+                                  #'start-embedding #'start-workflow-step))
+              (check "capture-only mode stays frozen across nested spans and all factories"
+                     (eq (agento11y-cl::recorder-capture-mode (funcall factory client)) :metadata-only)))
+            (check "explicit child override still wins in capture-only scope"
+                   (eq (agento11y-cl::recorder-capture-mode
+                        (start-generation client :content-capture :full)) :full))))
+        (check "capture-only resolution calls the resolver at most once"
+               (= calls (if (member source '(:resolver :resolver-error)) 1 0)))))
+    (let ((client (noop-client))
+          (bodies 0)
+          (*trace-context* nil))
+      (check "noop client still executes the body and returns its values"
+             (equal (multiple-value-list
+                     (with-span (client (error "noop name") :content-capture :metadata-only)
+                       (incf bodies)
+                       (values :noop nil))) '(:noop nil)))
+      (check "noop client exports no span and restores nil context"
+             (and (= bodies 1) (null *trace-context*)
+                  (null (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client)))))
+      (check "nil client still signals before evaluating options or body"
+             (handler-case
+                 (with-span (nil (incf bodies) :content-capture (incf bodies))
+                   (incf bodies)
+                   nil)
+               (error () (= bodies 1)))))
+    (dolist (protocol '(:http :otel))
+      (dolist (mode '(:full :no-tool-content :full-with-metadata-spans :metadata-only :invalid))
+        (multiple-value-bind (client requests)
+            (make-test-client :capture :full :generation-protocol protocol :experimental-features t)
+          (let ((original (make-condition 'simple-error :format-control "status=429 GENERIC-SECRET-SENTINEL")))
+            (check "generic error preserves condition identity"
+                   (eq original
+                       (handler-case
+                           (with-span (client "outer" :content-capture mode)
+                             (check "generic capture inherited by every child factory"
+                                    (every (lambda (rec)
+                                             (eq (agento11y-cl::recorder-capture-mode rec)
+                                                 (if (eq mode :invalid) :metadata-only mode)))
+                                           (mapcar (lambda (factory) (funcall factory client))
+                                                   (list #'start-generation #'start-tool-execution
+                                                         #'start-embedding #'start-workflow-step))))
+                             (error original))
+                         (error (e) e))))
+            (let ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
+              (check "generic failure remains an error" (eql (jget* (first spans) "status" "code") 2))
+              (agento11y-cl::export-traces (agento11y-cl::client-config client) spans nil)
+              (check "generic whole-wire status follows capture"
+                     (eq (not (null (search "GENERIC-SECRET-SENTINEL" (second (first (funcall requests))))))
+                         (not (null (member mode '(:full :no-tool-content)))))))))))
+    (dolist (mode '(:metadata-only :full-with-metadata-spans))
+      (let* ((client (make-test-client :capture mode))
+             (original (make-condition 'simple-error :format-control "status=429 MUTATION-SECRET")))
+        (ignore-errors
+          (with-span (client "mutating-config")
+            (setf (slot-value (agento11y-cl::client-config client) 'agento11y-cl::content-capture-mode) :full)
+            (error original)))
+        (check "generic snapshots client mode before body mutation"
+               (equal (jget* (first (agento11y-cl::queue-drain-all
+                                    (agento11y-cl::client-trace-queue client)))
+                             "status" "message") "rate_limit"))))
+    (let* ((calls 0)
+           (client (make-test-client :capture :full
+                                    :content-capture-resolver (lambda (metadata)
+                                                                (declare (ignore metadata))
+                                                                (incf calls)
+                                                                :metadata-only))))
+      (ignore-errors
+        (with-span (client "frozen")
+          (setf (slot-value (agento11y-cl::client-config client) 'agento11y-cl::content-capture-mode) :full)
+          (with-workflow-step (w client :step-name "step")
+            (check "workflow publishes its frozen mode"
+                   (eq (getf *trace-context* :content-capture-mode) :metadata-only)))
+          (error "status=429 SECRET")))
+      (check "resolver called once for enclosing span, children inherit" (= calls 1))
+      (let ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
+        (check "generic config mutation cannot widen status"
+               (equal (jget* (car (last spans)) "status" "message") "rate_limit"))))
+    (let ((client (make-test-client :capture :full
+                                    :log-fn (lambda (&rest args)
+                                              (declare (ignore args))
+                                              (error "diagnostic failed"))
+                                    :content-capture-resolver (lambda (metadata)
+                                                                (declare (ignore metadata))
+                                                                (error (make-condition 'broken-status-report))))))
+      (with-span (client "resolver-failure")
+        (check "broken resolver fails closed"
+               (eq (getf *trace-context* :content-capture-mode) :metadata-only))))
+    (let ((client (make-test-client :capture :metadata-only))
+          (options 0) (bodies 0))
+      (with-span (client "evaluated-once" :content-capture (progn (incf options) :full))
+        (incf bodies))
+      (check "generic evaluates content override and body once" (and (= options 1) (= bodies 1)))
+      (let ((*trace-context* (list :content-capture-mode :invalid)))
+        (with-span (client "invalid-parent")
+          (check "invalid inherited mode fails closed"
+                 (eq (getf *trace-context* :content-capture-mode) :metadata-only))))
+      (check "generic preserves multiple return values"
+             (equal (multiple-value-list (with-span (client "values") (values 1 2 3))) '(1 2 3)))
+      (check "generic preserves nonlocal exit values"
+             (equal (multiple-value-list
+                     (catch 'exit (with-span (client "throw") (throw 'exit (values 4 5))))) '(4 5)))
+      (dolist (condition (list (make-condition 'broken-status-report)
+                              (make-condition 'private-status-error)
+                              (make-condition 'marked-status-error
+                                              :detail (make-condition 'private-status-error))
+                              (make-condition 'broken-status-method)))
+        (check "generic preserves typed errors despite formatter failures"
+               (eq condition (handler-case (with-span (client "typed" :content-capture :full)
+                                             (error condition))
+                               (error (e) e)))))
+      (with-span (client "override" :content-capture :full)
+        (check "explicit generation override wins over parent"
+               (eq (agento11y-cl::recorder-capture-mode
+                    (start-generation client :content-capture :metadata-only)) :metadata-only))))
     ;; with-generation auto-ends
     (multiple-value-bind (client get-requests) (make-test-client)
       (declare (ignore get-requests))
@@ -3520,8 +3917,8 @@ experiment-runs branch, whose prefix they share."
           (declare (ignore get-requests))
           (with-experiment (run client :run-id "exp-threads" :name "threads")
             (setf run-object run)
-            (let ((*trace-context* (list :trace-id "trace-parent"
-                                         :span-id "span-parent")))
+            (let ((*trace-context* (list :trace-id "123456789abcdef0123456789abcdef0"
+                                         :span-id "123456789abcdef0")))
               (let ((context (capture-telemetry-context)))
                 (setf child-rec
                       (bt2:join-thread
@@ -3557,9 +3954,9 @@ experiment-runs branch, whose prefix they share."
                             (experiment-run-produced-generation-ids run-object)
                             :test #'equal)))
         (check "child-thread generation inherits the captured trace id"
-               (equal (gen-rec-trace-id child-rec) "trace-parent"))
+               (equal (gen-rec-trace-id child-rec) "123456789abcdef0123456789abcdef0"))
         (check "child-thread generation parents to the captured span"
-               (equal (agento11y-cl::gen-rec-parent-span-id child-rec) "span-parent"))
+               (equal (agento11y-cl::gen-rec-parent-span-id child-rec) "123456789abcdef0"))
         (let ((carried (exported-generation calls "generation-child"))
               (orphan (exported-generation calls "generation-orphan")))
           (check "child-thread generation carries the run-id tag"
@@ -7832,6 +8229,24 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-otel-genai-tests ()
   (with-test-suite ("OTel GenAI export")
+    (dolist (capture '(:no-content :span-only))
+      (dolist (condition (list (make-condition 'broken-status-report)
+                              (make-condition 'broken-status-method)
+                              (make-condition 'private-status-error)))
+        (let* ((inv (agento11y-cl::make-genai-invocation
+                     :capture capture :error-message condition
+                     :trace-id "123456789abcdef0123456789abcdef0"
+                     :span-id "123456789abcdef0"))
+               (span (agento11y-cl::build-genai-span inv)))
+          (check "direct GenAI builder recognizes typed errors without explicit error.type"
+                 (eql (jget* span "status" "code") 2))
+          (check "direct GenAI builder keeps the original error object"
+                 (eq condition (agento11y-cl::genai-invocation-error-message inv)))
+          (check "direct GenAI builder tolerates failed reporters and specialized formatters"
+                 (equal (jget* span "status" "message")
+                        (if (eq capture :span-only)
+                            (condition-status-message condition)
+                            (agento11y-cl::redacted-error-text condition)))))))
 
     ;; --- Part encoding: field order, the empty-not-omitted rule, and the
     ;; --- null for an absent arguments or response document.

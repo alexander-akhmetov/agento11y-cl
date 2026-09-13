@@ -60,8 +60,8 @@
    ;; Content capture
    (content-capture-mode :initarg :content-capture-mode :reader config-content-capture-mode
                          :initform :no-tool-content)
-   ;; Called when a generation, tool execution, or embedding starts and no
-   ;; closer setting has decided its capture mode. Takes the metadata supplied
+   ;; Called when a recorder or generic span starts and no closer setting has
+   ;; decided its capture mode. Takes the metadata supplied
    ;; at start (NIL where the recording type carries none) and returns a mode,
    ;; or NIL to defer to the client-level mode. Metadata a later set-result call
    ;; supplies is not seen: the mode is resolved once, at start, which is what
@@ -182,10 +182,10 @@ acts on."
 
 ;;; --- Content capture mode resolution ---
 ;;;
-;;; Precedence, from the shared docs/concepts/content-capture-modes.md:
-;;;   generation      per-call > resolver > client
-;;;   tool execution  per-call > parent generation's resolved mode > resolver > client
-;;;   embedding       resolver > client
+;;; Generation, tool execution and generic span:
+;;;   per-call > resolved parent > resolver > client
+;;; Embedding and workflow step:
+;;;   resolved parent > resolver > client
 ;;; A mode is resolved once, when the recorder starts, and held on the recorder,
 ;;; so a config change mid-call cannot move a recording between modes. A layer
 ;;; defers by holding NIL or :default; only the client-level mode is final.
@@ -199,9 +199,10 @@ resolves to :metadata-only."
     ((null mode) nil)
     ((eq mode :default) nil)
     ((valid-content-capture-mode-p mode) mode)
-    (t (agento11y-log config :warn "config"
-                      (format nil "ignoring ~a content capture mode ~s (unsupported value), using :metadata-only"
-                              source mode))
+    (t (ignore-errors
+         (agento11y-log config :warn "config"
+                       (format nil "ignoring ~a content capture mode ~s (unsupported value), using :metadata-only"
+                               source mode)))
        :metadata-only)))
 
 (defun %resolve-capture-mode-from-resolver (config metadata)
@@ -214,20 +215,22 @@ leaves the process."
       (handler-case
           (%capture-mode-choice config (funcall resolver metadata) "resolver")
         (error (e)
-          (agento11y-log config :warn "config"
-                         (format nil "content capture resolver failed: ~a, using :metadata-only"
-                                 (princ-to-string e)))
+          (ignore-errors
+            (agento11y-log config :warn "config"
+                           (format nil "content capture resolver failed: ~a, using :metadata-only"
+                                   (condition-status-message e))))
           :metadata-only)))))
 
 (defun resolve-content-capture-mode (config &key override parent-mode metadata)
   "Effective capture mode for one recording.
-OVERRIDE is the per-call mode, PARENT-MODE the mode a parent generation already
+OVERRIDE is the per-call mode, PARENT-MODE the mode an enclosing span already
 resolved to, METADATA what the resolver is given. A layer that decides the mode
 stops the chain, so a per-call mode leaves the resolver uncalled."
   (or (%capture-mode-choice config override "per-call")
-      parent-mode
+      (%capture-mode-choice config parent-mode "parent")
       (%resolve-capture-mode-from-resolver config metadata)
-      (config-content-capture-mode config)))
+      (%capture-mode-choice config (config-content-capture-mode config) "client")
+      :metadata-only))
 
 (defparameter +default-eval-path-prefix+ "/api/v1")
 (defparameter +default-scores-export-path+ "/api/v1/scores:export")

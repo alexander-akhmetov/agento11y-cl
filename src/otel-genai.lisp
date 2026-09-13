@@ -337,7 +337,8 @@ so a failure the caller described only in prose still classifies as _OTHER."
         (message (genai-invocation-error-message inv)))
     (cond
       ((and (stringp declared) (plusp (length declared))) declared)
-      ((and (stringp message) (plusp (length message))) +genai-error-type-other+)
+      ((and message (or (not (stringp message)) (plusp (length message))))
+       +genai-error-type-other+)
       (t nil))))
 
 ;;; --- Encoders ---
@@ -808,4 +809,7 @@ instrumentation library reports; Ok is the application's to set."
                 :end-time-unix-nano (genai-invocation-completed-at-nano inv)
                 :attributes (coerce attrs 'vector)
                 :status-code (if error-type 2 :unset)
-                :status-message (or (genai-invocation-error-message inv) ""))))
+                :status-message
+                (span-error-status-message
+                 (genai-invocation-error-message inv)
+                 (if (genai-capture-span-content-p capture) :full :metadata-only)))))
