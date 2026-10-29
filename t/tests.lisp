@@ -1045,6 +1045,227 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-recorder-tests ()
   (with-test-suite ("Recorder")
+    (dolist (protocol '(:http :otel))
+      (let ((client (make-test-client :capture :full :generation-protocol protocol
+                                      :experimental-features t)))
+        (flet ((finish (rec)
+                 (recorder-end rec)
+                 (recorder-end rec)
+                 (let ((spans (agento11y-cl::queue-drain-all
+                               (agento11y-cl::client-trace-queue client))))
+                   (check "typed tool execution ends exactly once" (= (length spans) 1))
+                   (check "typed tool execution creates no generation payload"
+                          (agento11y-cl::queue-empty-p
+                           (agento11y-cl::client-generation-queue client)))
+                   (first spans))))
+          (dolist (kind '(:load-skill :read-skill-resource :command))
+            (let* ((rec (start-tool-execution
+                         client :execution-kind kind :tool-name "  exec  "
+                         :skill-name " review " :skill-description " Instructions "
+                         :skill-source-uri " https://user:secret@skills.example/review?token=secret#part "
+                         :skill-resource-name " check.py "
+                         :process-executable-name " python3 "
+                         :process-executable-path " /usr/bin/python3 ")))
+              (set-result rec :process-exit-code 7)
+              (let* ((span (finish rec))
+                     (attrs (cf-genai-attribute-map (jget span "attributes"))))
+                (check "recognized kinds normalize the tool name attribute"
+                       (equal (gethash "gen_ai.tool.name" attrs) "string:exec"))
+                (check "recognized kinds normalize the span name"
+                       (equal (jget span "name")
+                              (if (eq kind :load-skill)
+                                  "execute_tool exec review"
+                                  "execute_tool exec review check.py")))
+                (check "recognized kinds normalize the skill name"
+                       (equal (gethash "gen_ai.skill.name" attrs) "string:review"))
+                (check "recognized kinds normalize the description"
+                       (equal (gethash "gen_ai.skill.description" attrs) "string:Instructions"))
+                (check "recognized kinds sanitize the source URI"
+                       (equal (gethash "gen_ai.skill.source.uri" attrs)
+                              "string:https://skills.example/review"))
+                (check "load-skill omits the resource; other kinds retain it"
+                       (equal (gethash "gen_ai.skill.resource.name" attrs)
+                              (unless (eq kind :load-skill) "string:check.py")))
+                (dolist (pair '(("process.executable.name" . "string:python3")
+                                ("process.executable.path" . "string:/usr/bin/python3")
+                                ("process.exit.code" . "int64:7")))
+                  (check "only commands carry process attributes"
+                         (equal (gethash (car pair) attrs)
+                                (when (eq kind :command) (cdr pair))))))))
+          (dolist (kind '(nil :future "command" 17 t))
+            (let ((rec (start-tool-execution
+                        client :execution-kind kind :tool-name "lookup"
+                        :skill-name "review" :skill-description "Instructions"
+                        :skill-source-uri "file:///skills/review"
+                        :skill-resource-name "check.py" :process-executable-name "python3"
+                        :process-executable-path "/usr/bin/python3")))
+              (set-result rec :process-exit-code 0)
+              (let* ((span (finish rec))
+                     (attrs (cf-genai-attribute-map (jget span "attributes"))))
+                (check "unknown kinds keep the generic tool name"
+                       (equal (jget span "name") "execute_tool lookup"))
+                (dolist (key '("gen_ai.skill.name" "gen_ai.skill.description"
+                               "gen_ai.skill.source.uri" "gen_ai.skill.resource.name"
+                               "process.executable.name" "process.executable.path"
+                               "process.exit.code"))
+                  (check "unknown kinds omit every typed attribute"
+                         (not (nth-value 1 (gethash key attrs))))))))
+          (dolist (bad (list nil 42 t :name '("review")
+                             (coerce (mapcar #'code-char
+                                             '(#x85 #xa0 #x2003 #x202f #x2028 #x2029 #x3000))
+                                     'string)))
+            (dolist (kind '(:load-skill :read-skill-resource :command))
+              (let* ((span (finish
+                            (start-tool-execution
+                             client :execution-kind kind :tool-name bad :skill-name bad
+                             :skill-description bad :skill-source-uri bad
+                             :skill-resource-name bad :process-executable-name bad
+                             :process-executable-path bad)))
+                     (attrs (cf-genai-attribute-map (jget span "attributes"))))
+                (check "recognized blank tool names use unknown without a suffix"
+                       (equal (jget span "name") "execute_tool unknown"))
+                (check "Unicode blanks and nonstrings never leak through the tool name"
+                       (member (gethash "gen_ai.tool.name" attrs) '(nil "string:") :test #'equal))
+                (dolist (key '("gen_ai.skill.name" "gen_ai.skill.description"
+                               "gen_ai.skill.source.uri" "gen_ai.skill.resource.name"
+                               "process.executable.name" "process.executable.path"))
+                  (check "Unicode blanks and nonstrings omit typed string attributes"
+                         (not (nth-value 1 (gethash key attrs))))))))
+          (dolist (case '(("https://Skills.Example:443" . "https://Skills.Example:443")
+                          ("https://skills.example:0/a%2fb" . "https://skills.example:0/a%2fb")
+                          ("https://[2001:db8::1]:65535/a" . "https://[2001:db8::1]:65535/a")
+                          ("https://[::ffff:192.0.2.1]/a" . "https://[::ffff:192.0.2.1]/a")
+                          ("https://%E4%BE%8B.example/review" . "https://%E4%BE%8B.example/review")
+                          ("https://%E2%98%83.example/review" . "https://%E2%98%83.example/review")
+                          ("https://%C3%A9.example/review" . "https://%C3%A9.example/review")
+                          ("https://例.example/review" . "https://例.example/review")
+                          ("https://☃.example/review" . "https://☃.example/review")
+                          ("https://user:secret@%E4%BE%8B.example:443/a%2fb?secret#part"
+                           . "https://%E4%BE%8B.example:443/a%2fb")
+                          ("https://[fe80::1%25eth0]/a" . "https://[fe80::1%25eth0]/a")
+                          ("https://[fe80::1%25eth%30]/a" . "https://[fe80::1%25eth%30]/a")
+                          ("https://[fe80::1%25eth0%2Fother]/a")
+                          ("https://[fe80::1%25eth0%00]/a")
+                          ("https://[fe80::1%25eth0%5cother]/a")
+                          ("https://[fe80::1%25eth0%3Fother]/a")
+                          ("https://[fe80::1%25eth0%23other]/a")
+                          ("https://[fe80::1%25eth0%40other]/a")
+                          ("https://[fe80::1%25eth0%5Bother]/a")
+                          ("https://[fe80::1%25eth0%5Dother]/a")
+                          ("https://[fe80::1%25eth0%3Aother]/a")
+                          ("https://[fe80::1%25eth0%20other]/a")
+                          ("https://[fe80::1%25eth0%7F]/a")
+                          ("https://[fe80::1%25eth0%C2%85]/a")
+                          ("https://[fe80::1%25eth0%C2%A0]/a")
+                          ("https://skills%00.example/a")
+                          ("https://skills%7F.example/a")
+                          ("https://skills%C2%85.example/a")
+                          ("https://skills%C2%A0.example/a")
+                          ("https://skills%E2%80%83.example/a")
+                          ("https://skills%E4%BE.example/a")
+                          ("https://[2001:::1]/a")
+                          ("https://[12345::1]/a")
+                          ("https://[::1]extra/a")
+                          ("https://2001:db8::1/a")
+                          ("https://skills%3fother/a")
+                          ("https://skills%23other/a")
+                          ("https://skills%5bother/a")))
+            (dolist (capture '(:full :no-tool-content :full-with-metadata-spans :metadata-only))
+              (let ((span (finish (start-tool-execution
+                                   client :execution-kind :load-skill :tool-name "read"
+                                   :content-capture capture :skill-source-uri (car case)))))
+                (check (format nil "~a ~a URI projection ~s" protocol capture (car case))
+                       (equal (genai-attr-string span "gen_ai.skill.source.uri")
+                              (when (member capture '(:full :no-tool-content))
+                                (cdr case)))))))
+          (let* ((inputs (mapcar #'copy-seq
+                                '("exec" "review" "Instructions" "file:///skills/review"
+                                  "check.py" "python3" "/usr/bin/python3")))
+                 (rec (apply #'start-tool-execution client :execution-kind :command
+                             (loop for key in '(:tool-name :skill-name :skill-description
+                                                :skill-source-uri :skill-resource-name
+                                                :process-executable-name :process-executable-path)
+                                   for value in inputs append (list key value)))))
+            (mapc (lambda (text) (fill text #\x)) inputs)
+            (let ((span (finish rec)))
+              (check "start copies the recognized kind's tool name"
+                     (equal (jget span "name") "execute_tool exec review check.py"))
+              (loop for key in '("gen_ai.tool.name" "gen_ai.skill.name"
+                                "gen_ai.skill.description" "gen_ai.skill.source.uri"
+                                "gen_ai.skill.resource.name" "process.executable.name"
+                                "process.executable.path")
+                    for expected in '("exec" "review" "Instructions" "file:///skills/review"
+                                      "check.py" "python3" "/usr/bin/python3")
+                    do (check "start copies all seven caller-owned strings"
+                              (equal (genai-attr-string span key) expected)))))
+          (dolist (case (list (list (list :process-exit-code 0) nil "0")
+                             (list (list :process-exit-code -1) nil "-1")
+                             (list (list :process-exit-code (- (expt 2 63))) nil
+                                   "-9223372036854775808")
+                             (list (list :process-exit-code (1- (expt 2 63))) nil
+                                   "9223372036854775807")
+                             (list (list :process-exit-code 1) (list :result "updated") "1")
+                             (list (list :process-exit-code 1) (list :process-exit-code 2) "2")
+                             (list (list :process-exit-code 1) (list :process-exit-code nil) nil)
+                             (list (list :process-exit-code 1) (list :process-exit-code t) nil)
+                             (list (list :process-exit-code 1) (list :process-exit-code "0") nil)
+                             (list (list :process-exit-code 1) (list :process-exit-code 1.5d0) nil)
+                             (list (list :process-exit-code 1) (list :process-exit-code 1/2) nil)
+                             (list (list :process-exit-code 1) (list :process-exit-code (expt 2 63)) nil)
+                             (list (list :process-exit-code 1)
+                                   (list :process-exit-code (1- (- (expt 2 63)))) nil)))
+            (let ((rec (start-tool-execution client :execution-kind :command :tool-name "exec")))
+              (apply #'set-result rec (first case))
+              (apply #'set-result rec (second case))
+              (let ((span (finish rec)))
+                (check (format nil "~a exit-code update ~s" protocol case)
+                       (equal (let ((value (genai-attr span "process.exit.code")))
+                                (when value (jget value "intValue")))
+                              (third case)))
+                (check "exit code alone preserves the protocol's success status"
+                       (if (eq protocol :http)
+                           (eql (jget* span "status" "code") 1)
+                           (null (jget span "status"))))
+                (check "exit code alone never creates error attributes"
+                       (and (null (genai-attr span "error.type"))
+                            (null (genai-attr span "error.category")))))))
+          (dolist (setter '(:call-error :error-message))
+            (dolist (code '(0 7))
+              (let ((rec (start-tool-execution client :execution-kind :command :tool-name "exec")))
+                (set-result rec :process-exit-code code)
+                (ecase setter
+                  (:call-error (set-call-error rec "request timed out"))
+                  (:error-message (set-result rec :error-message "request timed out")))
+                (let ((span (finish rec)))
+                  (check "explicit errors set error status independently of exit code"
+                         (eql (jget* span "status" "code") 2))
+                  (check "explicit errors keep tool execution error attributes"
+                         (and (equal (genai-attr-string span "error.type") "tool_execution_error")
+                              (equal (genai-attr-string span "error.category") "timeout"))))))))))
+    (dolist (protocol '(:http :otel))
+      (dolist (mode '(:full :no-tool-content :metadata-only :metadata-with-system-prompt
+                     :full-with-metadata-spans))
+        (multiple-value-bind (client requests)
+            (make-test-client :capture mode :generation-protocol protocol :experimental-features t)
+          (let ((rec (start-tool-execution
+                      client :execution-kind :command :tool-name "exec" :skill-name "review"
+                      :skill-description "PRIVATE-SKILL-DESCRIPTION"
+                      :skill-source-uri "file:///PRIVATE-SKILL-SOURCE"
+                      :process-executable-name "python3"
+                      :process-executable-path "/PRIVATE-EXECUTABLE-PATH")))
+            (setf (slot-value (agento11y-cl::client-config client)
+                              'agento11y-cl::content-capture-mode)
+                  (if (member mode '(:full :no-tool-content)) :metadata-only :full))
+            (recorder-end rec)
+            (client-flush client)
+            (let ((wire (format nil "~{~a~}" (mapcar #'second (funcall requests))))
+                  (kept (not (null (member mode '(:full :no-tool-content))))))
+              (check "typed tool execution reaches the mock transport" (funcall requests))
+              (dolist (sentinel '("PRIVATE-SKILL-DESCRIPTION" "PRIVATE-SKILL-SOURCE"
+                                  "PRIVATE-EXECUTABLE-PATH" "gen_ai.skill.description"
+                                  "gen_ai.skill.source.uri" "process.executable.path"))
+                (check (format nil "~a ~a freezes private field ~a" protocol mode sentinel)
+                       (eq (not (null (search sentinel wire))) kept))))))))
     ;; Inspect the whole mocked OTLP request, not only selected attributes.
     (dolist (protocol '(:http :otel))
       (dolist (mode '(:full :no-tool-content :full-with-metadata-spans :metadata-only :invalid))
@@ -3332,6 +3553,46 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-macro-tests ()
   (with-test-suite ("Macros")
+    (dolist (protocol '(:http :otel))
+      (dolist (override '(nil :full))
+        (multiple-value-bind (client requests)
+            (make-test-client :capture :full :generation-protocol protocol :experimental-features t)
+          (let ((trace nil) (parent nil) (options 0))
+            (with-generation (gen client :model-provider "test" :model-name "m"
+                                         :content-capture :metadata-only)
+              (setf trace (gen-rec-trace-id gen) parent (gen-rec-span-id gen))
+              (with-tool-execution (tool client :tool-name "exec" :execution-kind :command
+                                               :skill-name "review" :skill-resource-name "check.py"
+                                               :skill-description "SCOPED-PRIVATE-DESCRIPTION"
+                                               :skill-source-uri "file:///SCOPED-PRIVATE-SOURCE"
+                                               :process-executable-name "python3"
+                                               :process-executable-path "/SCOPED-PRIVATE-PATH"
+                                               :content-capture (progn (incf options) override))
+                (setf (slot-value (agento11y-cl::client-config client)
+                                  'agento11y-cl::content-capture-mode) :full)
+                (set-result tool :process-exit-code 0)))
+            (check "typed tool macro evaluates the capture option once" (= options 1))
+            (let* ((spans (agento11y-cl::queue-drain-all
+                          (agento11y-cl::client-trace-queue client)))
+                   (tool (find "execute_tool exec review check.py" spans
+                               :key (lambda (span) (jget span "name")) :test #'equal)))
+              (check "typed tool macro exports one child and its generation" (= (length spans) 2))
+              (check "typed tool macro inherits the generation trace"
+                     (equal (jget tool "traceId") trace))
+              (check "typed tool macro parents to the generation"
+                     (equal (jget tool "parentSpanId") parent))
+              (check "typed tool macro has a distinct span ID"
+                     (and (jget tool "spanId") (not (equal (jget tool "spanId") parent))))
+              (check "typed tool macro keeps public identity under restricted capture"
+                     (and (equal (genai-attr-string tool "gen_ai.skill.name") "review")
+                          (equal (genai-attr-string tool "process.executable.name") "python3")))
+              (agento11y-cl::export-traces (agento11y-cl::client-config client) spans nil))
+            (client-flush client)
+            (let ((wire (format nil "~{~a~}" (mapcar #'second (funcall requests)))))
+              (dolist (sentinel '("SCOPED-PRIVATE-DESCRIPTION" "SCOPED-PRIVATE-SOURCE"
+                                  "SCOPED-PRIVATE-PATH"))
+                (check "typed tool capture inherits the frozen generation mode unless overridden"
+                       (eq (not (null (search sentinel wire))) (eq override :full)))))))))
     ;; Native generations still export when generic spans are disabled.
     (let ((client (make-test-client :capture :full :traces-enabled nil))
           (*trace-context* nil))
@@ -7904,6 +8165,54 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-metrics-tests ()
   (with-test-suite ("Metrics")
+    (dolist (protocol '(:http :otel))
+      (dolist (error-source '(nil :call-error :error-message))
+        (let* ((client (make-test-client :metrics-enabled t :generation-protocol protocol
+                                         :experimental-features t))
+               (callbacks nil))
+          (setf (slot-value (agento11y-cl::client-config client) 'agento11y-cl::metrics-fn)
+                (lambda (type recorder) (push (list type recorder) callbacks)))
+          (dolist (kind '(nil :load-skill :read-skill-resource :command :future))
+            (dolist (code '(0 9 -1))
+              (let ((rec (start-tool-execution
+                          client :execution-kind kind :tool-name " exec "
+                          :skill-name "review" :skill-description "Instructions"
+                          :skill-source-uri "file:///skills/review" :skill-resource-name "check.py"
+                          :process-executable-name "python3" :process-executable-path "/usr/bin/python3")))
+                (set-result rec :process-exit-code code :duration-seconds 0.25d0)
+                (case error-source
+                  (:call-error (set-call-error rec "request timed out"))
+                  (:error-message (set-result rec :error-message "request timed out")))
+                (recorder-end rec)
+                (recorder-end rec)
+                (check "typed tool metrics callback keeps its recorder type and identity"
+                       (and (eq (caar callbacks) :tool-execution)
+                            (eq (second (first callbacks)) rec))))))
+          (let* ((reg (agento11y-cl::client-metric-registry client))
+                 (series (%series-named reg "gen_ai.client.operation.duration"))
+                 (duration (first series)))
+            (check "typed kinds and exit codes do not split duration series" (= (length series) 1))
+            (check "typed tools record no additional metric instruments"
+                   (= (hash-table-count (agento11y-cl::metric-registry-table reg)) 1))
+            (check "typed tools record duration exactly once per execution"
+                   (= (agento11y-cl::hist-state-count duration) 15))
+            (check "typed tool durations keep their values"
+                   (= (agento11y-cl::hist-state-sum duration) 3.75d0))
+            (check "typed tools invoke metrics-fn exactly once" (= (length callbacks) 15))
+            (check "typed tools keep operation and normalized tool dimensions"
+                   (and (equal (%series-attr duration "gen_ai.operation.name") "execute_tool")
+                        (equal (%series-attr duration "gen_ai.tool.name") "exec")))
+            (check "only explicit errors set the metrics error type"
+                   (equal (%series-attr duration "error.type")
+                          (if error-source "tool_execution_error" (if (eq protocol :http) "" nil))))
+            (check "only explicit errors set the metrics error category"
+                   (equal (%series-attr duration "error.category")
+                          (if error-source "timeout" (if (eq protocol :http) "" nil))))
+            (dolist (key '("gen_ai.skill.name" "gen_ai.skill.description" "gen_ai.skill.source.uri"
+                           "gen_ai.skill.resource.name" "process.executable.name"
+                           "process.executable.path" "process.exit.code"))
+              (check "typed tool attributes never become metric dimensions"
+                     (null (%series-attr duration key))))))))
     ;; --- OTLP datapoint field types ---
     (let* ((bounds agento11y-cl::+duration-buckets+)
            (counts (append (make-list (length bounds) :initial-element 0) (list 0)))
@@ -8212,7 +8521,8 @@ experiment-runs branch, whose prefix they share."
           return (jget attr "value")))
 
 (defun genai-attr-string (span key)
-  (jget (genai-attr span key) "stringValue"))
+  (let ((value (genai-attr span key)))
+    (when value (jget value "stringValue"))))
 
 (defun genai-only-span (client)
   (let ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
@@ -8229,6 +8539,88 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-otel-genai-tests ()
   (with-test-suite ("OTel GenAI export")
+    (dolist (protocol '(:http :otel))
+      (dolist (mode '(:full :no-tool-content :metadata-only :full-with-metadata-spans))
+        (let ((client (make-test-client :capture mode :generation-protocol protocol
+                                        :experimental-features t)))
+          (dolist (kind '(nil :command))
+            (let ((rec (start-tool-execution client :tool-name "exec" :execution-kind kind
+                                                   :skill-name "review")))
+              (set-result rec :arguments "{\"cmd\":\"echo hi\"}" :result "{\"ok\":true}"
+                              :process-exit-code 3)
+              (recorder-end rec)))
+          (let* ((spans (agento11y-cl::queue-drain-all
+                        (agento11y-cl::client-trace-queue client)))
+                 (generic (first spans))
+                 (typed (second spans)))
+            (check "generic and typed tools both export" (= (length spans) 2))
+            (dolist (key '("gen_ai.tool.call.arguments" "gen_ai.tool.call.result"
+                           "gen_ai.tool.call.arguments.length" "gen_ai.tool.call.result.length"))
+              (check "typed kinds leave generic content encodings and placeholders unchanged"
+                     (equalp (genai-attr generic key) (genai-attr typed key))))
+            (dolist (pair '(("gen_ai.tool.call.arguments" . "{\"cmd\":\"echo hi\"}")
+                            ("gen_ai.tool.call.result" . "{\"ok\":true}")))
+              (check "tool content retains the protocol's established representation"
+                     (equal (genai-attr-string typed (car pair))
+                            (cond ((eq mode :full) (cdr pair))
+                                  ((eq protocol :http) "<redacted>")
+                                  (t nil)))))
+            (check "native length attributes remain; GenAI length attributes stay omitted"
+                   (equal (let ((value (genai-attr typed "gen_ai.tool.call.arguments.length")))
+                            (when value (jget value "intValue")))
+                          (when (eq protocol :http) "17")))))))
+    (dolist (protocol '(:http :otel))
+      (dolist (options '((:traces-enabled nil)
+                         (:traces-endpoint nil)
+                         (:generation-enabled nil)
+                         (:generation-endpoint nil)
+                         (:experimental-features nil)))
+        (multiple-value-bind (client requests)
+            (apply #'make-test-client :generation-protocol protocol
+                   (append options (unless (member :experimental-features options)
+                                     (list :experimental-features t))))
+          (recorder-end (start-tool-execution client :tool-name "exec" :execution-kind :command
+                                                    :skill-name "review"))
+          (check "disabled tool export never creates a generation payload"
+                 (agento11y-cl::queue-empty-p (agento11y-cl::client-generation-queue client)))
+          (let ((spans (agento11y-cl::queue-drain-all
+                        (agento11y-cl::client-trace-queue client)))
+                (queued (if (eq protocol :http)
+                            (not (member :traces-enabled options))
+                            (not (or (member :traces-endpoint options)
+                                     (member :experimental-features options))))))
+            (check (format nil "~a tool export queue behavior ~s" protocol options)
+                   (= (length spans) (if queued 1 0)))
+            (dolist (span spans)
+              (agento11y-cl::queue-enqueue (agento11y-cl::client-trace-queue client) span)))
+          (client-flush client)
+          (let ((exported (if (eq protocol :http)
+                              (not (member :traces-enabled options))
+                              (not (or (member :traces-endpoint options)
+                                       (member :experimental-features options))))))
+            (check (format nil "~a tool export transport behavior ~s" protocol options)
+                   (eq (not (null (funcall requests))) (not (null exported)))))
+          (when (and (eq protocol :http) (member :traces-endpoint options))
+            (check "native missing endpoint behavior still passes NIL to the mock transport"
+                   (and (= (length (funcall requests)) 1)
+                        (null (first (first (funcall requests))))))))))
+    (dolist (protocol '(:http :otel))
+      (let ((client (make-test-client :capture :full :generation-protocol protocol
+                                      :experimental-features t)))
+        (dolist (kind '(nil :command))
+          (let ((rec (start-tool-execution client :tool-name "exec" :execution-kind kind)))
+            (set-result rec :arguments "not JSON" :result "plain result")
+            (recorder-end rec)))
+        (let ((spans (agento11y-cl::queue-drain-all
+                      (agento11y-cl::client-trace-queue client))))
+          (dolist (span spans)
+            (dolist (pair '(("gen_ai.tool.call.arguments" . "not JSON")
+                            ("gen_ai.tool.call.result" . "plain result")))
+              (check "generic and typed tools preserve plain text encoding"
+                     (equal (genai-attr-string span (car pair))
+                            (if (eq protocol :otel)
+                                (jzon:stringify (cdr pair))
+                                (cdr pair)))))))))
     (dolist (capture '(:no-content :span-only))
       (dolist (condition (list (make-condition 'broken-status-report)
                               (make-condition 'broken-status-method)
@@ -8890,7 +9282,8 @@ experiment-runs branch, whose prefix they share."
                            #'run-hooks-conformance-tests
                            #'run-experiments-conformance-tests
                            #'run-redaction-conformance-tests
-                           #'run-genai-conformance-tests))
+                           #'run-genai-conformance-tests
+                           #'run-tool-execution-conformance-tests))
       (multiple-value-bind (ok pass fail) (funcall test-fn)
         (declare (ignore ok))
         (incf total-pass pass)

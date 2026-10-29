@@ -315,7 +315,10 @@ also validated because malformed identifiers can invalidate an entire OTLP batch
 (defun start-tool-execution (client &key tool-name tool-call-id tool-type tool-description
                                           conversation-id agent-name agent-version
                                           model-provider model-name started-at
-                                          content-capture)
+                                          content-capture execution-kind
+                                          skill-name skill-description skill-source-uri
+                                          skill-resource-name process-executable-name
+                                          process-executable-path)
   "Create and start a tool execution recorder.
 STARTED-AT overrides the wall clock; see START-GENERATION.
 
@@ -330,7 +333,16 @@ capture-mode resolver, then the client-level mode."
                              config
                              :override content-capture
                              :parent-mode (getf *trace-context* :content-capture-mode))
-      :tool-name tool-name
+      :execution-kind (when (tool-execution-kind-p execution-kind) execution-kind)
+      :skill-name (normalize-tool-string skill-name)
+      :skill-description (normalize-tool-string skill-description)
+      :skill-source-uri (project-tool-source-uri skill-source-uri)
+      :skill-resource-name (normalize-tool-string skill-resource-name)
+      :process-executable-name (normalize-tool-string process-executable-name)
+      :process-executable-path (normalize-tool-string process-executable-path)
+      :tool-name (if (tool-execution-kind-p execution-kind)
+                     (normalize-tool-string tool-name)
+                     tool-name)
       :tool-call-id tool-call-id
       :tool-type tool-type
       :tool-description tool-description

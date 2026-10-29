@@ -7,8 +7,8 @@
 ;;; reaching a live backend. t/fixtures/README.md records the upstream commit
 ;;; and the refresh command.
 ;;;
-;;; This file loads before t/tests.lisp and shares nothing with it: every
-;;; helper here is prefixed CF- and built only on the SDK and t/suite.lisp.
+;;; This file loads before t/tests.lisp. Helpers use the CF- prefix. The tool
+;;; suite calls MAKE-TEST-CLIENT from t/tests.lisp after both files have loaded.
 
 ;;; --- Fixture loading ---
 
@@ -902,6 +902,167 @@ RE2 does not, so the two spellings differ by design."
     (cf-run-redaction-strings-cases #'check)
     (cf-run-redaction-generations-cases #'check)
     (cf-run-redaction-patterns-drift #'check)))
+
+(defparameter +cf-tool-start-fields+
+  '(("tool_name" . :tool-name)
+    ("execution_kind" . :execution-kind)
+    ("skill_name" . :skill-name)
+    ("skill_description" . :skill-description)
+    ("skill_source_uri" . :skill-source-uri)
+    ("skill_resource_name" . :skill-resource-name)
+    ("process_executable_name" . :process-executable-name)
+    ("process_executable_path" . :process-executable-path)))
+
+(defun cf-tool-execution-kind (value)
+  (or (cdr (assoc value '(("load_skill" . :load-skill)
+                         ("read_skill_resource" . :read-skill-resource)
+                         ("command" . :command)
+                         ("future" . :future))
+                 :test #'equal))
+      (error "Unmapped fixture execution_kind: ~s" value)))
+
+(defun cf-tool-start-keywords (start)
+  (let ((keywords nil))
+    (maphash (lambda (field value)
+               (let ((keyword (cdr (assoc field +cf-tool-start-fields+ :test #'equal))))
+                 (unless keyword
+                   (error "Unmapped fixture start field: ~s" field))
+                 (setf keywords
+                       (append keywords
+                               (list keyword
+                                     (if (eq keyword :execution-kind)
+                                         (cf-tool-execution-kind value)
+                                         value))))))
+             start)
+    keywords))
+
+(defun cf-tool-capture-mode (case)
+  ;; INCLUDE_CONTENT and OTEL_CAPTURE belong to legacy upstream APIs. Lisp
+  ;; uses only its capture policy, including reduced full-with-metadata-spans.
+  (let ((mode (or (jget case "capture_mode") "no_tool_content")))
+    (or (cdr (assoc mode '(("full" . :full)
+                          ("no_tool_content" . :no-tool-content)
+                          ("full_with_metadata_spans" . :full-with-metadata-spans)
+                          ("metadata_only" . :metadata-only))
+                   :test #'equal))
+        (error "Unmapped fixture capture_mode: ~s" mode))))
+
+(defun cf-tool-set-completion (rec case)
+  (multiple-value-bind (invalid present-p) (gethash "invalid_exit_code" case)
+    (when (and present-p
+               (or (not (nth-value 1 (gethash "dynamic_languages" case)))
+                   (find "lisp" (jget case "dynamic_languages") :test #'equal)))
+      (set-result rec :process-exit-code invalid)))
+  (let ((end (jget case "end")))
+    (if (and end (nth-value 1 (gethash "process_exit_code" end)))
+        (set-result rec :process-exit-code (jget end "process_exit_code"))
+        (set-result rec))))
+
+(defun cf-tool-attribute-map (attributes)
+  ;; Check the vector before flattening it: a map would hide duplicate keys.
+  (let ((seen nil))
+    (map nil (lambda (attribute)
+               (let ((key (jget attribute "key")))
+                 (when (member key seen :test #'equal)
+                   (error "Duplicate span attribute: ~s" key))
+                 (push key seen)))
+         attributes))
+  (let ((out (jobj)))
+    (map nil (lambda (attribute)
+               (setf (gethash (jget attribute "key") out) (jget attribute "value")))
+         attributes)
+    out))
+
+(defun cf-tool-expected-attributes (case)
+  (let ((out (jobj)))
+    (maphash (lambda (key value)
+               (setf (gethash key out)
+                     (cond
+                       ((stringp value) (jobj "stringValue" value))
+                       ((integerp value) (jobj "intValue" (format nil "~d" value)))
+                       (t (error "Unsupported fixture attribute ~s: ~s" key value)))))
+             (jget case "attributes"))
+    out))
+
+(defun cf-tool-span-diffs (span case fixture)
+  (let* ((actual (cf-tool-attribute-map (jget span "attributes")))
+         (subset (jobj))
+         (diffs nil))
+    (map nil (lambda (key)
+               (multiple-value-bind (value present-p) (gethash key actual)
+                 (when present-p (setf (gethash key subset) value))))
+         (jget fixture "skill_process_attributes"))
+    ;; Compare raw AnyValue objects. An intValue must be a decimal string,
+    ;; not a stringValue, doubleValue, or a numeric JSON intValue.
+    (setf diffs (cf-json-diff subset (cf-tool-expected-attributes case)
+                             "skill/process attributes"))
+    (unless (equal (jget span "name") (jget case "span_name"))
+      (push (format nil "span name = ~s, want ~s"
+                    (jget span "name") (jget case "span_name")) diffs))
+    (unless (eql (jget span "kind") 1)
+      (push (format nil "span kind = ~s, want INTERNAL (1)" (jget span "kind")) diffs))
+    (when (nth-value 1 (gethash "agento11y.skill.name" actual))
+      (push "unexpected agento11y.skill.name" diffs))
+    (setf diffs
+          (append diffs
+                  (cf-json-diff (jget actual "gen_ai.operation.name")
+                                (jobj "stringValue" "execute_tool") "operation")
+                  (cf-json-diff
+                   (jget actual "gen_ai.tool.name")
+                   (jobj "stringValue"
+                         (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                      (jget (jget case "start") "tool_name")))
+                   "tool name")))
+    (if (jget case "error")
+        (unless (eql (jget* span "status" "code") 2)
+          (push "execution error must set ERROR status" diffs))
+        (when (eql (jget* span "status" "code") 2)
+          (push "exit code alone must not set ERROR status" diffs)))
+    diffs))
+
+(defun cf-tool-case-diffs (case fixture protocol)
+  (let* ((*trace-context* nil)
+         (client (make-test-client :capture (cf-tool-capture-mode case)
+                                   :generation-protocol protocol
+                                   :experimental-features t))
+         (rec (apply #'start-tool-execution client
+                     (cf-tool-start-keywords (jget case "start")))))
+    (cf-tool-set-completion rec case)
+    (when (jget case "error")
+      (set-call-error rec (jget case "error")))
+    (recorder-end rec)
+    (recorder-end rec)
+    (let ((spans (agento11y-cl::queue-drain-all
+                  (agento11y-cl::client-trace-queue client)))
+          (generations (agento11y-cl::queue-drain-all
+                        (agento11y-cl::client-generation-queue client)))
+          (diffs nil))
+      (when generations
+        (push "tool execution queued a generation payload" diffs))
+      (if (= (length spans) 1)
+          (append diffs (cf-tool-span-diffs (first spans) case fixture))
+          (cons (format nil "expected one span after two ends, got ~d" (length spans))
+                diffs)))))
+
+(defun run-tool-execution-conformance-tests ()
+  (with-test-suite ("Conformance: tool execution kinds")
+    (let* ((fixture (cf-fixture "tool-execution-kinds/cases.json"))
+           (cases (jget fixture "cases")))
+      (check "tool execution fixture version is 1" (eql (jget fixture "version") 1))
+      (check "tool execution fixture has all 103 cases" (= (length cases) 103))
+      (check "tool execution fixture case ids are unique"
+             (= (length cases)
+                (length (remove-duplicates (map 'list (lambda (case) (jget case "id")) cases)
+                                           :test #'equal))))
+      (dolist (protocol '(:http :otel))
+        (loop for case across cases
+              for label = (format nil "~(~a~)/~a" protocol (jget case "id"))
+              do (handler-case
+                     (let ((diffs (cf-tool-case-diffs case fixture protocol)))
+                       (check (cf-label label diffs) (null diffs)))
+                   (error (condition)
+                     (check (format nil "~a -- ~a: ~a" label (type-of condition) condition)
+                            nil))))))))
 
 ;;; ================================================================
 ;;; GenAI-semconv wire conformance

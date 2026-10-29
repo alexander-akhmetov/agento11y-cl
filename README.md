@@ -75,6 +75,90 @@ Child tool executions and embeddings within the body are automatically parented 
     (agento11y-cl:set-result tool :result "search results here")))
 ```
 
+### Trace skill loads, resource reads, and commands
+
+Use the existing tool API to identify an observed skill load or an associated execution.
+This records an observation, not proof that the skill caused later work.
+Both generation protocols export one INTERNAL `execute_tool` span, without a generation payload for the tool.
+
+```lisp
+(agento11y-cl:with-generation (generation *client*
+                              :conversation-id "conversation-1"
+                              :model-provider "openai"
+                              :model-name "example-model")
+  (agento11y-cl:with-tool-execution (tool *client*
+                                    :tool-name "read"
+                                    :tool-call-id "call-1"
+                                    :conversation-id "conversation-1"
+                                    :execution-kind :load-skill
+                                    :skill-name "code-review"
+                                    :skill-source-uri "file:///skills/code-review/SKILL.md")
+    (agento11y-cl:set-result tool :result "loaded"))
+  (agento11y-cl:with-tool-execution (tool *client*
+                                    :tool-name "shell"
+                                    :execution-kind :command
+                                    :skill-name "code-review"
+                                    :skill-resource-name "scripts/check.sh"
+                                    :process-executable-name "sh"
+                                    :process-executable-path "/bin/sh")
+    (agento11y-cl:set-result tool :result "completed" :process-exit-code 0)))
+```
+
+`start-tool-execution` and `with-tool-execution` accept these optional fields:
+
+| Keyword | Attribute | Execution kinds |
+| --- | --- | --- |
+| `:skill-name` | `gen_ai.skill.name` | All recognized kinds |
+| `:skill-description` | `gen_ai.skill.description` | All recognized kinds |
+| `:skill-source-uri` | `gen_ai.skill.source.uri` | All recognized kinds |
+| `:skill-resource-name` | `gen_ai.skill.resource.name` | `:read-skill-resource`, `:command` |
+| `:process-executable-name` | `process.executable.name` | `:command` |
+| `:process-executable-path` | `process.executable.path` | `:command` |
+
+`:execution-kind` selects `:load-skill`, `:read-skill-resource`, or `:command`; the kind itself is not exported.
+Missing or unknown kinds retain generic tool behavior and omit every typed skill/process attribute.
+The SDK trims and copies the new string inputs at start. Blank or non-string optional fields are absent.
+
+Recognized kinds trim the tool name in both the span name and `gen_ai.tool.name`.
+The span name starts with `execute_tool {tool}`, using `unknown` when the tool name is blank.
+The suffix follows these rules; it does not change `gen_ai.tool.name`:
+
+| Kind | Suffix |
+| --- | --- |
+| `:load-skill` | Skill name, when present |
+| `:read-skill-resource` | Skill and resource, or resource alone |
+| `:command` | Skill and resource, resource alone, executable name, or nothing, in that order |
+
+Resource reads and commands do not append a skill name alone.
+
+For commands, `set-result` accepts `:process-exit-code` as a signed 64-bit integer, including zero and negative values.
+Omitting the keyword retains the previous code. Explicit `nil`, invalid values, and out-of-range integers clear it.
+The attribute uses an OTLP integer value. A nonzero code does not imply an execution error.
+Report errors explicitly with `set-call-error` or `set-result :error-message`.
+
+Capture policy is resolved at recorder creation, including inherited policy and a per-call `:content-capture` override.
+
+| Fields | `:full` | `:no-tool-content` | `:full-with-metadata-spans` | `:metadata-only` |
+| --- | --- | --- | --- | --- |
+| Applicable skill/resource/executable names and exit code | Include | Include | Include | Include |
+| Skill description, source URI, executable path | Include | Include | Omit | Omit |
+
+Names remain visible in reduced capture. Unsupported modes omit private fields.
+Accepted source URIs always lose user information, query, and fragment; hosts and paths can still expose private information.
+The SDK validates the complete URI before removing components, without reading files, contacting sources, or executing commands.
+It rejects relative or opaque locations, malformed authorities, ports or percent escapes, backslashes, and embedded whitespace or controls.
+Non-file URIs require a host. File URIs require an absolute path; `file:/path` becomes `file:///path`.
+Host spelling, explicit ports, and escaped path spelling are preserved. Invalid URIs omit only the source attribute.
+
+Finish tools inside the intended `with-generation` scope, as in the example.
+Tool recorders read trace context at completion, not at creation.
+For manual or cross-thread completion, restore the intended context with `capture-telemetry-context` and `with-telemetry-context`.
+Ending under another context can attach the tool to the wrong parent.
+
+Sigil reads these attributes from retained Tempo traces. Configure trace routing and retention for the tool spans.
+Sending only generation payloads, or sending tool spans only to Sigil's generation receiver, is insufficient.
+The SDK has no sampler API; conformance tests cover the completed wire spans, not sampler lifecycle behavior.
+
 ### Record an embedding
 
 ```lisp

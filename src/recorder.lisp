@@ -666,8 +666,10 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
                                                    (recorder-completed-at rec))
                :error-type (when err "tool_execution_error")
                :error-message (when err (span-error-status-message err capture))
-               :extra-attributes (genai-vendor-config-attributes
-                                  config :error-category (classify-error err)))))
+               :extra-attributes (append
+                                  (genai-vendor-config-attributes
+                                   config :error-category (classify-error err))
+                                  (tool-rec-typed-attributes rec)))))
     ;; The registry spells these two as JSON documents and has no counterpart
     ;; for the .length keys the native span adds, so those are dropped here.
     (when (capture-keeps-tool-span-content-p capture)
@@ -679,7 +681,10 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
         (when (%otel-string result)
           (setf (genai-invocation-tool-call-result inv)
                 (otel-raw-or-json-string (truncate-for-span result))))))
-    (build-genai-span inv :on-problem (%genai-problem-reporter config))))
+    (let ((span (build-genai-span inv :on-problem (%genai-problem-reporter config))))
+      (when (tool-execution-kind-p (tool-rec-execution-kind rec))
+        (setf (gethash "name" span) (tool-rec-typed-span-name rec)))
+      span)))
 
 (defun build-genai-embedding-span (rec config)
   "Build the GenAI-semconv embeddings span for an embedding call."
@@ -842,6 +847,16 @@ either exports the whole span tree or none of it."
    (tool-call-id     :initarg :tool-call-id     :accessor tool-rec-tool-call-id     :initform nil)
    (tool-type        :initarg :tool-type        :accessor tool-rec-tool-type        :initform nil)
    (tool-description :initarg :tool-description :accessor tool-rec-tool-description :initform nil)
+   (execution-kind :initarg :execution-kind :accessor tool-rec-execution-kind :initform nil)
+   (skill-name :initarg :skill-name :accessor tool-rec-skill-name :initform nil)
+   (skill-description :initarg :skill-description :accessor tool-rec-skill-description :initform nil)
+   (skill-source-uri :initarg :skill-source-uri :accessor tool-rec-skill-source-uri :initform nil)
+   (skill-resource-name :initarg :skill-resource-name :accessor tool-rec-skill-resource-name :initform nil)
+   (process-executable-name :initarg :process-executable-name
+                            :accessor tool-rec-process-executable-name :initform nil)
+   (process-executable-path :initarg :process-executable-path
+                            :accessor tool-rec-process-executable-path :initform nil)
+   (process-exit-code :accessor tool-rec-process-exit-code :initform nil)
    (conversation-id  :initarg :conversation-id  :accessor tool-rec-conversation-id  :initform nil)
    (agent-name       :initarg :agent-name       :accessor tool-rec-agent-name       :initform nil)
    (agent-version    :initarg :agent-version    :accessor tool-rec-agent-version    :initform nil)
@@ -856,12 +871,30 @@ either exports the whole span tree or none of it."
 (defmethod recorder-type-key ((rec tool-execution-recorder)) :tool-execution)
 
 (defmethod set-result ((rec tool-execution-recorder) &key arguments result
-                                                           error-message duration-seconds)
+                                                           error-message duration-seconds
+                                                           (process-exit-code nil exit-code-p))
   (when arguments      (setf (tool-rec-arguments rec) arguments))
   (when result         (setf (tool-rec-result rec) result))
   (when error-message  (setf (tool-rec-error-message rec) error-message))
   (when duration-seconds (setf (tool-rec-duration-seconds rec) duration-seconds))
+  (when exit-code-p
+    (setf (tool-rec-process-exit-code rec)
+          (when (typep process-exit-code '(signed-byte 64)) process-exit-code)))
   rec)
+
+(defun tool-rec-typed-attributes (rec)
+  (tool-execution-attributes
+   (tool-rec-execution-kind rec)
+   (tool-rec-skill-name rec) (tool-rec-skill-description rec)
+   (tool-rec-skill-source-uri rec) (tool-rec-skill-resource-name rec)
+   (tool-rec-process-executable-name rec) (tool-rec-process-executable-path rec)
+   (tool-rec-process-exit-code rec) (recorder-capture-mode rec)))
+
+(defun tool-rec-typed-span-name (rec)
+  (tool-execution-span-name
+   (tool-rec-execution-kind rec) (tool-rec-tool-name rec)
+   (tool-rec-skill-name rec) (tool-rec-skill-resource-name rec)
+   (tool-rec-process-executable-name rec)))
 
 (defmethod recorder-end ((rec tool-execution-recorder))
   (let ((config (client-config (recorder-client rec))))
@@ -921,14 +954,17 @@ either exports the whole span tree or none of it."
             (let ((category (classify-error err)))
               (when category
                 (push (otel-string-attr "error.category" category) attrs)))))
+        (setf attrs (append (reverse (tool-rec-typed-attributes rec)) attrs))
         (let ((start-nano (iso8601-to-unix-nano (recorder-started-at rec))))
           (queue-enqueue
            (client-trace-queue (recorder-client rec))
            (build-span :trace-id trace-id
                        :span-id span-id
                        :parent-span-id parent-span-id
-                       :name (format nil "execute_tool ~a"
-                                     (or (tool-rec-tool-name rec) "unknown"))
+                       :name (if (tool-execution-kind-p (tool-rec-execution-kind rec))
+                                 (tool-rec-typed-span-name rec)
+                                 (format nil "execute_tool ~a"
+                                         (or (tool-rec-tool-name rec) "unknown")))
                        :kind 1
                        :start-time-unix-nano start-nano
                        :end-time-unix-nano

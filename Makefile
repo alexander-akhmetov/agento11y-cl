@@ -48,5 +48,8 @@ conformance-refresh:
 			t/fixtures/otlpwire/$$f.generation.json; \
 		cp $(AGENTO11Y_REPO)/go/agento11y/testdata/otlpwire/$$f.span.json \
 			t/fixtures/otlpwire/$$f.span.json; \
-	done
+	done; \
+	mkdir -p t/fixtures/tool-execution-kinds; \
+	cp $(AGENTO11Y_REPO)/conformance/tool-execution-kinds/cases.json \
+		t/fixtures/tool-execution-kinds/cases.json
 	@git -C $(AGENTO11Y_REPO) log -1 --format='refreshed from agento11y %H'

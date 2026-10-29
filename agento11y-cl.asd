@@ -16,6 +16,7 @@
                (:file "env")
                (:file "auth")
                (:file "otel")
+               (:file "tool-execution")
                ;; Before "queue": the GenAI-semconv export layer builds on the
                ;; OTLP attribute and span helpers in "otel", and the adapter
                ;; needs the capture vocabulary from "config". It loads ahead of
