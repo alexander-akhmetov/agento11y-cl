@@ -1,5 +1,17 @@
 (in-package :agento11y-cl)
 
+(defun %call-with-recorder (recorder thunk)
+  (let ((observed-error nil) (completed-p nil))
+    (unwind-protect
+         (handler-bind ((serious-condition (lambda (condition) (setf observed-error condition))))
+           (multiple-value-prog1 (funcall thunk) (setf completed-p t)))
+      (when (and observed-error (not completed-p))
+        (set-call-error recorder observed-error))
+      (if completed-p
+          (recorder-end recorder)
+          (handler-case (recorder-end recorder)
+            (serious-condition () nil))))))
+
 (defmacro with-generation ((var client &rest initargs) &body body)
   "Execute BODY with a generation recorder bound to VAR.
 Binds *trace-context* per-thread so child tool/embedding spans
@@ -9,25 +21,25 @@ are correctly parented to this generation."
                              (gen-rec-trace-id ,var) (gen-rec-span-id ,var)
                              :content-capture-mode
                              (recorder-content-capture-mode ,var))))
-       (unwind-protect
-            (progn ,@body)
-         (recorder-end ,var)))))
+       (%call-with-recorder ,var (lambda () ,@body)))))
 
 (defmacro with-tool-execution ((var client &rest initargs) &body body)
-  "Execute BODY with a tool execution recorder bound to VAR.
-Calls recorder-end in unwind-protect."
-  `(let ((,var (start-tool-execution ,client ,@initargs)))
-     (unwind-protect
-          (progn ,@body)
-       (recorder-end ,var))))
+  "Record a tool execution and parent nested operations under its span."
+  `(let* ((,var (start-tool-execution ,client ,@initargs))
+          (*trace-context* (child-trace-context
+                            (tool-rec-trace-id ,var) (tool-rec-span-id ,var)
+                            :parent-span-id (tool-rec-parent-span-id ,var)
+                            :content-capture-mode (recorder-capture-mode ,var))))
+     (%call-with-recorder ,var (lambda () ,@body))))
 
 (defmacro with-embedding ((var client &rest initargs) &body body)
-  "Execute BODY with an embedding recorder bound to VAR.
-Calls recorder-end in unwind-protect."
-  `(let ((,var (start-embedding ,client ,@initargs)))
-     (unwind-protect
-          (progn ,@body)
-       (recorder-end ,var))))
+  "Record an embedding and preserve an escaping error on its span."
+  `(let* ((,var (start-embedding ,client ,@initargs))
+          (*trace-context* (child-trace-context
+                            (emb-rec-trace-id ,var) (emb-rec-span-id ,var)
+                            :parent-span-id (emb-rec-parent-span-id ,var)
+                            :content-capture-mode (recorder-capture-mode ,var))))
+     (%call-with-recorder ,var (lambda () ,@body))))
 
 (defmacro with-workflow-step ((var client &rest initargs) &body body)
   "Execute BODY with a workflow step recorder bound to VAR.
@@ -37,9 +49,7 @@ are correctly parented to this workflow step."
      (let ((*trace-context* (child-trace-context
                              (wfs-rec-trace-id ,var) (wfs-rec-span-id ,var)
                              :content-capture-mode (recorder-capture-mode ,var))))
-       (unwind-protect
-            (progn ,@body)
-         (recorder-end ,var)))))
+       (%call-with-recorder ,var (lambda () ,@body)))))
 
 ;;; --- Carrying telemetry onto a thread the caller spawns ---
 ;;;
@@ -158,14 +168,15 @@ the caller was told it had been adopted."
                   (,vals nil))
              (unwind-protect
                   (let ((*trace-context* ,ctx-var))
-                    (handler-case
-                        (progn
-                          (setf ,vals (multiple-value-list (progn ,@body)))
-                          (values-list ,vals))
-                      (error (e)
-                        (setf ,ok nil
-                              ,err-message (span-error-status-message e ,capture-var))
-                        (error e))))
+                    (handler-bind
+                        ((serious-condition (lambda (condition)
+                                  (setf ,ok nil
+                                        ,err-message (span-error-status-message
+                                                      condition ,capture-var
+                                                      (client-config ,client-var))))))
+                      (setf ,vals (multiple-value-list (progn ,@body))
+                            ,ok t ,err-message nil)
+                      (values-list ,vals)))
                (handler-case
                    (let* ((end-nano (current-unix-nano))
                           (,links-var ,links)
@@ -191,6 +202,8 @@ the caller was told it had been adopted."
                       (build-span :trace-id trace-id
                                   :span-id span-id
                                   :parent-span-id parent-span-id
+                                  :trace-flags (getf ,ctx-var :trace-flags 1)
+                                  :trace-state (getf ,ctx-var :trace-state)
                                   :name ,name-var
                                   :kind ,kind
                                   :start-time-unix-nano ,start-nano
@@ -201,7 +214,7 @@ the caller was told it had been adopted."
                                   :links ,links-var))
                      (bt2:with-lock-held ((client-lock ,client-var))
                        (bt2:condition-notify (client-wake-cv ,client-var))))
-                 (error (e)
+                 (serious-condition (e)
                    (handler-case
                        (agento11y-log (client-config ,client-var) :warn "span"
                                  (format nil "span recording failed: ~a" (princ-to-string e)))

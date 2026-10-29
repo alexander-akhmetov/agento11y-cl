@@ -1,0 +1,56 @@
+(in-package :agento11y-cl)
+
+(defun valid-trace-state (text)
+  (when (and (stringp text) (<= 1 (length text) 512))
+    (let ((members (uiop:split-string text :separator '(#\,)))
+          (keys nil))
+      (when (and (<= (length members) 32)
+                 (every
+                  (lambda (member)
+                    (let* ((member (string-trim '(#\Space #\Tab) member))
+                           (separator (position #\= member))
+                           (key (when separator (subseq member 0 separator)))
+                           (value (when separator (subseq member (1+ separator)))))
+                      (when (and key value
+                                 (cl-ppcre:scan
+                                  "\\A(?:[a-z][a-z0-9_*/-]{0,255}|[a-z0-9][a-z0-9_*/-]{0,240}@[a-z][a-z0-9_*/-]{0,13})\\z"
+                                  key)
+                                 (not (member key keys :test #'equal))
+                                 (<= 1 (length value) 256)
+                                 (not (char= (char value (1- (length value))) #\Space))
+                                 (every (lambda (ch)
+                                          (and (<= 32 (char-code ch) 126)
+                                               (not (find ch ",=")))) value))
+                        (push key keys)
+                        t)))
+                  members))
+        (format nil "~{~a~^,~}" (mapcar (lambda (member)
+                                         (string-trim '(#\Space #\Tab) member)) members))))))
+
+(defun extract-trace-context (headers)
+  "Read W3C traceparent/tracestate from a string-pair alist; invalid IDs return NIL."
+  (let ((parent (cdr (assoc "traceparent" headers :test #'string-equal)))
+        (state (cdr (assoc "tracestate" headers :test #'string-equal))))
+    (when (and (stringp parent) (>= (length parent) 55)
+               (cl-ppcre:scan "\\A[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}(?:-.+)?\\z" parent))
+      (let ((version (parse-integer parent :start 0 :end 2 :radix 16))
+            (trace (subseq parent 3 35))
+            (span (subseq parent 36 52))
+            (flags (parse-integer parent :start 53 :end 55 :radix 16)))
+        (when (and (/= version 255)
+                   (or (/= version 0) (= (length parent) 55))
+                   (trace-hex-id-p trace 32) (trace-hex-id-p span 16))
+          (list :trace-id trace :span-id span :trace-flags (logand flags 3)
+                :trace-state (valid-trace-state state) :remote-p t))))))
+
+(defun trace-context-headers (&optional (context *trace-context*))
+  "Return W3C propagation headers for CONTEXT without changing caller headers."
+  (let ((trace (getf context :trace-id))
+        (span (getf context :span-id))
+        (flags (getf context :trace-flags 1))
+        (state (valid-trace-state (getf context :trace-state))))
+    (when (and (trace-hex-id-p trace 32) (trace-hex-id-p span 16))
+      (cons (cons "traceparent" (format nil "00-~a-~a-~(~2,'0x~)"
+                                       (string-downcase trace) (string-downcase span)
+                                       (logand (if (integerp flags) flags 1) 3)))
+            (when state (list (cons "tracestate" state)))))))

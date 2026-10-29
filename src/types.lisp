@@ -8,17 +8,23 @@
    (total-tokens           :initarg :total-tokens           :accessor token-usage-total-tokens           :initform 0)
    (reasoning-tokens       :initarg :reasoning-tokens       :accessor token-usage-reasoning-tokens       :initform 0)
    (cache-read-tokens      :initarg :cache-read-tokens      :accessor token-usage-cache-read-tokens      :initform 0)
-   (cache-creation-tokens  :initarg :cache-creation-tokens  :accessor token-usage-cache-creation-tokens  :initform 0)))
+   (cache-creation-tokens  :initarg :cache-creation-tokens  :accessor token-usage-cache-creation-tokens  :initform 0)
+   (input-semantics :initarg :input-semantics :accessor token-usage-input-semantics
+                    :initform :unspecified :type (member :unspecified :inclusive))))
 
 (defun make-token-usage (&key (input 0) (output 0) (total nil)
-                              (reasoning 0) (cache-read 0) (cache-creation 0))
+                              (reasoning 0) (cache-read 0) (cache-creation 0)
+                              (input-semantics :unspecified))
+  "Create usage. :INCLUSIVE input includes cache reads and cache writes."
+  (check-type input-semantics (member :unspecified :inclusive))
   (make-instance 'token-usage
     :input-tokens input
     :output-tokens output
     :total-tokens (or total (+ input output))
     :reasoning-tokens reasoning
     :cache-read-tokens cache-read
-    :cache-creation-tokens cache-creation))
+    :cache-creation-tokens cache-creation
+    :input-semantics input-semantics))
 
 ;;; --- Message parts ---
 

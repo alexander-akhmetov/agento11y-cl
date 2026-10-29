@@ -1,7 +1,9 @@
 (in-package :agento11y-cl)
 
 (defclass agento11y-config ()
-  (;; Generation export
+  ((supplied-options :initform nil)
+   (supplied-option-values :initform nil)
+   ;; Generation export
    (generation-endpoint :initarg :generation-endpoint :reader config-generation-endpoint :initform nil)
    (generation-enabled  :initarg :generation-enabled  :reader config-generation-enabled  :initform nil)
    ;; How a generation leaves the process. :http POSTs the proprietary payload
@@ -12,10 +14,7 @@
                         :initform :http)
    ;; Eval control plane and score export.
    ;;
-   ;; eval-path-prefix, scores-export-path, and ingest-actor hold NIL until a
-   ;; caller sets them; the readers below apply the non-NIL defaults. NIL is
-   ;; what env resolution treats as "unset", so an explicit caller value that
-   ;; happens to equal the default still wins over the environment.
+   ;; These paths retain non-NIL reader defaults even when explicitly cleared.
    (eval-endpoint :initarg :eval-endpoint :reader config-eval-endpoint :initform nil)
    (eval-path-prefix :initarg :eval-path-prefix :initform nil)
    (eval-auth-token :initarg :eval-auth-token :reader config-eval-auth-token :initform nil)
@@ -34,7 +33,11 @@
    ;; Trace export
    (traces-endpoint     :initarg :traces-endpoint     :reader config-traces-endpoint     :initform nil)
    (traces-enabled      :initarg :traces-enabled      :reader config-traces-enabled      :initform nil)
+   ;; Collectors can belong to another service. Default forwarding stays on-origin;
+   ;; an explicit T opts into forwarding API auth and extra headers anywhere.
    (traces-forward-auth :initarg :traces-forward-auth :reader config-traces-forward-auth :initform t)
+   (traces-headers :initarg :traces-headers :reader config-traces-headers :initform nil)
+   (traces-protocol :initarg :traces-protocol :reader config-traces-protocol :initform :http/json)
    ;; Workflow step export
    (workflow-steps-endpoint :initarg :workflow-steps-endpoint :reader config-workflow-steps-endpoint :initform nil)
    (workflow-steps-enabled  :initarg :workflow-steps-enabled  :reader config-workflow-steps-enabled  :initform nil)
@@ -42,6 +45,8 @@
    (metrics-endpoint     :initarg :metrics-endpoint     :reader config-metrics-endpoint     :initform nil)
    (metrics-enabled      :initarg :metrics-enabled      :reader config-metrics-enabled      :initform nil)
    (metrics-forward-auth :initarg :metrics-forward-auth :reader config-metrics-forward-auth :initform t)
+   (metrics-headers :initarg :metrics-headers :reader config-metrics-headers :initform nil)
+   (metrics-protocol :initarg :metrics-protocol :reader config-metrics-protocol :initform :http/json)
    ;; Auth
    (auth-mode     :initarg :auth-mode     :reader config-auth-mode     :initform :none)
    (auth-user     :initarg :auth-user     :reader config-auth-user     :initform nil)
@@ -52,6 +57,8 @@
    (flush-interval-sec :initarg :flush-interval-sec :reader config-flush-interval-sec :initform 5)
    (queue-max          :initarg :queue-max          :reader config-queue-max          :initform 500)
    (trace-queue-max    :initarg :trace-queue-max    :reader config-trace-queue-max    :initform nil)
+   (generation-enqueue-timeout-sec :initarg :generation-enqueue-timeout-sec
+                                   :reader config-generation-enqueue-timeout-sec :initform 1.0)
    ;; HTTP
    (export-timeout-sec  :initarg :export-timeout-sec  :reader config-export-timeout-sec  :initform 10)
    (max-retries         :initarg :max-retries         :reader config-max-retries         :initform 5)
@@ -84,6 +91,10 @@
    ;; Service identity (OTel resource attributes)
    (service-name    :initarg :service-name    :reader config-service-name    :initform "unknown")
    (service-version :initarg :service-version :reader config-service-version :initform nil)
+   ;; Cumulative metric producers must not share a default resource identity.
+   (service-instance-id :initarg :service-instance-id :reader config-service-instance-id
+                        :initform (generate-trace-id))
+   (resource-attributes :initarg :resource-attributes :reader config-resource-attributes :initform nil)
    ;; Agent identity (gen_ai.agent.* span attributes; falls back to service-* when unset)
    (agent-name    :initarg :agent-name    :reader config-agent-name    :initform nil)
    (agent-version :initarg :agent-version :reader config-agent-version :initform nil)
@@ -100,11 +111,38 @@
    ;; AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES.
    (experimental-features :initarg :experimental-features
                           :reader config-experimental-features :initform nil)
+   ;; Experiment telemetry must not change the generation transport.
+   (use-experimental-otel :initarg :use-experimental-otel
+                          :reader config-use-experimental-otel :initform nil)
    ;; Callbacks
    (log-fn     :initarg :log-fn     :reader config-log-fn     :initform nil)
    (metrics-fn :initarg :metrics-fn :reader config-metrics-fn :initform nil)
    ;; Testing
    (http-fn :initarg :http-fn :reader config-http-fn :initform nil)))
+
+(defvar *copying-config-p* nil)
+
+(defun config-option-supplied-p (config keyword)
+  "True when the caller supplied KEYWORD, including NIL or a schema default.
+MAKE-CONFIG and direct MAKE-INSTANCE have identical supplied-option semantics.
+Environment resolution preserves this state without marking env values explicit."
+  (not (null (member keyword (slot-value config 'supplied-options)))))
+
+(defmethod initialize-instance :after ((config agento11y-config) &rest initargs &key)
+  (unless *copying-config-p*
+    (setf (slot-value config 'supplied-options)
+          (remove-duplicates (loop for (key value) on initargs by #'cddr collect key))
+          (slot-value config 'supplied-option-values) (copy-list initargs))
+    (dolist (entry '((:service-name service-name "service.name")
+                     (:service-version service-version "service.version")
+                     (:service-instance-id service-instance-id "service.instance.id")))
+      (unless (config-option-supplied-p config (first entry))
+        (let ((attribute (assoc (third entry) (config-resource-attributes config) :test #'equal)))
+          (when attribute
+            (setf (slot-value config (second entry)) (cdr attribute)))))))
+  (dolist (protocol (list (config-traces-protocol config) (config-metrics-protocol config)))
+    (unless (eq protocol :http/json)
+      (error "Unsupported OTLP protocol ~s; only :http/json is supported" protocol))))
 
 ;;; --- Content capture mode vocabulary ---
 ;;;
@@ -239,15 +277,13 @@ stops the chain, so a per-call mode leaves the resolver uncalled."
 (defparameter +default-embedding-max-text-length+ 1024)
 
 (defmacro %define-defaulted-reader (name slot default)
-  "Define reader NAME returning SLOT, or DEFAULT when SLOT is NIL, plus a
-NAME-SUPPLIED-P predicate reporting whether a caller set it. NIL means unset,
-so env resolution can still fill the slot and an explicit NIL cannot produce a
-NIL path or actor."
+  "Define reader NAME with a non-NIL fallback, plus a caller-supplied predicate.
+An explicit NIL keeps the fallback and prevents environment replacement."
   `(progn
      (defun ,name (config)
        (or (slot-value config ',slot) ,default))
      (defun ,(intern (concatenate 'string (symbol-name name) "-SUPPLIED-P")) (config)
-       (and (slot-value config ',slot) t))))
+       (config-option-supplied-p config ,(intern (symbol-name slot) :keyword)))))
 
 (%define-defaulted-reader config-eval-path-prefix eval-path-prefix
                           +default-eval-path-prefix+)

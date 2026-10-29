@@ -126,6 +126,8 @@ the lock, so a concurrent record-histogram cannot tear a datapoint."
       (let ((payload (jzon:stringify
                       (build-otlp-metrics-payload metrics
                                                   (config-service-name config)
-                                                  (config-service-version config)))))
+                                                  (config-service-version config)
+                                                  :resource-attributes
+                                                  (config-otel-resource-attributes config)))))
         (post-with-retry config (config-metrics-endpoint config) payload
                          auth-headers "metrics" (length metrics))))))

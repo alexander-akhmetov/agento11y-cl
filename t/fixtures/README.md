@@ -28,7 +28,7 @@ commit records below.
 `otlpwire/` differs from the other rows. The rest come from the shared
 `conformance/` and `redaction/` directories, which are a cross-SDK contract.
 The six `otlpwire/` files come from Go-private `testdata/`: they can change
-upstream without notice, and no other SDK checks itself against them. They were
+upstream without notice. Python also checks its adapter against these files. They were
 copied at agento11y commit `0137e0ef04f857c0922405c7a262800914f0a094`, the last
 commit that touched them. Proposing them for a shared `conformance/genai/`
 upstream is the right follow-up.

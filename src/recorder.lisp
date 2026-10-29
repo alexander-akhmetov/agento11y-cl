@@ -16,6 +16,8 @@ the enclosing generation withholds.")
 
 (defun child-trace-context (trace-id span-id
                             &key parent-span-id
+                                 (trace-flags (getf *trace-context* :trace-flags 1))
+                                 (trace-state (getf *trace-context* :trace-state))
                                  (content-capture-mode
                                   (getf *trace-context* :content-capture-mode)))
   "Build the *trace-context* plist for a span opened under TRACE-ID and SPAN-ID.
@@ -31,6 +33,8 @@ adopt the caller's trace once it is."
   (list :trace-id trace-id
         :span-id span-id
         :parent-span-id parent-span-id
+        :trace-flags trace-flags
+        :trace-state trace-state
         :content-capture-mode content-capture-mode))
 
 ;;; --- Base recorder ---
@@ -40,6 +44,8 @@ adopt the caller's trace once it is."
    (started-at  :initarg :started-at  :accessor recorder-started-at  :initform nil)
    (completed-at :initarg :completed-at :accessor recorder-completed-at :initform nil)
    (call-error  :initarg :call-error  :accessor recorder-call-error  :initform nil)
+   (trace-flags :accessor recorder-trace-flags :initform (getf *trace-context* :trace-flags 1))
+   (trace-state :accessor recorder-trace-state :initform (getf *trace-context* :trace-state))
    (ended-p     :initarg :ended-p     :accessor recorder-ended-p     :initform nil)
    ;; Factories resolve capture at start. NIL retains direct-instance compatibility.
    (content-capture-mode :initarg :content-capture-mode
@@ -82,7 +88,10 @@ would let a new recorder type silently not support it."
   (setf (recorder-ended-p rec) t)
   (unless (recorder-completed-at rec)
     (setf (recorder-completed-at rec) (iso8601-now)))
-  (let ((client (recorder-client rec)))
+  (let ((client (recorder-client rec))
+        (*trace-context* (copy-list *trace-context*)))
+    (setf (getf *trace-context* :trace-flags) (recorder-trace-flags rec)
+          (getf *trace-context* :trace-state) (recorder-trace-state rec))
     (handler-case
         (progn
           (call-next-method)
@@ -106,11 +115,15 @@ would let a new recorder type silently not support it."
                 (error (e)
                   (agento11y-log (client-config client) :warn "recorder"
                             (format nil "metrics callback failed: ~a" (princ-to-string e))))))))
-      (error (e)
-        (handler-case
-            (agento11y-log (client-config client) :warn "recorder"
-                      (format nil "~a end failed: ~a" (type-of rec) (princ-to-string e)))
-          (error () nil))))))
+      (agento11y-export-error (e)
+        (setf (recorder-ended-p rec) nil)
+        (error e))
+      (error ()
+        (%record-export-failure client (list :kind :serialization-error
+                                             :recorder-type (recorder-type-key rec)))
+        (setf (recorder-ended-p rec) nil)
+        (error 'agento11y-export-error :message "Recorder serialization failed"
+               :diagnostics (client-export-diagnostics client))))))
 
 (defgeneric recorder-type-key (recorder)
   (:method ((rec recorder)) :unknown))
@@ -128,13 +141,12 @@ would let a new recorder type silently not support it."
 
 (defun message-secret-mode (role input-p redact-inputs)
   "Secret-redaction strength for a message: :full, :light, or :none.
-Output messages always redact (assistant=light, tool=full). Input messages
-redact only when REDACT-INPUTS is true (user=full, assistant=light, tool=full)."
-  (if input-p
-      (if redact-inputs
-          (case role (:user :full) (:assistant :light) (:tool :full) (t :none))
-          :none)
-      (case role (:assistant :light) (:tool :full) (t :none))))
+Only input user prompts are exempt when REDACT-INPUTS is false."
+  (case role
+    (:user (if (and input-p redact-inputs) :full :none))
+    (:assistant :light)
+    (:tool :full)
+    (t :none)))
 
 (defun data-url-p (url)
   "True when URL is a data: URL."
@@ -153,7 +165,12 @@ scanned for secrets with strength SECRET-MODE (:full, :light, or :none)."
     ;; STRENGTH is a part's intrinsic redaction strength; a message-level :none
     ;; clamps every part to :none regardless.
     (flet ((scrub (text strength)
-             (apply-secret-redaction redactor (if (eq smode :none) :none strength) text)))
+             (apply-secret-redaction redactor (if (eq smode :none) :none strength) text))
+           (scrub-base64 (content)
+             (utf8-base64-encode
+              (apply-secret-redaction-bytes redactor
+                                            (if (eq smode :none) :none :full)
+                                            content))))
       (typecase part
         (text-part
          (jobj "text" (if redact "" (scrub (text-part-text part) smode))))
@@ -165,9 +182,7 @@ scanned for secrets with strength SECRET-MODE (:full, :light, or :none)."
                (jobj "id" (tool-call-part-id part)
                      "name" (tool-call-part-name part)
                      "input_json" (if redact ""
-                                      (cl-base64:string-to-base64-string
-                                       (scrub (or (tool-call-part-input-json part) "")
-                                              :full))))
+                                      (scrub-base64 (or (tool-call-part-input-json part) ""))))
                "metadata" (jobj "provider_type" "tool_use")))
         (tool-result-part
          (let ((tr (jobj "tool_call_id" (tool-result-part-tool-call-id part)
@@ -176,19 +191,20 @@ scanned for secrets with strength SECRET-MODE (:full, :light, or :none)."
                          "is_error" (if (tool-result-part-is-error part) t nil))))
            (when (tool-result-part-name part)
              (setf (gethash "name" tr) (tool-result-part-name part)))
-           (when (and (not redact) (tool-result-part-content part))
-             (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return)
-                                         (tool-result-part-content part))))
-               (when (and (plusp (length trimmed))
-                          (or (char= (char trimmed 0) #\{)
-                              (char= (char trimmed 0) #\[)))
-                 (handler-case
-                     (let ((parsed (jzon:parse trimmed)))
-                       (when (or (hash-table-p parsed) (vectorp parsed))
-                         (setf (gethash "content_json" tr)
-                               (cl-base64:string-to-base64-string
-                                (scrub trimmed :full)))))
-                   (error () nil)))))
+           (unless redact
+             (let ((json (tool-result-part-content-json part))
+                   (content (tool-result-part-content part)))
+               (cond
+                 (json (setf (gethash "content_json" tr) (scrub-base64 json)))
+                 ((stringp content)
+                  (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) content)))
+                    (when (and (plusp (length trimmed))
+                               (find (char trimmed 0) "{["))
+                      (handler-case
+                          (let ((parsed (jzon:parse trimmed)))
+                            (when (or (hash-table-p parsed) (vectorp parsed))
+                              (setf (gethash "content_json" tr) (scrub-base64 content))))
+                        (error () nil))))))))
            (jobj "tool_result" tr
                  "metadata" (jobj "provider_type" "tool_result"))))
         (media-part
@@ -217,8 +233,11 @@ scanned for secrets with strength SECRET-MODE (:full, :light, or :none)."
                                                      :redactor redactor
                                                      :secret-mode secret-mode))
                                    (message-parts msg)))))
-    (jobj "role" (role-string (message-role msg))
-          "parts" (coerce parts 'vector))))
+    (let ((obj (jobj "role" (role-string (message-role msg))
+                     "parts" (coerce parts 'vector))))
+      (when (message-name msg)
+        (setf (gethash "name" obj) (message-name msg)))
+      obj)))
 
 ;;; --- Usage serialization ---
 
@@ -237,12 +256,15 @@ name it was written with: only the wire key moved."
             "total_tokens" (token-usage-total-tokens usage)
             "reasoning_tokens" (token-usage-reasoning-tokens usage)
             "cache_read_input_tokens" (token-usage-cache-read-tokens usage)
-            "cache_write_input_tokens" (token-usage-cache-creation-tokens usage))
+            "cache_write_input_tokens" (token-usage-cache-creation-tokens usage)
+            "input_semantics" (ecase (token-usage-input-semantics usage)
+                                (:unspecified "TOKEN_INPUT_SEMANTICS_UNSPECIFIED")
+                                (:inclusive "TOKEN_INPUT_SEMANTICS_INCLUSIVE")))
       (jobj "input_tokens" 0 "output_tokens" 0 "total_tokens" 0)))
 
 ;;; --- Tool schema serialization ---
 
-(defun serialize-tools (tools &key keep-content)
+(defun serialize-tools (tools &key keep-content redactor)
   "Serialize tool definition plists to JSON array.
 When KEEP-CONTENT is false, description and input_schema_json are emitted as
 empty strings; name, type, and deferred survive in every mode."
@@ -251,15 +273,17 @@ empty strings; name, type, and deferred survive in every mode."
        (loop for tool in tools
              collect (jobj "name" (or (getf tool :name) "")
                            "description" (if keep-content
-                                             (or (getf tool :description) "")
+                                             (apply-secret-redaction redactor :light
+                                                                     (or (getf tool :description) ""))
                                              "")
                            "type" "function"
                            "input_schema_json"
                            (if keep-content
                                (handler-case
-                                   (cl-base64:string-to-base64-string
-                                    (jzon:stringify (getf tool :parameters)))
-                                 (error () (cl-base64:string-to-base64-string "{}")))
+                                   (utf8-base64-encode
+                                    (apply-secret-redaction redactor :full
+                                                            (jzon:stringify (getf tool :parameters))))
+                                 (error () (utf8-base64-encode "{}")))
                                "")
                            "deferred" (if (getf tool :deferred) t nil)))
        'vector)
@@ -332,7 +356,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
                                                        stop-reason response-id response-model
                                                        tags metadata
                                                        temperature top-p max-tokens
-                                                       tool-choice thinking-enabled
+                                                       tool-choice (thinking-enabled nil thinking-enabled-p)
                                                        parent-generation-ids
                                                        duration-seconds ttft-seconds)
   (when input-messages  (setf (gen-rec-input-messages rec) input-messages))
@@ -349,7 +373,7 @@ started-at. Second granularity (ISO timestamps carry no fraction)."
   (when top-p           (setf (gen-rec-top-p rec) top-p))
   (when max-tokens      (setf (gen-rec-max-tokens rec) max-tokens))
   (when tool-choice     (setf (gen-rec-tool-choice rec) tool-choice))
-  (unless (eq thinking-enabled nil)
+  (when thinking-enabled-p
     (when (member thinking-enabled '(t nil :unset))
       (setf (gen-rec-thinking-enabled rec) thinking-enabled)))
   (when parent-generation-ids
@@ -443,7 +467,8 @@ values onto the conventions' chat operation."
     (when (recorder-call-error rec)
       (setf (gethash "call_error" gen)
             (if capture-content
-                (condition-status-message (recorder-call-error rec))
+                (apply-secret-redaction redactor :light
+                                        (condition-status-message (recorder-call-error rec)))
                 (redacted-error-text (recorder-call-error rec)))))
     (when (gen-rec-response-id rec)
       (setf (gethash "response_id" gen) (gen-rec-response-id rec)))
@@ -503,8 +528,13 @@ values onto the conventions' chat operation."
                     'vector)))
     (when (gen-rec-tools rec)
       (setf (gethash "tools" gen)
-            (serialize-tools (gen-rec-tools rec) :keep-content capture-content)))
+            (serialize-tools (gen-rec-tools rec) :keep-content capture-content
+                                                :redactor redactor)))
     gen))
+
+(defun sanitized-span-error-status-message (error capture config)
+  "Apply the span capture gate, then scan any retained error text."
+  (config-secret-redact config :light (span-error-status-message error capture)))
 
 (defun build-generation-span (rec config gen-payload)
   "Build an OTel span for a generation. Returns span hash-table."
@@ -520,6 +550,7 @@ values onto the conventions' chat operation."
                   :agent-version (gen-rec-agent-version rec)
                   :conversation-id (gen-rec-conversation-id rec))))
     (push (otel-string-attr "gen_ai.operation.name" op-name) attrs)
+    (push (otel-bool-attr "agento11y.record" nil) attrs)
     (when gen-payload
       (let ((gen-id (jget gen-payload "id")))
         (when (and gen-id (plusp (length gen-id)))
@@ -536,6 +567,8 @@ values onto the conventions' chat operation."
     ;; Usage attributes
     (let ((usage (gen-rec-usage rec)))
       (when usage
+        (when (eq (token-usage-input-semantics usage) :inclusive)
+          (push (otel-string-attr "gen_ai.token.semantics" "inclusive") attrs))
         (let ((input (token-usage-input-tokens usage)))
           (when (plusp input)
             (push (otel-int-attr "gen_ai.usage.input_tokens" input) attrs)))
@@ -568,6 +601,9 @@ values onto the conventions' chat operation."
     (unless (eq (gen-rec-thinking-enabled rec) :unset)
       (push (otel-bool-attr "agento11y.gen_ai.request.thinking.enabled"
                              (gen-rec-thinking-enabled rec)) attrs))
+    (let ((budget (thinking-budget-from-metadata (gen-rec-metadata rec))))
+      (when budget
+        (push (otel-int-attr "agento11y.gen_ai.request.thinking.budget_tokens" budget) attrs)))
     ;; Error attributes
     (when (recorder-call-error rec)
       (push (otel-string-attr "error.type" "provider_call_error") attrs)
@@ -589,8 +625,8 @@ values onto the conventions' chat operation."
                   :end-time-unix-nano end-nano
                   :attributes (coerce (nreverse attrs) 'vector)
                   :status-code (if (recorder-call-error rec) 2 1)
-                  :status-message (span-error-status-message
-                                   (recorder-call-error rec) capture)))))
+                  :status-message (sanitized-span-error-status-message
+                                   (recorder-call-error rec) capture config)))))
 
 ;;; ================================================================
 ;;; GenAI-semconv spans (generation-protocol :otel)
@@ -624,9 +660,10 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
          (inv (genai-invocation-from-generation
                payload capture
                :parent-span-id (gen-rec-parent-span-id rec)
+               :dimensional-tags (config-tags config)
                :error-type (when call-error "provider_call_error")
                :error-message (when call-error
-                                (span-error-status-message call-error capture))
+                                (sanitized-span-error-status-message call-error capture config))
                :error-category (classify-error call-error))))
     (let ((start (genai-invocation-started-at-nano inv)))
       (when start
@@ -642,14 +679,13 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
   "Build the GenAI-semconv execute_tool span for a tool execution."
   (let* ((capture (recorder-capture-mode rec))
          (err (or (tool-rec-error-message rec) (recorder-call-error rec)))
-         (parent *trace-context*)
          (start-nano (iso8601-to-unix-nano (recorder-started-at rec)))
          (inv (make-genai-invocation
                :operation "execute_tool"
                :capture (otel-capture-mode capture)
-               :trace-id (or (getf parent :trace-id) (generate-trace-id))
-               :span-id (generate-span-id)
-               :parent-span-id (getf parent :span-id)
+               :trace-id (tool-rec-trace-id rec)
+               :span-id (tool-rec-span-id rec)
+               :parent-span-id (tool-rec-parent-span-id rec)
                :provider (otel-provider-name (tool-rec-model-provider rec))
                :request-model (tool-rec-model-name rec)
                :conversation-id (tool-rec-conversation-id rec)
@@ -659,13 +695,14 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
                :tool-call-id (tool-rec-tool-call-id rec)
                :tool-type (tool-rec-tool-type rec)
                :tool-description (when (capture-keeps-span-content-p capture)
-                                   (tool-rec-tool-description rec))
+                                   (config-secret-redact config :light
+                                                         (tool-rec-tool-description rec)))
                :started-at-nano start-nano
                :completed-at-nano (%genai-end-nano start-nano
                                                    (tool-rec-duration-seconds rec)
                                                    (recorder-completed-at rec))
                :error-type (when err "tool_execution_error")
-               :error-message (when err (span-error-status-message err capture))
+               :error-message (when err (sanitized-span-error-status-message err capture config))
                :extra-attributes (append
                                   (genai-vendor-config-attributes
                                    config :error-category (classify-error err))
@@ -676,11 +713,13 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
       (let ((args (tool-rec-arguments rec)))
         (when (%otel-string args)
           (setf (genai-invocation-tool-call-arguments inv)
-                (otel-raw-or-json-string (truncate-for-span args)))))
+                (otel-raw-or-json-string
+                 (truncate-for-span (config-secret-redact config :full args))))))
       (let ((result (tool-rec-result rec)))
         (when (%otel-string result)
           (setf (genai-invocation-tool-call-result inv)
-                (otel-raw-or-json-string (truncate-for-span result))))))
+                (otel-raw-or-json-string
+                 (truncate-for-span (config-secret-redact config :full result)))))))
     (let ((span (build-genai-span inv :on-problem (%genai-problem-reporter config))))
       (when (tool-execution-kind-p (tool-rec-execution-kind rec))
         (setf (gethash "name" span) (tool-rec-typed-span-name rec)))
@@ -707,9 +746,7 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
     (when (and (config-embedding-capture-input config)
                (capture-keeps-span-content-p capture)
                (emb-rec-input-texts rec))
-      (let ((texts (truncate-embedding-texts (emb-rec-input-texts rec)
-                                             (config-embedding-max-input-items config)
-                                             (config-embedding-max-text-length config))))
+      (let ((texts (sanitized-embedding-texts rec config)))
         (when texts
           (setf extras (append extras
                                (list (otel-string-array-attr
@@ -734,7 +771,7 @@ mode. PAYLOAD is the generation payload, which the adapter reads as its source."
                                           (emb-rec-duration-seconds rec)
                                           (recorder-completed-at rec))
       :error-type (when err "provider_call_error")
-      :error-message (when err (span-error-status-message err capture))
+      :error-message (when err (sanitized-span-error-status-message err capture config))
       :extra-attributes extras)
      :on-problem (%genai-problem-reporter config))))
 
@@ -783,7 +820,7 @@ step maps onto the conventions' workflow operation rather than disappearing."
                                           (wfs-rec-duration-seconds rec)
                                           (recorder-completed-at rec))
       :error-type (when err "workflow_step_error")
-      :error-message (when err (span-error-status-message err capture))
+      :error-message (when err (sanitized-span-error-status-message err capture config))
       :extra-attributes extras)
      :on-problem (%genai-problem-reporter config))))
 
@@ -824,8 +861,8 @@ either exports the whole span tree or none of it."
         ;; The payload is built whatever generation-enabled says: here it is the
         ;; adapter's source rather than something that gets POSTed.
         (let ((payload (build-generation-payload rec config)))
-          (queue-enqueue (client-trace-queue client)
-                         (build-genai-generation-span rec config payload))))
+          (enqueue-generation-span client
+                                   (build-genai-generation-span rec config payload))))
       (return-from recorder-end nil))
     (let ((gen-payload nil)
           (span nil))
@@ -843,7 +880,13 @@ either exports the whole span tree or none of it."
 ;;; ================================================================
 
 (defclass tool-execution-recorder (recorder)
-  ((tool-name        :initarg :tool-name        :accessor tool-rec-tool-name        :initform nil)
+  ((trace-id :initarg :trace-id :accessor tool-rec-trace-id
+              :initform (or (normalized-trace-id (getf *trace-context* :trace-id) 32)
+                            (generate-trace-id)))
+   (span-id :initarg :span-id :accessor tool-rec-span-id :initform (generate-span-id))
+   (parent-span-id :initarg :parent-span-id :accessor tool-rec-parent-span-id
+                   :initform (normalized-trace-id (getf *trace-context* :span-id) 16))
+   (tool-name        :initarg :tool-name        :accessor tool-rec-tool-name        :initform nil)
    (tool-call-id     :initarg :tool-call-id     :accessor tool-rec-tool-call-id     :initform nil)
    (tool-type        :initarg :tool-type        :accessor tool-rec-tool-type        :initform nil)
    (tool-description :initarg :tool-description :accessor tool-rec-tool-description :initform nil)
@@ -885,7 +928,10 @@ either exports the whole span tree or none of it."
 (defun tool-rec-typed-attributes (rec)
   (tool-execution-attributes
    (tool-rec-execution-kind rec)
-   (tool-rec-skill-name rec) (tool-rec-skill-description rec)
+   (tool-rec-skill-name rec)
+   (when (capture-keeps-span-content-p (recorder-capture-mode rec))
+     (config-secret-redact (client-config (recorder-client rec)) :light
+                           (tool-rec-skill-description rec)))
    (tool-rec-skill-source-uri rec) (tool-rec-skill-resource-name rec)
    (tool-rec-process-executable-name rec) (tool-rec-process-executable-path rec)
    (tool-rec-process-exit-code rec) (recorder-capture-mode rec)))
@@ -910,10 +956,9 @@ either exports the whole span tree or none of it."
       (let* ((capture (recorder-capture-mode rec))
              (capture-tool (capture-keeps-tool-span-content-p capture))
              (capture-span (capture-keeps-span-content-p capture))
-             (parent *trace-context*)
-             (trace-id (or (getf parent :trace-id) (generate-trace-id)))
-             (parent-span-id (getf parent :span-id))
-             (span-id (generate-span-id))
+             (trace-id (tool-rec-trace-id rec))
+             (parent-span-id (tool-rec-parent-span-id rec))
+             (span-id (tool-rec-span-id rec))
              (provider (or (tool-rec-model-provider rec) ""))
              (model (or (tool-rec-model-name rec) ""))
              (attrs (common-span-attrs config
@@ -932,20 +977,22 @@ either exports the whole span tree or none of it."
             (push (otel-string-attr "gen_ai.tool.type" tt) attrs)))
         (let ((td (tool-rec-tool-description rec)))
           (when (and capture-span td (stringp td) (plusp (length td)))
-            (push (otel-string-attr "gen_ai.tool.description" td) attrs)))
-        ;; Secret redaction applies to generation payloads only; standalone
-        ;; tool-execution spans export arguments/results gated by capture mode
-        ;; but unscanned. Enabling redact-secrets does not scrub this path.
+            (push (otel-string-attr "gen_ai.tool.description"
+                                     (config-secret-redact config :light td)) attrs)))
         (let ((args (tool-rec-arguments rec)))
           (when (and args (stringp args) (plusp (length args)))
             (push (otel-string-attr "gen_ai.tool.call.arguments"
-                                     (if capture-tool (truncate-for-span args) "<redacted>"))
+                                     (if capture-tool
+                                         (truncate-for-span (config-secret-redact config :full args))
+                                         "<redacted>"))
                   attrs)
             (push (otel-int-attr "gen_ai.tool.call.arguments.length" (length args)) attrs)))
         (let ((res (tool-rec-result rec)))
           (when (and res (stringp res) (plusp (length res)))
             (push (otel-string-attr "gen_ai.tool.call.result"
-                                     (if capture-tool (truncate-for-span res) "<redacted>"))
+                                     (if capture-tool
+                                         (truncate-for-span (config-secret-redact config :full res))
+                                         "<redacted>"))
                   attrs)
             (push (otel-int-attr "gen_ai.tool.call.result.length" (length res)) attrs)))
         (let ((err (or (tool-rec-error-message rec) (recorder-call-error rec))))
@@ -980,9 +1027,9 @@ either exports the whole span tree or none of it."
                        ;; redacts a span error only under metadata_only and
                        ;; full_with_metadata_spans (redactSpanErrors, go/agento11y
                        ;; client.go), and this matches the other span types here.
-                       :status-message (span-error-status-message
+                       :status-message (sanitized-span-error-status-message
                                         (or (tool-rec-error-message rec)
-                                            (recorder-call-error rec)) capture))))))))
+                                            (recorder-call-error rec)) capture config))))))))
 
 ;;; ================================================================
 ;;; Embedding recorder
@@ -1061,6 +1108,14 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
            texts))
     (nreverse kept)))
 
+(defun sanitized-embedding-texts (rec config)
+  (truncate-embedding-texts
+   (map 'list (lambda (text)
+                (when (stringp text) (config-secret-redact config :full text)))
+        (emb-rec-input-texts rec))
+   (config-embedding-max-input-items config)
+   (config-embedding-max-text-length config)))
+
 (defmethod recorder-end ((rec embedding-recorder))
   (let ((config (client-config (recorder-client rec))))
     (when (otel-generation-protocol-p config)
@@ -1102,10 +1157,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
         (when (and (config-embedding-capture-input config)
                    capture-span
                    (emb-rec-input-texts rec))
-          (let ((texts (truncate-embedding-texts
-                        (emb-rec-input-texts rec)
-                        (config-embedding-max-input-items config)
-                        (config-embedding-max-text-length config))))
+          (let ((texts (sanitized-embedding-texts rec config)))
             (when texts
               (push (otel-string-array-attr "gen_ai.embeddings.input_texts" texts) attrs))))
         (let ((src (emb-rec-source rec)))
@@ -1131,8 +1183,8 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                            (or (iso8601-to-unix-nano (recorder-completed-at rec)) "0"))
                        :attributes (coerce (nreverse attrs) 'vector)
                        :status-code (if (recorder-call-error rec) 2 1)
-                       :status-message (span-error-status-message
-                                        (recorder-call-error rec) capture))))))))
+                       :status-message (sanitized-span-error-status-message
+                                        (recorder-call-error rec) capture config))))))))
 
 ;;; ================================================================
 ;;; Workflow step recorder
@@ -1201,7 +1253,9 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
     (let ((err (or (wfs-rec-error-message rec) (recorder-call-error rec))))
       (when err
         (setf (gethash "error" step)
-              (if capture-content (condition-status-message err) (redacted-error-text err)))))
+              (if capture-content
+                  (config-secret-redact config :light (condition-status-message err))
+                  (redacted-error-text err)))))
     (when (wfs-rec-linked-generation-ids rec)
       (setf (gethash "linked_generation_ids" step)
             (coerce (wfs-rec-linked-generation-ids rec) 'vector)))
@@ -1258,7 +1312,7 @@ ignored. A limit that is NIL, zero, or negative falls back to 20 items and
                   :end-time-unix-nano end-nano
                   :attributes (coerce (nreverse attrs) 'vector)
                   :status-code (if err 2 1)
-                  :status-message (span-error-status-message err capture)))))
+                  :status-message (sanitized-span-error-status-message err capture config)))))
 
 (defmethod recorder-end ((rec workflow-step-recorder))
   (let ((config (client-config (recorder-client rec))))
@@ -1321,6 +1375,10 @@ SDK's own tag series are appended, which otel mode would otherwise lose."
           extra
           (prefixed-tag-pairs (config-tags config))))
 
+(defun token-usage-semantics-attrs (usage)
+  (when (and usage (eq (token-usage-input-semantics usage) :inclusive))
+    (list (cons "gen_ai.token.semantics" "inclusive"))))
+
 (defun record-genai-generation-metrics (rec registry config)
   "Record the conventions' client instruments for a generation in otel mode.
 
@@ -1372,7 +1430,8 @@ one."
         (when (plusp (cdr pair))
           (record-histogram registry "gen_ai.client.token.usage" +genai-token-usage-unit+
                             +token-buckets+
-                            (append base (list (cons "gen_ai.token.type" (car pair))))
+                            (append base (token-usage-semantics-attrs usage)
+                                    (list (cons "gen_ai.token.type" (car pair))))
                             (cdr pair)))))))
 
 (defmethod record-builtin-metrics ((rec generation-recorder) registry config)
@@ -1407,7 +1466,7 @@ one."
           (when (and (cdr pair) (plusp (cdr pair)))
             (record-histogram registry "gen_ai.client.token.usage" "token"
                               +token-buckets+
-                              (append id
+                              (append id (token-usage-semantics-attrs u)
                                       (list (cons "gen_ai.operation.name" op)
                                             (cons "gen_ai.token.type" (car pair))))
                               (cdr pair))))))

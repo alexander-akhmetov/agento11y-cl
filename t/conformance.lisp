@@ -693,47 +693,9 @@ which is what NIL does in %JOIN-STABLE-ID-PARTS."
 ;;; Redaction conformance
 ;;; ================================================================
 
-;;; The redaction engine and the content-capture rules are behind the fixtures,
-;;; and a follow-up ticket owns catching them up. RUN-TESTS returns the exit
-;;; code the Makefile and CI read, so a suite that fails by design would leave
-;;; every later change reading "29 failed" and no way to see a 30th. Each known
-;;; gap is listed by check id instead: a listed check that fails is reported as
-;;; a known gap and passes the build, anything else fails it, and a listed check
-;;; that starts passing fails too, so the list cannot outlive the gap.
-
-(defparameter +cf-known-redaction-failures+
-  '(;; The call error is not scanned at all.
-    "generations/input-redaction-disabled/callError"
-    "generations/input-redaction-enabled/callError"
-    "generations/email-redaction-disabled/callError"
-    ;; tool_result.content_json in the payload is derived from content when
-    ;; content parses as JSON, so the part's own content-json never reaches it.
-    "generations/input-redaction-disabled/input.tool.toolResultContentJson"
-    "generations/input-redaction-disabled/output.tool.toolResultContentJson"
-    "generations/input-redaction-enabled/input.tool.toolResultContentJson"
-    "generations/input-redaction-enabled/output.tool.toolResultContentJson"
-    "generations/email-redaction-disabled/input.tool.toolResultContentJson"
-    "generations/email-redaction-disabled/output.tool.toolResultContentJson"
-    ;; With input redaction off, the fixture still expects light on assistant
-    ;; input messages and full on tool input messages; the SDK redacts neither.
-    "generations/input-redaction-disabled/input.assistant.text"
-    "generations/input-redaction-disabled/input.assistant.thinking"
-    "generations/input-redaction-disabled/input.assistant.toolCallInputJson"
-    "generations/input-redaction-disabled/input.tool.text"
-    "generations/input-redaction-disabled/input.tool.toolResultContent")
-  "Ids of the redaction conformance checks the SDK is known to fail.")
-
 (defun cf-redaction-check (check id label passed)
-  "Report one redaction check, reading ID against the known-failure list."
-  (cond
-    ((not (member id +cf-known-redaction-failures+ :test #'string=))
-     (funcall check label passed))
-    (passed
-     (funcall check
-              (format nil "~a -- now passes, drop ~s from +cf-known-redaction-failures+"
-                      label id)
-              nil))
-    (t (funcall check (format nil "known gap: ~a" label) t))))
+  (declare (ignore id))
+  (funcall check label passed))
 
 (defun cf-run-redaction-strings-cases (check)
   (let ((cases (jget (cf-fixture "redaction/strings.json") "cases")))
@@ -1150,7 +1112,8 @@ entries are a subset rather than the whole document."
       (setf (gethash "gen_ai.operation.name" expected) "string:chat"))
     ;; 2. agento11y.record is what makes the backend store a generation. This
     ;;    SDK adds it; the fixtures do not carry it.
-    (setf (gethash "agento11y.record" expected) "string:true")
+    (setf (gethash "agento11y.record" expected) "string:true"
+          (gethash "agento11y.sdk.name" expected) "string:agento11y-cl")
     ;; 3. agento11y.agent.effective_version has no source in this SDK, which
     ;;    has no effective-version concept. Leaving it out beats inventing one.
     (remhash "agento11y.agent.effective_version" expected)

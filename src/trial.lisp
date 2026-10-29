@@ -33,8 +33,16 @@
    (generation-id :initform nil :accessor trial-generation-id)
    (trace-id :initform nil :accessor trial-trace-id)
    (span-id :initform nil :accessor trial-span-id)
+   (conversation-trace-id :initform nil :accessor trial-conversation-trace-id)
+   (conversation-span-id :initform nil :accessor trial-conversation-span-id)
    ;; Scores recorded on this trial but not yet exported.
    (buffer :initform nil :accessor trial-buffer)
+   (otel-state :initform nil :accessor trial-otel-state)
+   (started-ticks :initform (get-internal-real-time) :reader trial-started-ticks)
+   (duration-ms :initform nil :accessor trial-duration-ms)
+   (input-tokens :initform nil :accessor trial-input-tokens)
+   (output-tokens :initform nil :accessor trial-output-tokens)
+   (cost :initform nil :accessor trial-cost)
    (created-p :initform nil :accessor trial-created-p)
    (closed-p :initform nil :accessor trial-closed-p)
    ;; Called as (funcall flush-fn trial) before the closing PATCH.
@@ -240,7 +248,7 @@ request unless the gate is on."
                     :conversation-id (trial-conversation-id trial))
     ;; The evaluator reads the stored conversation, so its generation has to
     ;; exist before the wait starts, not when the trial closes.
-    (client-flush client)
+    (client-flush client :generations-only t)
     (let ((deadline (%evaluation-deadline timeout-sec))
           (evaluation (trigger-trial-evaluation client experiment-id id
                                                 :evaluator-id evaluator-id
@@ -429,11 +437,14 @@ ATTEMPT); a caller that already minted it passes it so both agree."
                                :flush-fn flush-fn
                                :closed-fn closed-fn
                                :cloud-evaluated-fn cloud-evaluated-fn)))
+    (%experiment-otel-safely (lambda () (%start-trial-otel trial test-case)))
     (create-trial client experiment-id
                   :trial-id (trial-id trial)
                   :test-case-id normalized-case-id
                   :attempt attempt
                   :status "running"
+                  :trace-id (trial-trace-id trial)
+                  :span-id (trial-span-id trial)
                   :test-case (test-case-snapshot test-case
                                                  :suite-id suite-id
                                                  :suite-version suite-version)
@@ -449,25 +460,32 @@ ATTEMPT); a caller that already minted it passes it so both agree."
   trial)
 
 (defun trial-bind-conversation (trial conversation-id &key trace-id span-id)
-  "Record the conversation this trial ran in. Local only; issues no request."
+  "Bind a conversation without changing an existing diagnostic span's identity.
+With diagnostics enabled, explicit trace/span IDs become a link to that conversation."
   (let ((id (%trimmed-text conversation-id)))
     (when (plusp (length id))
       (setf (trial-conversation-id trial) id)))
   (let ((tid (%trimmed-text trace-id)))
     (when (plusp (length tid))
-      (setf (trial-trace-id trial) tid)))
+      (setf (trial-conversation-trace-id trial) tid)
+      (unless (trial-otel-state trial) (setf (trial-trace-id trial) tid))))
   (let ((sid (%trimmed-text span-id)))
     (when (plusp (length sid))
-      (setf (trial-span-id trial) sid)))
+      (setf (trial-conversation-span-id trial) sid)
+      (unless (trial-otel-state trial) (setf (trial-span-id trial) sid))))
   trial)
 
-(defun trial-close (trial &key ((:error error-message)) status)
+(defun trial-close (trial &key ((:error error-message)) status usage
+                              input-tokens output-tokens cost duration-ms)
   "Flush this trial's scores, then PATCH it terminal. Later calls are ignored.
 
 The close is claimed under TRIAL-LOCK before any work starts, so a worker
 thread and run teardown racing to close the same trial cannot both flush and
 both PATCH, which would double-count the run's accepted scores. A close that
-signals releases the claim again, so the caller or run teardown can retry it."
+signals releases the claim again, so the caller or run teardown can retry it.
+DURATION-MS defaults to elapsed monotonic milliseconds. USAGE is TOKEN-USAGE;
+explicit INPUT-TOKENS and OUTPUT-TOKENS override it. COST is forwarded only
+when supplied; this SDK does not estimate cost."
   (bt2:with-lock-held ((trial-lock trial))
     (when (trial-closed-p trial)
       (return-from trial-close trial))
@@ -480,6 +498,18 @@ signals releases the claim again, so the caller or run teardown can retry it."
            (unless (%blank-string-p error-message)
              (setf (trial-status trial) "errored"
                    (trial-error-text trial) (%text error-message)))
+           (when usage
+             (setf (trial-input-tokens trial) (token-usage-input-tokens usage)
+                   (trial-output-tokens trial) (token-usage-output-tokens usage)))
+           (when input-tokens (setf (trial-input-tokens trial) input-tokens))
+           (when output-tokens (setf (trial-output-tokens trial) output-tokens))
+           (when cost (setf (trial-cost trial) cost))
+           (unless (trial-duration-ms trial)
+             (setf (trial-duration-ms trial)
+                   (or duration-ms
+                       (max 0 (floor (* 1000 (- (get-internal-real-time)
+                                                (trial-started-ticks trial)))
+                                     internal-time-units-per-second)))))
            ;; Scores go out before the PATCH so the run's terminal state never
            ;; claims scores the backend has not stored yet.
            (let ((flush-fn (trial-flush-fn trial)))
@@ -491,10 +521,16 @@ signals releases the claim again, so the caller or run teardown can retry it."
                              (trial-id trial)
                              :status (trial-wire-status trial)
                              :error (trial-error-text trial)
+                             :duration-ms (trial-duration-ms trial)
+                             :input-tokens (trial-input-tokens trial)
+                             :output-tokens (trial-output-tokens trial)
+                             :cost (trial-cost trial)
                              :conversation-id (trial-conversation-id trial)
                              :trace-id (trial-trace-id trial)
                              :span-id (trial-span-id trial)))
            (setf closed-p t))
+      (%experiment-otel-safely
+       (lambda () (%end-trial-otel trial (unless closed-p "trial close failed"))))
       (unless closed-p
         (bt2:with-lock-held ((trial-lock trial))
           (setf (trial-closed-p trial) nil)))))

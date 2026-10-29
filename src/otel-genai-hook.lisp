@@ -37,6 +37,8 @@
    ;; documents below come out in a fixed key order.
    (tags :initarg :tags :accessor genai-vendor-tags :initform nil)
    (metadata :initarg :metadata :accessor genai-vendor-metadata :initform nil)
+   (dimensional-tags :initarg :dimensional-tags :accessor genai-vendor-dimensional-tags :initform nil)
+   (inclusive-input :initarg :inclusive-input :accessor genai-vendor-inclusive-input :initform nil)
    (parent-generation-ids :initarg :parent-generation-ids
                           :accessor genai-vendor-parent-generation-ids :initform nil)
    (tool-choice :initarg :tool-choice :accessor genai-vendor-tool-choice :initform nil)
@@ -54,8 +56,6 @@
 ;;; absent rather than invented: agento11y.agent.effective_version, because
 ;;; this SDK has no effective-version concept, and agento11y.raw_artifacts,
 ;;; because it emits raw_artifacts as an always-empty vector.
-;;; gen_ai.token.semantics is the same case: this SDK has no token input
-;;; semantics to report.
 
 (defun %genai-vendor-nested-json (value)
   "VALUE as a pre-encoded JSON document, or NIL when it is not one the JSON
@@ -112,6 +112,17 @@ generation filled from the payload shape carries it."
             for hit = (cdr (assoc key (genai-vendor-metadata vendor) :test #'string=))
             when (and (stringp hit) (plusp (length hit))) return hit)))
 
+(defun thinking-budget-from-metadata (metadata)
+  (let* ((key "agento11y.gen_ai.request.thinking.budget_tokens")
+         (value (if (hash-table-p metadata) (gethash key metadata)
+                    (cdr (assoc key metadata :test #'equal))))
+         (integer (ignore-errors
+                    (typecase value
+                      (integer value)
+                      (real (when (= value (truncate value)) (truncate value)))
+                      (string (parse-integer value))))))
+    (when (typep integer '(signed-byte 64)) integer)))
+
 (defun genai-vendor-attributes (vendor capture)
   "OTLP attributes for the agento11y fields the conventions do not define.
 CAPTURE gates the content-bearing ones."
@@ -144,18 +155,18 @@ CAPTURE gates the content-bearing ones."
               attrs)))
     (let ((tags (genai-vendor-tags vendor)))
       (when tags
-        ;; The document keeps the tags map as the payload holds it. The
-        ;; agento11y.tag.* dimensions trim it: the capture-mode marker is an
-        ;; SDK-owned key that the native span path deliberately keeps off
-        ;; every span, and republishing it as a dimension would add a series
-        ;; that says nothing about the caller.
+        ;; Per-generation tags belong to the document, not metric dimensions.
         (push (otel-string-attr +genai-vendor-attr-tags+
                                 (%genai-vendor-json-document tags))
-              attrs)
-        (dolist (kv (prefixed-tag-pairs
-                     (remove +content-capture-mode-key+ tags
-                             :key #'car :test #'string=)))
-          (push (otel-string-attr (car kv) (cdr kv)) attrs))))
+              attrs)))
+    (dolist (kv (prefixed-tag-pairs (genai-vendor-dimensional-tags vendor)))
+      (push (otel-string-attr (car kv) (cdr kv)) attrs))
+    (push (otel-string-attr "agento11y.sdk.name" +sdk-name+) attrs)
+    (when (genai-vendor-inclusive-input vendor)
+      (push (otel-string-attr "gen_ai.token.semantics" "inclusive") attrs))
+    (let ((budget (thinking-budget-from-metadata (genai-vendor-metadata vendor))))
+      (when budget
+        (push (otel-int-attr "agento11y.gen_ai.request.thinking.budget_tokens" budget) attrs)))
     (when with-content
       (let ((title (genai-vendor-conversation-title-value vendor)))
         (when (plusp (length (or title "")))
@@ -172,11 +183,8 @@ CAPTURE gates the content-bearing ones."
 
 (defun genai-vendor-config-attributes (config &key error-category)
   "The client-level agento11y attributes a non-generation span carries in otel
-mode: the user id, the agento11y.tag.* dimensions, and the error category.
-
-agento11y.sdk.name is deliberately absent, matching the generation span, whose
-shape the golden fixtures pin."
-  (let ((attrs nil))
+mode: SDK identity, user id, tag dimensions, and error category."
+  (let ((attrs (list (otel-string-attr "agento11y.sdk.name" +sdk-name+))))
     (let ((uid (config-user-id config)))
       (when uid
         (let ((text (princ-to-string uid)))

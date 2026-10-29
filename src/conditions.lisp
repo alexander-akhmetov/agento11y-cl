@@ -12,6 +12,8 @@
 
 (define-condition agento11y-export-error (agento11y-error)
   ((status-code :initarg :status-code :reader agento11y-export-error-status-code
+                :initform nil)
+   (diagnostics :initarg :diagnostics :reader agento11y-export-error-diagnostics
                 :initform nil))
   (:report (lambda (c stream)
              (format stream "Agento11y export error (~a): ~a"

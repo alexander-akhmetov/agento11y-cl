@@ -6,7 +6,7 @@
 ;;; (Go: go/agento11y/env.go, Python: python/agento11y/config.py).
 ;;; Resolution precedence: explicit caller config > env var > schema defaults.
 ;;;
-;;; Every variable has a preferred AGENTO11Y_<SUFFIX> name and a legacy
+;;; Branded variables have a preferred AGENTO11Y_<SUFFIX> name and a legacy
 ;;; SIGIL_<SUFFIX> fallback. Selection happens before parsing, so a nonblank
 ;;; preferred value wins even when it later fails validation and stale legacy
 ;;; config cannot silently resurface. This matches envPair/envTrimmed in
@@ -145,178 +145,154 @@ HTTP headers). Returns a fresh alist."
           (push initarg result))))
     result))
 
+(defun %otlp-signal-endpoint (base signal)
+  (let* ((end (or (position-if (lambda (c) (find c "?#")) base) (length base)))
+         (path (string-right-trim "/" (subseq base 0 end))))
+    (concatenate 'string path "/v1/" signal (subseq base end))))
+
+(defun %parse-otlp-protocol (value name)
+  (unless (string-equal value "http/json")
+    (error "Unsupported ~a; only http/json OTLP is supported" name))
+  :http/json)
+
 ;;; --- Public resolver ---
 
 (defun resolve-config-from-env (config &key (env-fn #'uiop:getenv))
-  "Return a fresh agento11y-config with AGENTO11Y_* env vars layered on top of
-defaults but below explicit caller-supplied values. CONFIG is the user's config;
-ENV-FN is called with each variable name and must return a string or nil.
+  "Copy CONFIG, resolving caller options > environment > defaults.
+Explicit NIL and explicit default values win, including through repeated copies.
+Branded variables prefer AGENTO11Y_ over SIGIL_ before parsing.
 
-Resolution precedence per slot: caller value (explicit) > env > schema default.
+OTLP endpoint precedence: explicit signal option > branded exact signal URL >
+branded OTLP base > standard signal URL > standard OTLP base. Only base URLs
+receive /v1/traces or /v1/metrics. Standard signal headers replace generic OTLP
+headers. API extra headers are separate. Only HTTP JSON OTLP is supported.
 
-Recognized suffixes, each read as AGENTO11Y_<SUFFIX> with a legacy
-SIGIL_<SUFFIX> fallback:
-  ENDPOINT, TRACES_ENDPOINT, EVAL_ENDPOINT, EVAL_PATH_PREFIX, EVAL_AUTH_TOKEN,
-  INGEST_ACTOR, EXPERIMENT_URL_TEMPLATE, HEADERS, AUTH_MODE, AUTH_TENANT_ID,
-  AUTH_TOKEN, AGENT_NAME, AGENT_VERSION, USER_ID, TAGS, CONTENT_CAPTURE_MODE,
-  REDACT_SECRETS, REDACT_INPUT_MESSAGES, DEBUG,
-  ENABLE_EXPERIMENTAL_FEATURES.
-
-The AGENTO11Y_ spelling wins whenever both are set, and the choice is made
-before parsing, so a stale SIGIL_ value cannot resurface when the preferred one
-fails validation. The two spellings are never merged: the selected value is
-used whole, including for TAGS and HEADERS.
-
-AGENTO11Y_PROTOCOL selects the generation export protocol: http/https keep the
-proprietary payload POST, and otel emits a GenAI-semconv span instead. Any
-other value is ignored with a warning. otel needs AGENTO11Y_TRACES_ENDPOINT
-too, because that span is the generation and the traces endpoint is where it
-goes. AGENTO11Y_INSECURE is a no-op since TLS
-is controlled by the URL scheme.
-
-Note: an explicit caller value that equals the slot's schema default is
-indistinguishable from \"unset\" and WILL be overridden by env. This applies to
-:none for :auth-mode, :no-tool-content for :content-capture-mode, and nil for
-:redact-secrets / :redact-input-messages. For the redaction flags the asymmetry
-fails safe: env can only turn redaction on when the caller did not ask for it.
-Callers that need to enforce these defaults against deployment env must either
-set the matching variable or unset it.
-:eval-path-prefix and :ingest-actor do not have that problem: their slots hold
-NIL until a caller sets them, so an explicit value equal to the default still
-wins over env."
-  (let* ((endpoint  (env-branded env-fn "ENDPOINT"))
-         (traces-endpoint (env-branded env-fn "TRACES_ENDPOINT"))
-         (eval-endpoint (env-branded env-fn "EVAL_ENDPOINT"))
-         (eval-path-prefix (env-branded env-fn "EVAL_PATH_PREFIX"))
-         (eval-auth-token (env-branded env-fn "EVAL_AUTH_TOKEN"))
-         (ingest-actor (env-branded env-fn "INGEST_ACTOR"))
-         (experiment-url-template (env-branded env-fn "EXPERIMENT_URL_TEMPLATE"))
-         (headers   (env-branded env-fn "HEADERS"))
-         (agent     (env-branded env-fn "AGENT_NAME"))
-         (agent-ver (env-branded env-fn "AGENT_VERSION"))
-         (user      (env-branded env-fn "USER_ID"))
-         (tags      (env-branded env-fn "TAGS"))
-         (debug     (env-branded env-fn "DEBUG"))
-         (experimental (env-branded env-fn +experimental-features-env-suffix+))
-         (tenant    (env-branded env-fn "AUTH_TENANT_ID"))
-         (token     (env-branded env-fn "AUTH_TOKEN"))
-         ;; These five keep the variable name next to the value, so a warning
-         ;; about an unsupported value names the spelling the caller set.
-         (auth-mode-pair (env-branded* env-fn "AUTH_MODE"))
-         (auth-mode (car auth-mode-pair))
-         (auth-mode-var (cdr auth-mode-pair))
-         (capture-pair (env-branded* env-fn "CONTENT_CAPTURE_MODE"))
-         (capture (car capture-pair))
-         (capture-var (cdr capture-pair))
-         (redact-secrets-pair (env-branded* env-fn "REDACT_SECRETS"))
-         (redact-secrets (car redact-secrets-pair))
-         (redact-secrets-var (cdr redact-secrets-pair))
-         (redact-inputs-pair (env-branded* env-fn "REDACT_INPUT_MESSAGES"))
-         (redact-inputs (car redact-inputs-pair))
-         (redact-inputs-var (cdr redact-inputs-pair))
-         (protocol-pair (env-branded* env-fn "PROTOCOL"))
-         (protocol (car protocol-pair))
-         (protocol-var (cdr protocol-pair)))
-    ;; Warn when the protocol var is set to something we don't support.
-    (when (and protocol
-               (not (member (string-downcase protocol) '("http" "https" "otel")
-                            :test #'string=)))
-      (agento11y-log config :warn "env"
-                 (format nil "ignoring ~a=~a (supported values are http, https, and otel)"
-                         protocol-var protocol)))
-    (let ((overrides nil))
-      (flet ((override (k v) (push k overrides) (push v overrides)))
-        ;; Endpoint.
-        (when (and endpoint (null (config-generation-endpoint config)))
-          (override :generation-endpoint endpoint))
-        ;; OTLP traces endpoint. It is not derived from the generation
-        ;; endpoint: that one is the generation ingest API and an OTLP
-        ;; collector is a different service on a different path.
-        (when (and traces-endpoint (null (config-traces-endpoint config)))
-          (override :traces-endpoint traces-endpoint))
-        ;; Eval endpoint and links.
-        (when (and eval-endpoint (null (config-eval-endpoint config)))
-          (override :eval-endpoint eval-endpoint))
-        ;; These two ask the slot itself rather than comparing against the
-        ;; default, so a caller who explicitly passes the default value keeps it.
-        (when (and eval-path-prefix
-                   (not (config-eval-path-prefix-supplied-p config)))
-          (override :eval-path-prefix eval-path-prefix))
-        (when (and ingest-actor
-                   (not (config-ingest-actor-supplied-p config)))
-          (override :ingest-actor ingest-actor))
-        (when (and eval-auth-token (null (config-eval-auth-token config)))
-          (override :eval-auth-token eval-auth-token))
-        (when (and experiment-url-template
-                   (null (config-experiment-url-template config)))
-          (override :experiment-url-template experiment-url-template))
-        ;; Auth mode (caller :none is treated as "not set").
-        (when (and auth-mode (eq (config-auth-mode config) :none))
-          (let ((parsed (%parse-auth-mode auth-mode config auth-mode-var)))
-            (unless (eq parsed :invalid)
-              (override :auth-mode parsed))))
-        ;; Auth password.
-        (when (and token (null (config-auth-password config)))
-          (override :auth-password token))
-        ;; Tenant ID.
-        (when (and tenant (null (config-tenant-id config)))
-          (override :tenant-id tenant))
-        ;; Content capture mode (caller :no-tool-content, the schema default,
-        ;; is treated as "not set").
-        (when (and capture (eq (config-content-capture-mode config) :no-tool-content))
-          (let ((parsed (parse-content-capture-mode capture config capture-var)))
-            (unless (eq parsed :invalid)
-              (override :content-capture-mode parsed))))
-        ;; A caller mode outside the supported set falls back to :metadata-only.
-        ;; The env branch above cannot also have fired: it requires the caller
-        ;; mode to be :no-tool-content, which is supported. Serialization redacts
-        ;; an unsupported mode on its own; this warning is the diagnostic.
-        (unless (valid-content-capture-mode-p (config-content-capture-mode config))
-          (agento11y-log config :warn "config"
-                     (format nil "ignoring :content-capture-mode ~s (unsupported value), using :metadata-only"
-                             (config-content-capture-mode config)))
-          (override :content-capture-mode :metadata-only))
-        ;; Secret redaction master enable (agento11y-cl extension).
-        (when (and redact-secrets (null (config-redact-secrets config)))
-          (let ((parsed (parse-strict-bool redact-secrets config redact-secrets-var)))
-            (unless (eq parsed :invalid)
-              (override :redact-secrets parsed))))
-        ;; Input-message redaction gating. Name kept aligned with the Python SDK env var.
-        (when (and redact-inputs (null (config-redact-input-messages config)))
-          (let ((parsed (parse-strict-bool redact-inputs config redact-inputs-var)))
-            (unless (eq parsed :invalid)
-              (override :redact-input-messages parsed))))
-        ;; Agent identity.
-        (when (and agent (null (config-agent-name config)))
-          (override :agent-name agent))
-        (when (and agent-ver (null (config-agent-version config)))
-          (override :agent-version agent-ver))
-        ;; User ID.
-        (when (and user (null (config-user-id config)))
-          (override :user-id user))
-        ;; Tags: env tags are base layer, caller tags win on key collision.
-        (let ((env-tags (when tags (parse-csv-kv tags))))
-          (when env-tags
-            (override :tags
-                      (%merge-alist-env-base env-tags (config-tags config) #'equal))))
-        ;; Extra headers: case-insensitive collision so caller wins.
-        (let ((env-headers (when headers (parse-csv-kv headers))))
-          (when env-headers
-            (override :extra-headers
-                      (%merge-alist-env-base env-headers (config-extra-headers config)
-                                             #'string-equal))))
-        ;; Generation export protocol (caller :http, the schema default, is
-        ;; treated as "not set"). http and https both mean the payload POST.
-        (when (and protocol (eq (config-generation-protocol config) :http)
-                   (string= (string-downcase protocol) "otel"))
-          (override :generation-protocol :otel))
-        ;; Debug.
-        (when (and debug (null (config-debug config)))
-          (override :debug (parse-bool debug)))
-        ;; Experimental feature gate.
-        (when (and experimental (null (config-experimental-features config)))
-          (override :experimental-features (parse-bool experimental))))
-      ;; Overrides come first so make-instance picks them over the copied slots
-      ;; (CLOS uses the first occurrence of an initarg).
-      (apply #'make-instance 'agento11y-config
-             (append (nreverse overrides) (%copy-config-initargs config))))))
+A metrics-specific endpoint enables metrics unless metrics-enabled was supplied.
+A generic OTLP base alone does not enable metrics or ordinary trace recording.
+USE_EXPERIMENTAL_OTEL controls experiment telemetry, not generation transport."
+  (let ((overrides nil))
+    (labels ((supplied (key) (config-option-supplied-p config key))
+             (override (key value)
+               (setf (getf overrides key) value))
+             (effective (key reader)
+               (getf overrides key (funcall reader config)))
+             (branded (suffix) (env-branded env-fn suffix))
+             (standard (name) (env-trimmed env-fn name))
+             (set-env (key suffix &optional parser)
+               (unless (supplied key)
+                 (let* ((pair (env-branded* env-fn suffix))
+                        (value (car pair)))
+                   (when value
+                     (let ((parsed (if parser
+                                       (funcall parser value config (cdr pair))
+                                       value)))
+                       (unless (eq parsed :invalid)
+                         (override key parsed)))))))
+             (set-alist (key text test)
+               ;; Retain the caller's map separately so earlier env values cannot
+               ;; override a later environment when a resolved config is copied.
+               (let ((caller (getf (slot-value config 'supplied-option-values) key)))
+                 (unless (and (supplied key) (null caller))
+                   (when text
+                     (override key (%merge-alist-env-base (parse-csv-kv text) caller test)))))))
+      (dolist (entry '((:generation-endpoint "ENDPOINT")
+                       (:eval-endpoint "EVAL_ENDPOINT")
+                       (:eval-path-prefix "EVAL_PATH_PREFIX")
+                       (:eval-auth-token "EVAL_AUTH_TOKEN")
+                       (:ingest-actor "INGEST_ACTOR")
+                       (:experiment-url-template "EXPERIMENT_URL_TEMPLATE")
+                       (:auth-password "AUTH_TOKEN")
+                       (:tenant-id "AUTH_TENANT_ID")
+                       (:agent-name "AGENT_NAME")
+                       (:agent-version "AGENT_VERSION")
+                       (:user-id "USER_ID")))
+        (set-env (first entry) (second entry)))
+      (set-env :auth-mode "AUTH_MODE" #'%parse-auth-mode)
+      (set-env :content-capture-mode "CONTENT_CAPTURE_MODE" #'parse-content-capture-mode)
+      (dolist (entry '((:redact-secrets "REDACT_SECRETS")
+                       (:redact-input-messages "REDACT_INPUT_MESSAGES")
+                       (:redact-email-addresses "REDACT_EMAIL_ADDRESSES")
+                       (:debug "DEBUG")
+                       (:experimental-features "ENABLE_EXPERIMENTAL_FEATURES")
+                       (:use-experimental-otel "USE_EXPERIMENTAL_OTEL")
+                       (:metrics-enabled "METRICS_ENABLED")))
+        (set-env (first entry) (second entry) #'parse-strict-bool))
+      (set-alist :tags (branded "TAGS") #'equal)
+      (set-alist :extra-headers (branded "HEADERS") #'string-equal)
+      (unless (supplied :generation-protocol)
+        (let* ((pair (env-branded* env-fn "PROTOCOL"))
+               (protocol (car pair)))
+          (when protocol
+            (cond ((string-equal protocol "otel") (override :generation-protocol :otel))
+                  ((member protocol '("http" "https") :test #'string-equal)
+                   (override :generation-protocol :http))
+                  (t (agento11y-log config :warn "env"
+                                   (format nil "ignoring ~a (supported values are http, https, and otel)"
+                                           (cdr pair))))))))
+      (unless (valid-content-capture-mode-p
+               (effective :content-capture-mode #'config-content-capture-mode))
+        (agento11y-log config :warn "config"
+                       (format nil "ignoring :content-capture-mode ~s (unsupported value), using :metadata-only"
+                               (effective :content-capture-mode #'config-content-capture-mode)))
+        (override :content-capture-mode :metadata-only))
+      (let* ((branded-base (branded "OTEL_EXPORTER_OTLP_ENDPOINT"))
+             (base (or branded-base (standard "OTEL_EXPORTER_OTLP_ENDPOINT")))
+             (metrics-specific nil))
+        (dolist (signal '("traces" "metrics"))
+          (let* ((traces-p (string= signal "traces"))
+                 (key (if traces-p :traces-endpoint :metrics-endpoint))
+                 (header-key (if traces-p :traces-headers :metrics-headers))
+                 (protocol-key (if traces-p :traces-protocol :metrics-protocol))
+                 (upper (string-upcase signal))
+                 (exact (branded (concatenate 'string upper "_ENDPOINT")))
+                 (standard-exact (standard (concatenate 'string "OTEL_EXPORTER_OTLP_" upper "_ENDPOINT")))
+                 (endpoint (or exact
+                               (when branded-base (%otlp-signal-endpoint branded-base signal))
+                               standard-exact
+                               (when base (%otlp-signal-endpoint base signal))))
+                 (headers (or (standard (concatenate 'string "OTEL_EXPORTER_OTLP_" upper "_HEADERS"))
+                              (standard "OTEL_EXPORTER_OTLP_HEADERS")))
+                 (protocol-name (concatenate 'string "OTEL_EXPORTER_OTLP_" upper "_PROTOCOL"))
+                 (signal-protocol (standard protocol-name))
+                 (protocol (or signal-protocol (standard "OTEL_EXPORTER_OTLP_PROTOCOL"))))
+            (unless (supplied key)
+              (when endpoint (override key endpoint)))
+            (unless traces-p
+              (setf metrics-specific
+                    (if (supplied key)
+                        (config-metrics-endpoint config)
+                        (or exact (and (not branded-base) standard-exact)))))
+            (unless (supplied header-key)
+              (when headers (override header-key (parse-csv-kv headers))))
+            (unless (supplied protocol-key)
+              (when protocol
+                (override protocol-key
+                          (%parse-otlp-protocol protocol
+                                                (if signal-protocol protocol-name
+                                                    "OTEL_EXPORTER_OTLP_PROTOCOL")))))))
+        ;; A base shared with generation export must not start a new signal.
+        (when (and metrics-specific (not (supplied :metrics-enabled))
+                   (not (branded "METRICS_ENABLED")))
+          (override :metrics-enabled t)))
+      (set-alist :resource-attributes (standard "OTEL_RESOURCE_ATTRIBUTES") #'equal)
+      (let ((resources (effective :resource-attributes #'config-resource-attributes)))
+        (unless (supplied :service-name)
+          (let ((name (or (cdr (assoc "service.name"
+                                     (getf (slot-value config 'supplied-option-values)
+                                           :resource-attributes) :test #'equal))
+                          (standard "OTEL_SERVICE_NAME")
+                          (cdr (assoc "service.name" resources :test #'equal)))))
+            (when name (override :service-name name))))
+        (dolist (entry '((:service-version "service.version")
+                         (:service-instance-id "service.instance.id")))
+          (unless (supplied (first entry))
+            (let ((value (cdr (assoc (second entry) resources :test #'equal))))
+              (when value (override (first entry) value))))))
+      (let* ((*copying-config-p* t)
+             (copy (apply #'make-instance 'agento11y-config
+                          (append overrides (%copy-config-initargs config)))))
+        (setf (slot-value copy 'supplied-options)
+              (copy-list (slot-value config 'supplied-options))
+              (slot-value copy 'supplied-option-values)
+              (copy-list (slot-value config 'supplied-option-values)))
+        copy))))

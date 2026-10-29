@@ -1,6 +1,7 @@
 (in-package :agento11y-cl)
 
 (defvar +sdk-name+ "agento11y-cl")
+(defvar *trace-context*)
 
 ;;; --- Attribute helpers ---
 
@@ -64,7 +65,10 @@ Returning NIL rather than an empty vector is what keeps the key off the span."
 
 (defun build-span (&key trace-id span-id parent-span-id name kind
                         start-time-unix-nano end-time-unix-nano
-                        attributes status-code status-message links)
+                        attributes status-code status-message links events
+                        scope-name scope-version schema-url
+                        (trace-flags (getf *trace-context* :trace-flags 1))
+                        (trace-state (getf *trace-context* :trace-state)))
   "Build an OTLP-compatible span JSON object.
 This low-level serializer does not apply capture policy to caller-owned status,
 attributes or names. Use SPAN-ERROR-STATUS-MESSAGE before passing error text.
@@ -82,7 +86,15 @@ parent or its sampling, so an unusable one costs the link and nothing else."
                      "kind" kind
                      "startTimeUnixNano" (or start-time-unix-nano "0")
                      "endTimeUnixNano" (or end-time-unix-nano "0")
-                     "attributes" (or attributes (vector)))))
+                     "attributes" (or attributes (vector))
+                     "_scope" (jobj "name" (or scope-name +sdk-name+)))))
+    (when scope-version
+      (setf (gethash "version" (jget span "_scope")) scope-version))
+    (when schema-url
+      (setf (gethash "_schemaUrl" span) schema-url))
+    (when events (setf (gethash "events" span) (coerce events 'vector)))
+    (when trace-flags (setf (gethash "flags" span) trace-flags))
+    (when trace-state (setf (gethash "traceState" span) trace-state))
     (let ((link-vector (build-span-links links)))
       (when link-vector
         (setf (gethash "links" span) link-vector)))
@@ -93,27 +105,73 @@ parent or its sampling, so an unusable one costs the link and nothing else."
       (setf (gethash "parentSpanId" span) parent-span-id))
     span))
 
+(defun config-otel-resource-attributes (config)
+  (let ((attributes (remove "service.instance.id" (config-resource-attributes config)
+                            :key #'car :test #'equal)))
+    (if (config-service-instance-id config)
+        (acons "service.instance.id" (config-service-instance-id config) attributes)
+        attributes)))
+
+(defun resource-otel-value (value)
+  (typecase value
+    (string (jobj "stringValue" value))
+    (integer
+     (check-type value (signed-byte 64))
+     (jobj "intValue" (format nil "~d" value)))
+    (real (jobj "doubleValue" (float value 1d0)))
+    ((or cons vector)
+     (jobj "arrayValue" (jobj "values" (map 'vector #'resource-otel-value value))))
+    (t (if (member value '(t nil))
+           (jobj "boolValue" value)
+           (error "Unsupported resource attribute value type ~a" (type-of value))))))
+
+(defun resource-otel-attributes (service-name service-version attributes)
+  (let ((pairs (remove-if (lambda (pair)
+                            (member (car pair) '("service.name" "service.version")
+                                    :test #'equal))
+                          attributes)))
+    (push (cons "service.name" (or service-name "unknown")) pairs)
+    (when service-version (push (cons "service.version" service-version) pairs))
+    (coerce (loop for (key . value) in pairs
+                  when (stringp key)
+                    collect (jobj "key" key "value" (resource-otel-value value)))
+            'vector)))
+
 (defun build-otlp-payload (spans service-name service-version
-                           &key scope-name scope-version schema-url)
-  "Wrap spans in the OTLP resourceSpans envelope.
-SCOPE-NAME, SCOPE-VERSION and SCHEMA-URL declare which instrumentation built
-the spans and which semantic-convention version they follow. They default to
-this SDK's own name and no schema URL; the GenAI export passes the conventions'
-scope and schema instead, which is how a receiver tells which version of the
-conventions the attributes were written to."
-  (let ((resource-attrs (list (otel-string-attr "service.name" (or service-name "unknown"))))
-        (scope (jobj "name" (or scope-name +sdk-name+))))
-    (when service-version
-      (push (otel-string-attr "service.version" service-version) resource-attrs))
-    (when scope-version
-      (setf (gethash "version" scope) scope-version))
-    (let ((scope-spans (jobj "scope" scope "spans" (coerce spans 'vector))))
-      (when schema-url
-        (setf (gethash "schemaUrl" scope-spans) schema-url))
-      (jobj "resourceSpans"
-            (vector
-             (jobj "resource" (jobj "attributes" (coerce (nreverse resource-attrs) 'vector))
-                   "scopeSpans" (vector scope-spans)))))))
+                           &key scope-name scope-version schema-url resource-attributes)
+  "Group spans by instrumentation scope without changing the queued records.
+The fallback scope applies only to spans without an explicit scope."
+  (let ((groups nil))
+    (dolist (span spans)
+      (let* ((scope (or (jget span "_scope")
+                        (jobj "name" (or scope-name +sdk-name+))))
+             (schema (or (jget span "_schemaUrl") schema-url))
+             (key (list (jget scope "name") (or (jget scope "version") scope-version) schema))
+             (group (assoc key groups :test #'equal))
+             (wire (jobj)))
+        (maphash (lambda (name value)
+                   (unless (member name '("_scope" "_schemaUrl") :test #'equal)
+                     (setf (gethash name wire) value))) span)
+        (unless group
+          (setf group (cons key nil)
+                groups (append groups (list group))))
+        (push wire (cdr group))))
+    (jobj "resourceSpans"
+          (vector
+           (jobj "resource"
+                 (jobj "attributes" (resource-otel-attributes service-name service-version
+                                                             resource-attributes))
+                 "scopeSpans"
+                 (coerce
+                  (loop for (key . items) in groups
+                        collect (destructuring-bind (name version schema) key
+                                  (let* ((scope (jobj "name" name))
+                                         (group (jobj "scope" scope "spans"
+                                                      (coerce (nreverse items) 'vector))))
+                                    (when version (setf (gethash "version" scope) version))
+                                    (when schema (setf (gethash "schemaUrl" group) schema))
+                                    group)))
+                  'vector))))))
 
 ;;; --- Metric histogram buckets ---
 ;;; Duration and token bucket boundaries match the current OTel GenAI semantic
@@ -163,14 +221,12 @@ encoded as uint64 strings (OTLP JSON convention); sum stays a JSON number."
         "histogram" (jobj "aggregationTemporality" +temporality-cumulative+
                           "dataPoints" (coerce datapoints 'vector))))
 
-(defun build-otlp-metrics-payload (metrics service-name service-version)
+(defun build-otlp-metrics-payload (metrics service-name service-version &key resource-attributes)
   "Wrap METRICS in the OTLP resourceMetrics envelope (scope name +sdk-name+)."
-  (let ((resource-attrs (list (otel-string-attr "service.name" (or service-name "unknown")))))
-    (when service-version
-      (push (otel-string-attr "service.version" service-version) resource-attrs))
+  (let ((resource-attrs (resource-otel-attributes service-name service-version resource-attributes)))
     (jobj "resourceMetrics"
           (vector
-           (jobj "resource" (jobj "attributes" (coerce (nreverse resource-attrs) 'vector))
+           (jobj "resource" (jobj "attributes" resource-attrs)
                  "scopeMetrics"
                  (vector
                   (jobj "scope" (jobj "name" +sdk-name+)
@@ -218,12 +274,14 @@ builders, where signalling here would drop the whole record."
 Returns the classified category so consumers keep the classification."
   (or (classify-error error-string) "sdk_error"))
 
-(defun span-error-status-message (error mode)
+(defun span-error-status-message (error mode &optional config)
   "Render ERROR under the resolved SDK span capture MODE. NIL means no error.
 Tool errors use the span gate, not the stricter gate for tool arguments."
   (if error
       (if (capture-keeps-span-content-p mode)
-          (condition-status-message error)
+          (if config
+              (config-secret-redact config :light (condition-status-message error))
+              (condition-status-message error))
           (redacted-error-text error))
       ""))
 

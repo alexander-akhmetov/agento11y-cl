@@ -7,14 +7,17 @@
 (defun make-score (&key evaluator-id evaluator-version score-key
                         (value nil value-supplied-p)
                         ((:passed passed) nil passed-supplied-p)
-                        explanation generation-id metadata
+                        explanation generation-id metadata evaluator-kind
                         grader-conversation-id grader-generation-id grader-trace-id)
   "Build a score output for EXPERIMENT-RUN-ADD-SCORES.
 The GRADER-* ids record where the judgement came from, as opposed to the
-generation or trial being judged."
+generation or trial being judged. EVALUATOR-KIND is telemetry-only and never
+changes the HTTP score body."
   (let ((score (list :evaluator-id evaluator-id
                      :evaluator-version evaluator-version
                      :score-key score-key)))
+    (when evaluator-kind
+      (setf score (append score (list :evaluator-kind evaluator-kind))))
     (when value-supplied-p
       (setf score (append score (list :value value))))
     (when generation-id
@@ -38,6 +41,10 @@ generation or trial being judged."
    (run-id :initarg :run-id :reader experiment-run-run-id)
    (name :initarg :name :reader experiment-run-name)
    (upload :initarg :upload :reader experiment-run-upload :initform :continuous)
+   (use-experimental-otel :initarg :use-experimental-otel
+                          :reader experiment-run-use-experimental-otel :initform nil)
+   (otel-state :initform nil :accessor experiment-run-otel-state)
+   (status :initform "running" :accessor experiment-run-status)
    (buffer :initform nil :accessor experiment-run-buffer)
    (dataset :initarg :dataset :accessor experiment-run-dataset :initform nil)
    (candidate :initarg :candidate :accessor experiment-run-candidate :initform nil)
@@ -105,12 +112,16 @@ non-terminal, and a silent one leaves no trace of why."
 
 (defun %make-experiment-run (&key client run-id name dataset candidate suite
                                   (upload :continuous)
-                                  agent-name agent-version extra-tags extra-metadata)
+                                  agent-name agent-version extra-tags extra-metadata
+                                  (use-experimental-otel nil use-experimental-otel-p))
   (make-instance 'experiment-run
                  :client client
                  :run-id (%trimmed-text run-id)
                  :name (%text name)
                  :upload upload
+                 :use-experimental-otel
+                 (if use-experimental-otel-p use-experimental-otel
+                     (config-use-experimental-otel (client-config client)))
                  :dataset dataset
                  :candidate candidate
                  :suite suite
@@ -455,7 +466,7 @@ the two functions do not each carry their own list of score keys."
   (if (null items)
       0
       (progn
-        (client-flush (experiment-run-client run))
+        (client-flush (experiment-run-client run) :generations-only t)
         (let ((accepted (export-scores (experiment-run-client run) items)))
           (bt2:with-lock-held ((experiment-run-lock run))
             (incf (experiment-run-accepted-count run) accepted))
@@ -508,6 +519,9 @@ count for EXPERIMENT-RUN-PUBLISH to export."
          (bt2:with-lock-held ((trial-lock trial))
            (%check-trial-open trial)
            (setf (trial-buffer trial) (append (trial-buffer trial) items))
+           ;; Events describe buffered scores, not an HTTP acknowledgement.
+           (%experiment-otel-safely
+            (lambda () (%trial-otel-add-scores trial items)))
            (length (trial-buffer trial))))
         ((eq (experiment-run-upload run) :continuous)
          (%export-score-items run items))
@@ -595,7 +609,7 @@ not an error."
                                             :parts (list (make-text-part
                                                           (%text (getf grader :output))))))
                     :usage usage)))
-    (client-flush client)))
+    (client-flush client :generations-only t)))
 
 (defun trial-record-evaluation (trial result &key score-key (publish-grader t) metadata)
   "Turn an EVALUATION-RESULT into a score on TRIAL.
@@ -630,6 +644,7 @@ it. Returns the number of scores now buffered on the trial."
      trial
      (list (make-score :evaluator-id evaluator-id
                        :evaluator-version (evaluation-result-evaluator-version result)
+                       :evaluator-kind (evaluation-result-evaluator-kind result)
                        :score-key key
                        :value (evaluation-result-value result)
                        :passed (and (evaluation-result-passed result) t)
@@ -775,13 +790,13 @@ generation ids captured for ~:[that trial~;those trials~], so scores on ~
         (error-text nil)
         (completed-p nil))
     (unwind-protect
-         (handler-case
-             (multiple-value-prog1
-                 (funcall body-fn trial)
-               (setf completed-p t))
-           (error (e)
-             (setf error-text (princ-to-string e))
-             (error e)))
+         (handler-bind ((serious-condition (lambda (condition)
+                                 (setf error-text (condition-status-message condition)))))
+           (multiple-value-prog1
+               (let ((*trace-context*
+                       (%experiment-otel-context (trial-otel-state trial))))
+                 (funcall body-fn trial))
+             (setf completed-p t error-text nil)))
       ;; A throw or a return-from reaches the cleanup with no error text, and
       ;; would otherwise close the trial completed. Report it as errored: the
       ;; body never finished, so nothing verified the case.
@@ -858,7 +873,8 @@ the local total against it answers 409 score-count-mismatch."
                                                (experiment-run-accepted-count run))
                                               (t score-count))
                                :error error-message)
-      (setf (experiment-run-finalized-p run) t)))
+      (setf (experiment-run-finalized-p run) t
+            (experiment-run-status run) (%normalize-finalize-status status))))
   run)
 
 (defun experiment-run-url (run)
@@ -872,7 +888,8 @@ the local total against it answers 409 score-count-mismatch."
 (defun %open-experiment-run (client &key run-id name description tags metadata dataset candidate
                                       collection-id agent-name agent-version extra-tags
                                       extra-metadata suite planned-trial-count
-                                      (on-conflict :reopen) (upload :continuous))
+                                      (on-conflict :reopen) (upload :continuous)
+                                      (use-experimental-otel nil use-experimental-otel-p))
   (when (%blank-string-p run-id)
     (error 'agento11y-validation-error :message "experiment run_id is required"))
   (when (%blank-string-p name)
@@ -921,46 +938,33 @@ the local total against it answers 409 score-count-mismatch."
                           :agent-name agent-name
                           :agent-version agent-version
                           :extra-tags extra-tags
-                          :extra-metadata extra-metadata)))
+                          :extra-metadata extra-metadata
+                          :use-experimental-otel
+                          (if use-experimental-otel-p use-experimental-otel
+                              (config-use-experimental-otel (client-config client))))))
 
 (defun %close-error-summary (errors)
   (format nil "trial close failed: ~{~a~^; ~}"
           (mapcar #'princ-to-string errors)))
 
-(defun %call-with-experiment (client body-fn &key run-id name description tags metadata
-                                      dataset candidate collection-id agent-name agent-version
-                                      extra-tags extra-metadata suite planned-trial-count
-                                      (on-conflict :reopen) (upload :continuous)
-                                      (print-url t))
-  (let ((run (%open-experiment-run client
-                                   :run-id run-id
-                                   :name name
-                                   :description description
-                                   :tags tags
-                                   :metadata metadata
-                                   :dataset dataset
-                                   :candidate candidate
-                                   :collection-id collection-id
-                                   :agent-name agent-name
-                                   :agent-version agent-version
-                                   :extra-tags extra-tags
-                                   :extra-metadata extra-metadata
-                                   :suite suite
-                                   :planned-trial-count planned-trial-count
-                                   :on-conflict on-conflict
-                                   :upload upload))
-        (exit-kind :aborted)
+(defun %call-with-experiment (client body-fn &rest options &key (print-url t)
+                                                          &allow-other-keys)
+  (let ((open-options (copy-list options)))
+    (remf open-options :print-url)
+    (let ((run (apply #'%open-experiment-run client open-options)))
+      (%call-with-suite-otel
+       run (lambda () (%call-with-experiment-lifecycle run body-fn print-url))))))
+
+(defun %call-with-experiment-lifecycle (run body-fn print-url)
+  (let ((exit-kind :aborted)
         (error-text nil))
     (unwind-protect
-         (handler-case
-             (let ((*experiment-run* run))
-               (multiple-value-prog1
-                   (funcall body-fn run)
-                 (setf exit-kind :succeeded)))
-           (error (e)
-             (setf exit-kind :failed
-                   error-text (princ-to-string e))
-             (error e)))
+         (handler-bind ((serious-condition (lambda (condition)
+                                 (setf exit-kind :failed
+                                       error-text (condition-status-message condition)))))
+           (let ((*experiment-run* run))
+             (multiple-value-prog1 (funcall body-fn run)
+               (setf exit-kind :succeeded error-text nil))))
       ;; Trials always close before the run finalizes: the backend refuses to
       ;; finalize a run that still has running trials.
       (let* ((close-errors (%call-swallowing-errors
@@ -1032,7 +1036,10 @@ the local total against it answers 409 score-count-mismatch."
 Open trials are always closed first. On normal exit buffered scores are
 published and the run is finalized completed (:upload :manual instead leaves
 the run open for the caller to publish and finalize); on an error, and on a
-non-local exit, it is finalized failed."
+non-local exit, it is finalized failed.
+:USE-EXPERIMENTAL-OTEL overrides the client setting, including explicit NIL.
+The opt-in adds diagnostic suite/trial spans only when normal traces are enabled;
+REST remains the experiment and score storage protocol."
   `(%call-with-experiment ,client
                           (lambda (,run)
                             ,@body)
@@ -1048,9 +1055,17 @@ non-local exit, it is finalized failed."
     (when metadata (setf (gethash "metadata" item) (%jsonify metadata)))
     item))
 
-(defun make-target-result (&key output generation-ids conversation-id metadata)
-  "Build a target result for RUN-EXPERIMENT targets."
+(defun make-target-result (&key output generation-ids conversation-id metadata
+                               usage input-tokens output-tokens)
+  "Build a target result for RUN-EXPERIMENT targets.
+USAGE is TOKEN-USAGE. INPUT-TOKENS and OUTPUT-TOKENS, when known, are forwarded
+to the trial report and diagnostic span. No cost is estimated."
   (let ((result (jobj)))
+    (when usage
+      (setf input-tokens (token-usage-input-tokens usage)
+            output-tokens (token-usage-output-tokens usage)))
+    (when input-tokens (setf (gethash "input_tokens" result) input-tokens))
+    (when output-tokens (setf (gethash "output_tokens" result) output-tokens))
     (when output (setf (gethash "output" result) (%jsonify output)))
     (when generation-ids
       (setf (gethash "generation_ids" result)
@@ -1083,7 +1098,8 @@ A bare MAKE-SCORE plist is wrapped in a list."
                        &key run-id name description tags metadata dataset candidate
                             collection-id agent-name agent-version extra-tags extra-metadata
                             suite (attempt 1) (on-conflict :reopen)
-                            (upload :continuous) (print-url t) (fetch-report t))
+                            (upload :continuous) (print-url t) (fetch-report t)
+                            (use-experimental-otel nil use-experimental-otel-p))
   "Run TARGET over dataset ITEMS inside an experiment and export scores.
 
 Each item gets one typed trial, so its scores anchor to the trial and roll
@@ -1109,7 +1125,10 @@ unless FETCH-REPORT is set and the report fetch succeeds)."
                       :extra-tags extra-tags :extra-metadata extra-metadata
                       :suite suite :planned-trial-count (length items)
                       :on-conflict on-conflict
-                      :upload upload :print-url print-url)
+                      :upload upload :print-url print-url
+                      :use-experimental-otel
+                      (if use-experimental-otel-p use-experimental-otel
+                          (config-use-experimental-otel (client-config client))))
       (setf completed-run run)
       (dolist (item items)
         (with-trial (trial run item :attempt attempt)
@@ -1132,6 +1151,16 @@ unless FETCH-REPORT is set and the report fetch succeeds)."
                  (outputs (loop for scorer in scorers
                                 append (%scorer-outputs (funcall scorer item result)))))
             (trial-bind-conversation trial conv-id)
+            (let ((usage (nth-value 0 (%field result "usage" :usage))))
+              (when (typep usage 'token-usage)
+                (setf (trial-input-tokens trial) (token-usage-input-tokens usage)
+                      (trial-output-tokens trial) (token-usage-output-tokens usage))))
+            (dolist (field '(("input_tokens" :input-tokens) ("output_tokens" :output-tokens)))
+              (multiple-value-bind (value present-p) (%field result (first field) (second field))
+                (when present-p
+                  (if (eq (second field) :input-tokens)
+                      (setf (trial-input-tokens trial) value)
+                      (setf (trial-output-tokens trial) value)))))
             (when (= (length generation-ids) 1)
               (trial-bind-generation trial (first generation-ids)))
             (trial-add-scores trial outputs

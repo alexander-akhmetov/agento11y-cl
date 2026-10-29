@@ -223,3 +223,24 @@ produce a \"[REDACTED]\" marker rather than leaking unredacted content."
               (:light (redact-light redactor s))
               (:full  (redact-full redactor s))))
         (error () "[REDACTED]"))))
+
+(defun config-secret-redact (config mode text)
+  "Scan exported content under CONFIG. Caller metadata and tags are not scanned."
+  (apply-secret-redaction
+   (when (config-redact-secrets config)
+     (make-secret-redactor :include-emails (config-redact-email-addresses config)))
+   mode text))
+
+(defun apply-secret-redaction-bytes (redactor mode content)
+  "Scan text or UTF-8 octets, preserving octets when scanning is disabled.
+Invalid UTF-8 fails closed when scanning is enabled."
+  (cond
+    ((or (null redactor) (eq mode :none) (null content)) content)
+    ((stringp content) (apply-secret-redaction redactor mode content))
+    (t
+     (handler-case
+         (string-to-utf8-octets
+          (apply-secret-redaction
+           redactor mode
+           (babel:octets-to-string content :encoding :utf-8 :errorp t)))
+       (error () (string-to-utf8-octets "[REDACTED]"))))))

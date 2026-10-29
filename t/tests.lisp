@@ -75,6 +75,11 @@
       :env-fn (constantly nil))
      (lambda () (reverse requests)))))
 
+(defun drain-recorded-spans (client)
+  (append (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))
+          (when (eq (config-generation-protocol (agento11y-cl::client-config client)) :otel)
+            (agento11y-cl::queue-drain-all (agento11y-cl::client-generation-queue client)))))
+
 ;;; --- Helpers shared by the experiment, trial, and suite suites ---
 ;;;
 ;;; One definition each. Two copies of ROUTED-HTTP had already drifted into
@@ -403,6 +408,7 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-env-tests ()
   (with-test-suite ("Env")
+    (agento11y-cl::config-parity-regression-cases)
     (labels ((env-from-alist (alist)
                (lambda (name)
                  (cdr (assoc name alist :test #'string=))))
@@ -509,8 +515,8 @@ experiment-runs branch, whose prefix they share."
                (equal (config-ingest-actor cfg) "ingest:sdk/lisp")))
       (let ((cfg (resolve '(("AGENTO11Y_EVAL_PATH_PREFIX" . "/env/v1"))
                           :eval-path-prefix nil)))
-        (check "env still fills an explicitly nil eval-path-prefix"
-               (equal (config-eval-path-prefix cfg) "/env/v1")))
+        (check "explicit nil eval-path-prefix retains its reader default"
+               (equal (config-eval-path-prefix cfg) "/api/v1")))
       (let ((cfg (resolve '(("AGENTO11Y_INGEST_ACTOR" . "ingest:runner/harbor")))))
         (check "AGENTO11Y_INGEST_ACTOR -> ingest-actor"
                (equal (config-ingest-actor cfg) "ingest:runner/harbor")))
@@ -874,6 +880,74 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-otel-tests ()
   (with-test-suite ("OTel")
+    (let* ((parent "00-11111111111111111111111111111111-2222222222222222-03")
+           (headers (list (cons "TraceParent" parent) (cons "TraceState" "vendor=opaque")))
+           (context (extract-trace-context headers)))
+      (check "W3C trace context round trips headers"
+             (and (equal (cdr (assoc "traceparent" (trace-context-headers context) :test #'equal)) parent)
+                  (equal (cdr (assoc "tracestate" (trace-context-headers context) :test #'equal)) "vendor=opaque")))
+      (dolist (invalid (list (concatenate 'string parent "-extra")
+                            "00-00000000000000000000000000000000-2222222222222222-01"
+                            "ff-11111111111111111111111111111111-2222222222222222-01"
+                            (substitute #\A #\1 parent)))
+        (check "invalid W3C parent is ignored"
+               (null (extract-trace-context (list (cons "traceparent" invalid))))))
+      (dolist (flags '("04" "05" "ff"))
+        (let ((context (extract-trace-context
+                        (list (cons "traceparent" (concatenate 'string (subseq parent 0 53) flags))))))
+          (check "unknown trace flag bits do not discard valid parent identity"
+                 (and context (= (getf context :trace-flags)
+                                 (logand 3 (parse-integer flags :radix 16)))))))
+      (let ((context (extract-trace-context
+                      (list (cons "traceparent" parent) (cons "tracestate" "vendor=a,vendor=b")))))
+        (check "invalid tracestate does not discard valid traceparent"
+               (and context (null (getf context :trace-state)))))
+      (let ((*trace-context* context))
+        (let ((child (child-trace-context (getf context :trace-id) "3333333333333333")))
+          (check "child context preserves flags and tracestate"
+                 (and (= (getf child :trace-flags) 3)
+                      (equal (getf child :trace-state) "vendor=opaque"))))))
+    (let* ((generic (agento11y-cl::build-span :name "generic" :kind 1))
+           (genai (agento11y-cl::build-genai-span (agento11y-cl::make-genai-invocation)))
+           (payload (agento11y-cl::build-otlp-payload
+                     (list generic genai) "service" "v1"
+                     :resource-attributes '(("deployment.environment.name" . "test"))))
+           (groups (jget* payload "resourceSpans" 0 "scopeSpans")))
+      (check "generic and GenAI spans retain separate scopes"
+             (and (= (length groups) 2)
+                  (equal (jget* groups 0 "scope" "name") "agento11y-cl")
+                  (equal (jget* groups 1 "scope" "name") "otel-genai-cl")))
+      (check "internal scope bookkeeping does not enter OTLP JSON"
+             (not (search "_scope" (jzon:stringify payload))))
+      (check "queued span retains scope after serialization" (jget generic "_scope"))
+      (check "arbitrary resource attributes enter OTLP"
+             (search "deployment.environment.name" (jzon:stringify payload))))
+    (let* ((inv (agento11y-cl::make-genai-invocation :top-k 7))
+           (attrs (agento11y-cl::genai-request-attributes inv))
+           (attr (find "gen_ai.request.top_k" attrs
+                       :key (lambda (item) (jget item "key")) :test #'equal)))
+      (check "top-k uses OTLP intValue" (equal (jget* attr "value" "intValue") "7")))
+    (let* ((inv (agento11y-cl::make-genai-invocation
+                 :usage (agento11y-cl::make-genai-usage :cache-read 4)))
+           (span (agento11y-cl::build-genai-span inv)))
+      (check "cache-only usage does not invent zero input/output counters"
+             (and (null (genai-attr span "gen_ai.usage.input_tokens"))
+                  (null (genai-attr span "gen_ai.usage.output_tokens"))
+                  (genai-attr span "gen_ai.usage.cache_read.input_tokens")))
+      (setf (agento11y-cl::genai-invocation-operation inv) "fetch_response")
+      (check "polling operations do not duplicate token counts"
+             (null (genai-attr (agento11y-cl::build-genai-span inv)
+                               "gen_ai.usage.cache_read.input_tokens"))))
+    (let ((values (agento11y-cl::resource-otel-value (vector "text" 3 t nil 0.5d0))))
+      (check "resource arrays retain OTLP value types"
+             (and (equal (jget* values "arrayValue" "values" 0 "stringValue") "text")
+                  (equal (jget* values "arrayValue" "values" 1 "intValue") "3")
+                  (eq (jget* values "arrayValue" "values" 2 "boolValue") t)
+                  (null (jget* values "arrayValue" "values" 3 "boolValue"))
+                  (= (jget* values "arrayValue" "values" 4 "doubleValue") 0.5d0))))
+    (check "nested JSON doubles use JSON exponent syntax"
+           (= (jget (jzon:parse (agento11y-cl::genai-json
+                                 (list :object (cons "number" 0.5d0)))) "number") 0.5d0))
     ;; Attribute helpers
     (let ((attr (otel-string-attr "key" "val")))
       (check "string-attr key" (equal (jget attr "key") "key"))
@@ -915,7 +989,9 @@ experiment-runs branch, whose prefix they share."
            (payload (agento11y-cl::build-otlp-payload (list span) "my-svc" "1.0")))
       (check "payload has resourceSpans" (jget payload "resourceSpans"))
       (let* ((rs (aref (jget payload "resourceSpans") 0))
-             (svc-name (jget* (aref (jget* rs "resource" "attributes") 0) "value" "stringValue")))
+             (svc-name (jget* (find "service.name" (jget* rs "resource" "attributes")
+                                    :key (lambda (attr) (jget attr "key")) :test #'equal)
+                              "value" "stringValue")))
         (check "payload service.name" (equal svc-name "my-svc"))))
 
     ;; Error classification
@@ -1045,6 +1121,7 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-recorder-tests ()
   (with-test-suite ("Recorder")
+    (integrity-privacy-regression-cases)
     (dolist (protocol '(:http :otel))
       (let ((client (make-test-client :capture :full :generation-protocol protocol
                                       :experimental-features t)))
@@ -1294,8 +1371,7 @@ experiment-runs branch, whose prefix they share."
                 (recorder-end rec)
                 (check "recording retains the original error object"
                        (eq failure (agento11y-cl::recorder-call-error rec))))
-              (let ((spans (agento11y-cl::queue-drain-all
-                            (agento11y-cl::client-trace-queue client))))
+              (let ((spans (drain-recorded-spans client)))
                 (check "four recorders export exactly once" (= (length spans) 4))
                 (dolist (span spans)
                   (check "protocol success status is unchanged; errors remain code 2"
@@ -2486,7 +2562,8 @@ experiment-runs branch, whose prefix they share."
     ;; Tool execution recorder
     (multiple-value-bind (client get-requests) (make-test-client :generation-enabled nil)
       (declare (ignore get-requests))
-      (let ((*trace-context* (list :trace-id "parent-trace" :span-id "parent-span")))
+      (let ((*trace-context* (list :trace-id "11111111111111111111111111111111"
+                                    :span-id "2222222222222222")))
         (let ((rec (start-tool-execution client
                      :tool-name "search"
                      :tool-call-id "tc-1"
@@ -2498,8 +2575,8 @@ experiment-runs branch, whose prefix they share."
           (let ((span (first (agento11y-cl::queue-drain-all
                               (agento11y-cl::client-trace-queue client)))))
             (check "tool span enqueued" (not (null span)))
-            (check "tool span parent" (equal (jget span "parentSpanId") "parent-span"))
-            (check "tool span trace" (equal (jget span "traceId") "parent-trace"))
+            (check "tool span parent" (equal (jget span "parentSpanId") "2222222222222222"))
+            (check "tool span trace" (equal (jget span "traceId") "11111111111111111111111111111111"))
             (check "tool span name" (search "execute_tool search" (jget span "name")))
             (check "tool span kind=INTERNAL" (= (jget span "kind") 1))))))
 
@@ -3450,6 +3527,8 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-client-tests ()
   (with-test-suite ("Client")
+    (agento11y-cl::native-deadline-regression-cases)
+    (transport-lifecycle-regression-cases)
     ;; Noop client
     (let ((client (noop-client)))
       (check "noop client created" (not (null client)))
@@ -3553,6 +3632,73 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-macro-tests ()
   (with-test-suite ("Macros")
+    #+sbcl
+    (let ((client (make-test-client)) (original (make-condition 'sb-ext:timeout)))
+      (check "non-ERROR serious conditions retain their identity"
+             (handler-case
+                 (progn (with-generation (rec client) (error original)) nil)
+               (serious-condition (condition) (eq condition original))))
+      (check "timeout conditions mark the recorder failed"
+             (eql (jget* (first (drain-recorded-spans client)) "status" "code") 2)))
+    (macrolet ((recoverable-error () '(restart-case (error "recoverable") (recover () :recovered))))
+      (dolist (protocol '(:http :otel))
+        (dolist (invoke (list (lambda (client) (with-generation (rec client) (recoverable-error)))
+                             (lambda (client) (with-tool-execution (rec client :tool-name "tool")
+                                                (recoverable-error)))
+                             (lambda (client) (with-embedding (rec client) (recoverable-error)))
+                             (lambda (client) (with-workflow-step (rec client :step-name "step")
+                                                (recoverable-error)))
+                             (lambda (client) (with-span (client "generic") (recoverable-error)))))
+          (let* ((client (make-test-client :generation-protocol protocol :experimental-features t
+                                           :workflow-steps-enabled t))
+                 (result (handler-case
+                             (handler-bind ((error (lambda (condition)
+                                                     (declare (ignore condition))
+                                                     (let ((restart (find-restart 'recover)))
+                                                       (when restart (invoke-restart restart))))))
+                               (funcall invoke client))
+                           (error () :escaped))))
+            (check "instrumentation preserves application restart recovery" (eq result :recovered))
+            (check "recovered errors do not mark the completed recorder failed"
+                   (every (lambda (span) (not (eql (jget* span "status" "code") 2)))
+                          (drain-recorded-spans client)))))))
+    (dolist (protocol '(:http :otel))
+      (dolist (capture '(:full :metadata-only))
+        (dolist (invoke (list (lambda (client condition)
+                               (with-generation (rec client :model-name "model" :model-provider "provider")
+                                 (error condition)))
+                             (lambda (client condition)
+                               (with-tool-execution (rec client :tool-name "tool")
+                                 (error condition)))
+                             (lambda (client condition)
+                               (with-embedding (rec client :model-name "embedding" :model-provider "provider")
+                                 (error condition)))
+                             (lambda (client condition)
+                               (with-workflow-step (rec client :step-name "step" :conversation-id "conversation")
+                                 (error condition)))))
+          (let* ((client (make-test-client :generation-protocol protocol :experimental-features t
+                                           :capture capture :workflow-steps-enabled t))
+                 (original (make-condition 'simple-error :format-control "MACRO-PRIVATE-ERROR")))
+            (check "recorder macro preserves escaping condition identity"
+                   (handler-case (progn (funcall invoke client original) nil)
+                     (error (condition) (eq condition original))))
+            (let ((span (first (drain-recorded-spans client))))
+              (check "recorder macro records escaping errors automatically"
+                     (eql (jget* span "status" "code") 2))
+              (check "automatic error text follows capture policy"
+                     (equal (jget* span "status" "message")
+                            (if (eq capture :full) "MACRO-PRIVATE-ERROR" "sdk_error"))))))))
+    (dolist (protocol '(:http :otel))
+      (let ((client (make-test-client :generation-protocol protocol :experimental-features t))
+            tool-id child-id)
+        (with-tool-execution (tool client :tool-name "parent-tool")
+          (setf tool-id (tool-rec-span-id tool))
+          (with-generation (child client :model-name "model" :model-provider "provider")
+            (setf child-id (gen-rec-span-id child))))
+        (let* ((spans (drain-recorded-spans client))
+               (child (find child-id spans :key (lambda (span) (jget span "spanId")) :test #'equal)))
+          (check "nested generations parent to the active tool span"
+                 (equal (jget child "parentSpanId") tool-id)))))
     (dolist (protocol '(:http :otel))
       (dolist (override '(nil :full))
         (multiple-value-bind (client requests)
@@ -3572,8 +3718,7 @@ experiment-runs branch, whose prefix they share."
                                   'agento11y-cl::content-capture-mode) :full)
                 (set-result tool :process-exit-code 0)))
             (check "typed tool macro evaluates the capture option once" (= options 1))
-            (let* ((spans (agento11y-cl::queue-drain-all
-                          (agento11y-cl::client-trace-queue client)))
+            (let* ((spans (drain-recorded-spans client))
                    (tool (find "execute_tool exec review check.py" spans
                                :key (lambda (span) (jget span "name")) :test #'equal)))
               (check "typed tool macro exports one child and its generation" (= (length spans) 2))
@@ -3636,13 +3781,13 @@ experiment-runs branch, whose prefix they share."
                           (with-generation (child client :model-name "child")
                             (record-error child))))
                       (error failure)))))
-              (let ((generations (agento11y-cl::queue-drain-all
-                                  (agento11y-cl::client-generation-queue client)))
-                    (workflows (agento11y-cl::queue-drain-all
-                                (agento11y-cl::client-workflow-queue client)))
-                    (spans (agento11y-cl::queue-drain-all
-                            (agento11y-cl::client-trace-queue client)))
-                    (payload-error (if (eq mode :metadata-only) "rate_limit" failure)))
+              (let* ((generations (when (eq protocol :http)
+                                    (agento11y-cl::queue-drain-all
+                                     (agento11y-cl::client-generation-queue client))))
+                     (workflows (agento11y-cl::queue-drain-all
+                                 (agento11y-cl::client-workflow-queue client)))
+                     (spans (drain-recorded-spans client))
+                     (payload-error (if (eq mode :metadata-only) "rate_limit" failure)))
                 (check "nested generation payload count follows protocol"
                        (= (length generations) (if (eq protocol :http) 2 0)))
                 (dolist (generation generations)
@@ -5134,6 +5279,7 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-experiment-tests ()
   (with-test-suite ("Experiments")
+    (agento11y-cl::experiment-otel-regression-cases)
     (labels ((empty-jobj-p (obj)
                (and (hash-table-p obj) (zerop (hash-table-count obj))))
              (ends-with-p (suffix text)
@@ -6054,9 +6200,13 @@ experiment-runs branch, whose prefix they share."
           (check "score export body matches the pinned bytes"
                  (equal (third bodies)
                         "{\"scores\":[{\"score_id\":\"score-f97882d5fc838573\",\"evaluator_id\":\"judge\",\"evaluator_version\":\"1\",\"score_key\":\"quality\",\"value\":{\"number\":1.0},\"trial_id\":\"trial-011f75bdcfbbe2dc\",\"experiment_id\":\"exp-stable\",\"conversation_id\":\"conv-e3921792bf7015da\",\"test_case_id\":\"it1\",\"passed\":true,\"metadata\":{\"item_id\":\"it1\"},\"source\":{\"kind\":\"experiment\",\"id\":\"exp-stable\"}}]}"))
-          (check "trial patch body matches the pinned bytes"
-                 (equal (fourth bodies)
-                        "{\"status\":\"completed\",\"conversation_id\":\"conv-e3921792bf7015da\"}"))
+          (let ((body (jzon:parse (fourth bodies))))
+            (check "trial patch includes measured duration"
+                   (and (numberp (jget body "duration_ms")) (>= (jget body "duration_ms") 0)))
+            (remhash "duration_ms" body)
+            (check "trial patch retains the pinned non-timing fields"
+                   (equal (jzon:stringify body)
+                          "{\"status\":\"completed\",\"conversation_id\":\"conv-e3921792bf7015da\"}")))
           (check "finalize body matches the pinned bytes"
                  (equal (fifth bodies)
                         "{\"status\":\"completed\",\"source\":{\"kind\":\"sdk\",\"id\":\"lisp\"},\"score_count\":1}"))))
@@ -6570,8 +6720,10 @@ experiment-runs branch, whose prefix they share."
                                        (trial-id trial)))))
             (check "clean close sends status completed"
                    (equal (jget posted "status") "completed"))
-            (check "clean close body is sparse"
-                   (= (hash-table-count posted) 1))
+            (check "clean close contains status and measured duration"
+                   (and (= (hash-table-count posted) 2)
+                        (numberp (jget posted "duration_ms"))
+                        (>= (jget posted "duration_ms") 0)))
             (check "trial-closed-p is set after close" (trial-closed-p trial)))
           (setf (cdr calls) nil)
           (trial-close trial)
@@ -8525,7 +8677,10 @@ experiment-runs branch, whose prefix they share."
     (when value (jget value "stringValue"))))
 
 (defun genai-only-span (client)
-  (let ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
+  (let ((spans (append
+                (when (eq (config-generation-protocol (agento11y-cl::client-config client)) :otel)
+                  (agento11y-cl::queue-drain-all (agento11y-cl::client-generation-queue client)))
+                (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client)))))
     (values (first spans) (length spans))))
 
 (defun genai-otel-client (&rest args)
@@ -8539,6 +8694,36 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-otel-genai-tests ()
   (with-test-suite ("OTel GenAI export")
+    (dolist (protocol '(:http :otel))
+      (let* ((client (make-client
+                      (make-config :generation-protocol protocol :generation-enabled t
+                                   :experimental-features t :traces-enabled t
+                                   :traces-endpoint "http://fake.invalid/v1/traces"
+                                   :tags '(("env" . "client"))
+                                   :http-fn (lambda (&rest args) (declare (ignore args)) (values "{}" 200)))
+                      :env-fn (constantly nil)))
+             (rec (start-generation client :model-name "model" :model-provider "provider"
+                                    :tags '(("env" . "request") ("request" . "private"))
+                                    :metadata (jobj "agento11y.gen_ai.request.thinking.budget_tokens" "64"))))
+        (recorder-end rec)
+        (let ((span (genai-only-span client)))
+          (check "span SDK identity is queryable"
+                 (equal (genai-attr-string span "agento11y.sdk.name") "agento11y-cl"))
+          (check "thinking budget metadata becomes an integer span attribute"
+                 (equal (jget (genai-attr span "agento11y.gen_ai.request.thinking.budget_tokens")
+                              "intValue") "64"))
+          (check "generation tags cannot override client dimensions"
+                 (and (equal (genai-attr-string span "agento11y.tag.env") "client")
+                      (null (genai-attr span "agento11y.tag.request"))))
+          (check "only the sole OTel generation copy opts into generation routing"
+                 (if (eq protocol :otel)
+                     (equal (genai-attr-string span "agento11y.record") "true")
+                     (let ((marker (genai-attr span "agento11y.record")))
+                       (and marker (null (jget marker "boolValue"))))))
+          (when (eq protocol :otel)
+            (let ((tags (jzon:parse (genai-attr-string span "agento11y.generation.tags"))))
+              (check "generation-specific tags remain in the export document"
+                     (equal (jget tags "env") "request")))))))
     (dolist (protocol '(:http :otel))
       (dolist (mode '(:full :no-tool-content :metadata-only :full-with-metadata-spans))
         (let ((client (make-test-client :capture mode :generation-protocol protocol

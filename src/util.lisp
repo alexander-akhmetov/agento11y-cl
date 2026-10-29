@@ -79,23 +79,16 @@ Parses fractional seconds if present. Returns NIL for invalid input."
 
 ;;; --- ID generation (thread-safe) ---
 
-(defvar *id-counter* 0)
 (defvar *id-lock* (bt2:make-lock :name "agento11y-id"))
 (defvar *id-random-state* (make-random-state t))
 
 (defun generate-id ()
   "Generate a unique generation ID like gen_<hex>."
-  (let ((ts (get-universal-time))
-        (seq (bt2:with-lock-held (*id-lock*)
-               (incf *id-counter*))))
-    (format nil "gen_~8,'0x~4,'0x" ts (mod seq #xFFFF))))
+  (format nil "gen_~a" (generate-trace-id)))
 
 (defun generate-workflow-step-id ()
   "Generate a unique workflow step ID like wfs_<hex>."
-  (let ((ts (get-universal-time))
-        (seq (bt2:with-lock-held (*id-lock*)
-               (incf *id-counter*))))
-    (format nil "wfs_~8,'0x~4,'0x" ts (mod seq #xFFFF))))
+  (format nil "wfs_~a" (generate-trace-id)))
 
 (defun generate-trace-id ()
   "Generate a 32-hex-char lowercase trace ID (128-bit random).
@@ -175,6 +168,16 @@ codepoint (true on SBCL, CCL, ECL)."
                 (vector-push-extend (logior #x80 (logand (ash code -6) #x3F)) out)
                 (vector-push-extend (logior #x80 (logand code #x3F)) out))))
     out))
+
+(defun utf8-base64-encode (text)
+  "Encode TEXT as UTF-8 bytes, then base64. Octet vectors retain their bytes."
+  (cl-base64:usb8-array-to-base64-string
+   (if (stringp text) (string-to-utf8-octets text) text)))
+
+(defun utf8-base64-decode (encoded)
+  "Decode base64 UTF-8 text. Invalid UTF-8 signals an error."
+  (babel:octets-to-string (cl-base64:base64-string-to-usb8-array encoded)
+                          :encoding :utf-8 :errorp t))
 
 (defun sha1-hex (octets)
   "Return the SHA-1 digest of OCTETS as a lowercase hex string."

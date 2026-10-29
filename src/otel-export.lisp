@@ -163,7 +163,9 @@ A JSON null is rejected too: the decoder reads a null as an absent payload."
 (defun %otel-decode-b64 (value)
   "Decode a payload field that carries base64 text, or NIL."
   (when (and (stringp value) (plusp (length value)))
-    (handler-case (cl-base64:base64-string-to-string value)
+    (handler-case
+        (babel:octets-to-string (cl-base64:base64-string-to-usb8-array value)
+                               :encoding :utf-8 :errorp t)
       (error () nil))))
 
 (defun otel-json-document (b64)
@@ -175,7 +177,7 @@ tool calls onto the base64 key and leave the semconv field empty for every
 generic OTel consumer."
   (let ((text (%otel-decode-b64 b64)))
     (cond
-      ((null text) (values nil nil))
+      ((null text) (values nil (%otel-string b64)))
       ((otel-embeddable-json text) (values text nil))
       (t (values nil b64)))))
 
@@ -403,7 +405,7 @@ has to gate; in otel mode the messages are on the span, so the gate moves here."
 
 ;;; --- Invocation assembly ---
 
-(defun otel-vendor-generation (payload error-category)
+(defun otel-vendor-generation (payload error-category dimensional-tags)
   "The agento11y fields of PAYLOAD that the conventions do not define."
   (let ((metadata (%otel-alist (jget payload "metadata") :sort t))
         (usage (jget payload "usage")))
@@ -412,6 +414,10 @@ has to gate; in otel mode the messages are on the span, so the gate moves here."
      :user-id (%otel-string (cdr (assoc "agento11y.user.id" metadata :test #'string=)))
      :tags (%otel-alist (jget payload "tags") :sort t)
      :metadata metadata
+     :dimensional-tags dimensional-tags
+     :inclusive-input (member (and usage (jget usage "input_semantics"))
+                              '("TOKEN_INPUT_SEMANTICS_INCLUSIVE" "inclusive" 1)
+                              :test #'equal)
      :parent-generation-ids (%otel-list (jget payload "parent_generation_ids"))
      :tool-choice (%otel-string (jget payload "tool_choice"))
      :thinking-enabled (multiple-value-bind (value found)
@@ -424,7 +430,7 @@ has to gate; in otel mode the messages are on the span, so the gate moves here."
   (if keep messages (otel-strip-tool-content messages)))
 
 (defun genai-invocation-from-generation (payload capture
-                                         &key parent-span-id
+                                         &key parent-span-id dimensional-tags
                                               error-type error-message error-category)
   "Build the GenAI-semconv invocation for a generation payload.
 CAPTURE is the SDK capture mode the generation resolved to. ERROR-TYPE,
@@ -484,7 +490,7 @@ capture-gated by the caller, the way the native span's status message is."
                :error-type error-type
                :error-message error-message)))
     (setf (genai-invocation-extra-attributes inv)
-          (genai-vendor-attributes (otel-vendor-generation payload error-category)
+          (genai-vendor-attributes (otel-vendor-generation payload error-category dimensional-tags)
                                    genai-capture))
     inv))
 

@@ -76,8 +76,7 @@ an ordered object (:OBJECT (key . value) ...), or an array (:ARRAY value ...)."
     (string (genai-write-json-string value stream))
     (integer (format stream "~d" value))
     (genai-raw-json (write-string (genai-raw-json-text value) stream))
-    (real (let ((*read-default-float-format* 'double-float))
-            (format stream "~a" (float value 1d0))))
+    (real (write-string (jzon:stringify (float value 1d0)) stream))
     (t
      (cond
        ((eq value :true) (write-string "true" stream))
@@ -212,14 +211,17 @@ the key.")
                             :accessor genai-usage-reasoning-output-tokens :initform 0)
    ;; Marks an all-zero usage a provider really did return. Any non-zero count
    ;; already counts as reported without it.
-   (reported :initarg :reported :accessor genai-usage-reported :initform nil)))
+   (reported :initarg :reported :accessor genai-usage-reported :initform nil)
+   (input-reported :initarg :input-reported :accessor genai-usage-input-reported :initform nil)
+   (output-reported :initarg :output-reported :accessor genai-usage-output-reported :initform nil)))
 
-(defun make-genai-usage (&key (input 0) (output 0) (cache-read 0)
+(defun make-genai-usage (&key (input 0 input-p) (output 0 output-p) (cache-read 0)
                               (cache-creation 0) (reasoning 0) reported)
   (make-instance 'genai-usage :input-tokens input :output-tokens output
                               :cache-read-input-tokens cache-read
                               :cache-creation-input-tokens cache-creation
                               :reasoning-output-tokens reasoning
+                              :input-reported input-p :output-reported output-p
                               :reported reported))
 
 (defun genai-usage-reported-p (usage)
@@ -625,8 +627,8 @@ call and for a call with no timed chunk."
                               (genai-invocation-temperature inv)) attrs))
     (when (realp (genai-invocation-top-p inv))
       (push (otel-double-attr "gen_ai.request.top_p" (genai-invocation-top-p inv)) attrs))
-    (when (realp (genai-invocation-top-k inv))
-      (push (otel-double-attr "gen_ai.request.top_k" (genai-invocation-top-k inv)) attrs))
+    (when (integerp (genai-invocation-top-k inv))
+      (push (otel-int-attr "gen_ai.request.top_k" (genai-invocation-top-k inv)) attrs))
     (when (realp (genai-invocation-frequency-penalty inv))
       (push (otel-double-attr "gen_ai.request.frequency_penalty"
                               (genai-invocation-frequency-penalty inv)) attrs))
@@ -680,13 +682,16 @@ call and for a call with no timed chunk."
       (when ttfc
         (push (otel-double-attr "gen_ai.response.time_to_first_chunk" ttfc) attrs)))
     (let ((usage (genai-invocation-usage inv)))
-      (when (genai-usage-reported-p usage)
-        ;; Both counts go out even at zero, so a zero-valued usage a provider
-        ;; did return still decodes as present.
-        (push (otel-int-attr "gen_ai.usage.input_tokens"
-                             (genai-usage-input-tokens usage)) attrs)
-        (push (otel-int-attr "gen_ai.usage.output_tokens"
-                             (genai-usage-output-tokens usage)) attrs)
+      (when (and (genai-usage-reported-p usage)
+                 (not (equal (genai-invocation-operation-name inv) "fetch_response")))
+        (when (or (genai-usage-input-reported usage)
+                  (/= 0 (genai-usage-input-tokens usage)))
+          (push (otel-int-attr "gen_ai.usage.input_tokens"
+                               (genai-usage-input-tokens usage)) attrs))
+        (when (or (genai-usage-output-reported usage)
+                  (/= 0 (genai-usage-output-tokens usage)))
+          (push (otel-int-attr "gen_ai.usage.output_tokens"
+                               (genai-usage-output-tokens usage)) attrs))
         (when (/= 0 (genai-usage-cache-read-input-tokens usage))
           (push (otel-int-attr "gen_ai.usage.cache_read.input_tokens"
                                (genai-usage-cache-read-input-tokens usage)) attrs))
@@ -805,6 +810,9 @@ instrumentation library reports; Ok is the application's to set."
                 :parent-span-id (genai-invocation-parent-span-id inv)
                 :name (genai-span-name inv)
                 :kind (genai-span-kind inv)
+                :scope-name +genai-scope-name+
+                :scope-version +genai-version+
+                :schema-url +genai-schema-url+
                 :start-time-unix-nano (genai-invocation-started-at-nano inv)
                 :end-time-unix-nano (genai-invocation-completed-at-nano inv)
                 :attributes (coerce attrs 'vector)

@@ -10,6 +10,7 @@
    #:client-start
    #:client-shutdown
    #:client-flush
+   #:client-export-diagnostics
    #:noop-client
    ;; Recorder creation
    #:start-generation
@@ -56,6 +57,7 @@
    #:experiment-run-open-trials-list
    #:experiment-run-close-open-trials
    #:experiment-run-suite
+   #:experiment-run-use-experimental-otel
    #:make-score
    #:make-dataset-item
    #:make-target-result
@@ -82,6 +84,12 @@
    #:trial-generation-id
    #:trial-trace-id
    #:trial-span-id
+   #:trial-conversation-trace-id
+   #:trial-conversation-span-id
+   #:trial-duration-ms
+   #:trial-input-tokens
+   #:trial-output-tokens
+   #:trial-cost
    #:trial-created-p
    #:trial-closed-p
    ;; Cloud trial evaluation (experimental)
@@ -207,6 +215,15 @@
    #:config-embedding-max-input-items
    #:config-embedding-max-text-length
    #:config-experimental-features
+   #:config-use-experimental-otel
+   #:config-option-supplied-p
+   #:config-generation-enqueue-timeout-sec
+   #:config-resource-attributes
+   #:config-service-instance-id
+   #:config-traces-headers
+   #:config-metrics-headers
+   #:config-traces-protocol
+   #:config-metrics-protocol
    ;; Types + constructors
    #:message
    #:text-part
@@ -224,6 +241,7 @@
    #:make-token-usage
    ;; Accessors
    #:message-role
+   #:message-name
    #:message-parts
    #:text-part-text
    #:thinking-part-text
@@ -233,12 +251,20 @@
    #:tool-result-part-tool-call-id
    #:tool-result-part-name
    #:tool-result-part-content
+   #:tool-result-part-content-json
    #:tool-result-part-is-error
    #:media-part-kind
    #:media-part-url
    #:media-part-mime-type
    #:media-part-name
    #:media-part-provider-type
+   #:token-usage-input-tokens
+   #:token-usage-output-tokens
+   #:token-usage-total-tokens
+   #:token-usage-reasoning-tokens
+   #:token-usage-cache-read-tokens
+   #:token-usage-cache-creation-tokens
+   #:token-usage-input-semantics
    ;; Normalization
    #:normalize-input-messages
    #:normalize-message
@@ -252,12 +278,17 @@
    #:*trace-context*
    #:*experiment-run*
    #:child-trace-context
+   #:extract-trace-context
+   #:trace-context-headers
    #:capture-telemetry-context
    #:with-telemetry-context
    #:telemetry-context-thunk
    #:gen-rec-generation-id
    #:gen-rec-trace-id
    #:gen-rec-span-id
+   #:tool-rec-trace-id
+   #:tool-rec-span-id
+   #:tool-rec-parent-span-id
    #:emb-rec-trace-id
    #:emb-rec-span-id
    #:emb-rec-parent-span-id
@@ -289,6 +320,7 @@
    #:agento11y-config-error
    #:agento11y-export-error
    #:agento11y-export-error-status-code
+   #:agento11y-export-error-diagnostics
    #:agento11y-validation-error
    #:agento11y-not-found-error
    #:agento11y-conflict-error

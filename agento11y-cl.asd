@@ -28,6 +28,7 @@
                (:file "exporter")
                (:file "metrics")
                (:file "recorder")
+               (:file "propagation")
                ;; Before "rating": SUBMIT-CONVERSATION-RATING derives its base
                ;; URL with %RESOLVE-API-BASE-URL, defined here.
                (:file "hooks")
@@ -36,6 +37,7 @@
                (:file "eval")
                (:file "suite")
                (:file "trial")
+               (:file "experiment-otel")
                (:file "macros")
                ;; Before "experiment": TRIAL-RECORD-EVALUATION reads the
                ;; EVALUATION-RESULT accessors defined here.
@@ -53,4 +55,6 @@
                (:file "suite")
                ;; Before "tests": RUN-TESTS calls the conformance suites.
                (:file "conformance")
+               (:file "otel-regressions")
+               (:file "native-deadlines")
                (:file "tests")))

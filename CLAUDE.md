@@ -19,7 +19,7 @@ The SBCL invocation uses `--no-userinit` and loads deps via Quicklisp. Set `QUIC
 
 `t/conformance.lisp` checks this SDK against the cross-SDK fixtures vendored in `t/fixtures/`, in three suites: hooks, experiments, and redaction. `make conformance-refresh` re-copies the fixtures from an `agento11y` checkout, and `t/fixtures/README.md` maps each file to its upstream path and commit. Do not edit a fixture to make a suite green: a shape change belongs upstream in `grafana/agento11y`, run through the server's decoder first.
 
-The redaction engine and the content-capture rules are behind the fixtures. Every redaction check that fails for that reason is listed by id in `+cf-known-redaction-failures+`, so `make test` stays green and any other failure turns it red. A listed check that starts passing fails too, naming the id to drop from the list.
+All vendored redaction checks must pass. There is no expected-failure list.
 
 ## Architecture
 
@@ -38,11 +38,11 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 
 ### Key design decisions
 
-- **Two independent queues**: `client-generation-queue` (generation payloads) and `client-trace-queue` (OTel spans). Both are bounded and drop-oldest on overflow.
-- **`*trace-context*`** (dynamic variable): `with-generation` binds this with the generation's trace-id/span-id. Child `with-tool-execution` and `with-embedding` calls read it to set their `parentSpanId`, creating the span tree.
+- **Separate export queues**: `client-generation-queue` holds native generation payloads or OTel generation spans; tools and diagnostic spans use `client-trace-queue`. OTel generation enqueue waits for capacity, then signals an export error after `:generation-enqueue-timeout-sec`. Other queues retain drop-oldest behavior with loss counters. `client-flush` waits for in-flight exports and reports lifetime-sticky export failures and queue losses. No queue provides crash durability.
+- **`*trace-context*`** (dynamic variable): generation, tool, embedding, workflow, and generic span macros bind their span context for children. Recorder IDs, parent IDs, trace flags, and tracestate are captured at start. `extract-trace-context` and `trace-context-headers` support explicit W3C HTTP propagation.
 - **Content capture modes** (`:full`, `:no-tool-content`, `:full-with-metadata-spans`, `:metadata-only`): control which content-bearing fields are serialized. Two surfaces are gated separately, so a mode needs two predicates: `capture-keeps-payload-content-p` for the generation payload and `capture-keeps-span-content-p` for OTel spans (with `capture-keeps-tool-span-content-p` stricter still, for tool call arguments and results). `:full-with-metadata-spans` keeps the payload and strips the spans. In `:metadata-only`, message structure is preserved but text and thinking fields are empty strings, tool inputs/results and media URLs are cleared, and the system prompt, conversation title, tool descriptions, tool input schemas, and rating comments are withheld. A redacting mode also removes the metadata keys the SDK mirrors content into (`+content-metadata-keys+`) whoever wrote them; no other caller metadata or tag is touched. `config.lisp` owns the vocabulary, so any mode outside the four keywords redacts. Withheld error text is exported as the classified error category, not a placeholder. Every generation carries `agento11y.sdk.content_capture_mode` (`+content-capture-mode-key+`) in both its tags map and its metadata map: the sigil backend reads the tag, the reference SDKs write the metadata key.
 - **Capture mode is resolved at start**, including workflow steps and generic spans. `resolve-content-capture-mode` (`config.lisp`) applies per-call override, resolved parent, resolver, then client mode. Embeddings and workflows have no per-call override. Read recorder policy with `recorder-capture-mode`. Only ratings remain on the client-level mode. `with-span`, `with-generation` and `with-workflow-step` publish the resolved mode through `child-trace-context`; all child factories consume it. Invalid modes and resolver errors fail closed to `:metadata-only`.
-- **Error text has one formatter**: `span-error-status-message` applies the span gate, then `condition-status-message` or `redacted-error-text`. The exported `condition-status-message` generic lets applications withhold library-specific details without changing condition identity. Payloads retain their separate gate. The low-level `build-span` serializer leaves capture policy to its caller.
+- **Error text has one formatter**: `span-error-status-message` applies span capture policy, then `condition-status-message` or `redacted-error-text`. Recorder paths also scan retained text when secret redaction is enabled. The exported `condition-status-message` generic lets applications withhold library-specific details without changing condition identity. Payloads retain their separate gate. The low-level `build-span` serializer leaves capture policy to its caller.
 - **Embedding identity is stored at start**: `start-embedding` accepts independent `:trace-id` and `:span-id` overrides like `start-generation`. Both protocols use `emb-rec-trace-id`, `emb-rec-span-id` and `emb-rec-parent-span-id`, never end-time ambient context. Both factories normalize valid IDs to lowercase and reject wrong-width, nonhex and zero IDs.
 - **`recorder-end :around`**: shared lifecycle logic (idempotency guard, timestamp, wake worker, metrics callback) lives in the `:around` method on the base `recorder` class. Type-specific serialization is in the primary methods.
 - **`http-fn` config slot**: tests inject a lambda to capture HTTP requests instead of hitting the network.
@@ -58,14 +58,16 @@ Common Lisp SDK that captures LLM telemetry and exports it via two paths:
 | `exporter.lisp` | HTTP POST with exponential backoff retry |
 | `normalize.lisp` | Convert raw Anthropic/OpenAI API hash-tables into SDK CLOS types |
 | `otel.lisp` | OTel attribute helpers, span/payload builders |
-| `queue.lisp` | Thread-safe bounded queue (drop-oldest overflow) |
+| `queue.lisp` | Thread-safe queues, timed capacity waits, and loss counters |
 | `auth.lisp` | Build auth headers from config (basic/bearer/tenant) |
 | `types.lisp` | CLOS message/part/token-usage types and constructors |
-| `env.lisp` | Resolve `AGENTO11Y_*` environment variables (with `SIGIL_*` legacy fallback) into a config |
+| `env.lisp` | Resolve branded and standard OTLP variables; explicit caller options, including `nil`, win |
 | `eval.lisp` | Experiment wire protocol: run upsert and finalize, score export, the read routes, ingest actor, HTTP status classification |
 | `suite.lisp` | Local `test-suite` and `test-case` values; trial snapshots |
 | `trial.lisp` | `experiment-trial`, `create-trial`, `finalize-trial`, `with-trial`, bind helpers |
 | `experiment.lisp` | `experiment-run` orchestration: upload modes, score building, trial lifecycle, `run-experiment` |
+| `experiment-otel.lisp` | Independently enabled suite/trial spans and score events; HTTP remains the storage path |
+| `propagation.lisp` | W3C traceparent/tracestate validation and HTTP header conversion |
 | `conversations.lisp` | Read collections and conversations; build datasets from them |
 | `metrics.lisp` | OTLP histogram registry and export |
 | `rating.lisp` | Submit conversation ratings |

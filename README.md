@@ -2,7 +2,7 @@
 
 Common Lisp SDK for [Grafana Agent Observability](https://github.com/grafana/agento11y).
 
-It captures LLM generations, tool executions, and embeddings from your application and exports them as structured telemetry — generation payloads over HTTP and traces via OTLP.
+It records LLM generations, tool executions, and embeddings. Generations use the native HTTP API or experimental OTel spans. Traces and metrics use OTLP over HTTP/JSON.
 
 ## Features
 
@@ -150,10 +150,9 @@ It rejects relative or opaque locations, malformed authorities, ports or percent
 Non-file URIs require a host. File URIs require an absolute path; `file:/path` becomes `file:///path`.
 Host spelling, explicit ports, and escaped path spelling are preserved. Invalid URIs omit only the source attribute.
 
-Finish tools inside the intended `with-generation` scope, as in the example.
-Tool recorders read trace context at completion, not at creation.
-For manual or cross-thread completion, restore the intended context with `capture-telemetry-context` and `with-telemetry-context`.
-Ending under another context can attach the tool to the wrong parent.
+Tool recorders store trace, span, and parent IDs at creation. Completing a tool under another context does not change its parent.
+`with-tool-execution` makes its span active so nested operations become its children.
+Use `capture-telemetry-context` and `with-telemetry-context` when starting new child operations on another thread.
 
 Sigil reads these attributes from retained Tempo traces. Configure trace routing and retention for the tool spans.
 Sending only generation payloads, or sending tool spans only to Sigil's generation receiver, is insufficient.
@@ -318,18 +317,37 @@ Behaviour:
 - **Correlation** → `trace-id` and `span-id` on the context fall back to the ambient `*trace-context*`, so a hook called inside `with-generation` reports the same trace as the generation it guards. Set them (or `conversation-id`) explicitly to override.
 - **Part encoding** → every message part carries its `kind`; the server dispatches on that field. Tool call arguments and tool result payloads go out as embedded JSON so rules can match on them, while a tool definition's `input_schema_json` stays base64, which is what the server's protobuf bytes field expects.
 
-### Shutdown
+### Export completion
 
 ```lisp
-(agento11y-cl:client-shutdown *client*)
+(agento11y-cl:client-flush *client* :timeout-sec 5)
+(agento11y-cl:client-shutdown *client* :timeout-sec 5)
 ```
+
+Flush waits for in-flight exports, then drains pending records. Shutdown also drains a client whose worker was never started.
+Failed batches, OTLP partial rejection, queue loss, and timeouts signal `agento11y-export-error`.
+Inspect `agento11y-export-error-diagnostics` or `client-export-diagnostics` for details. Past losses remain visible for the client's lifetime.
+`client-flush :generations-only t` flushes only primary generation records and reports only their failures.
+Score and cloud-evaluation writes use this mode, so optional trace/metric failures do not prevent REST storage. Generation failures still block dependent writes.
+A completed HTTP request does not prove downstream generation storage.
+
+OTel generations use a separate queue. A full queue waits for `:generation-enqueue-timeout-sec` (default one second), then signals an export error without evicting another generation.
+Trace and native payload queues retain drop-oldest behavior; their losses are now reported.
+Queue limits count records, not bytes. These queues do not survive a process crash.
+Native export deadlines require SBCL and Dexador's USOCKET backend. They cover pooled reads, repeated reads, TLS waits, and locks; they cannot preempt foreign DNS calls or CPU work.
+Other Lisp implementations/backends must supply `:http-fn`, which must implement its own timeout. Shutdown does not kill a thread inside a request.
+
+Recorder macros record escaping errors and preserve the original application condition if export also fails.
 
 ## Configuration
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `:generation-endpoint` | `nil` | Full URL for generation export |
-| `:generation-enabled` | `nil` | Enable generation recording |
+| `:generation-enabled` | `nil` | Enable native generation export; explicitly setting `nil` also disables OTel generation export |
+| `:generation-protocol` | `:http` | Native generation HTTP export or experimental `:otel` |
+| `:experimental-features` | `nil` | Enable experimental generation transport and cloud evaluation |
+| `:use-experimental-otel` | `nil` | Enable separate experiment/trial diagnostic spans and score events |
 | `:eval-endpoint` | `nil` | Base URL for experiment control-plane requests; falls back to the generation endpoint host |
 | `:eval-path-prefix` | `"/api/v1"` | Path prefix for the experiment read routes. The `experiment-runs` write routes are absolute and ignore it |
 | `:eval-auth-token` | `nil` | Bearer token for control-plane requests; replaces the generation auth headers when set. Score export always uses generation auth |
@@ -339,10 +357,11 @@ Behaviour:
 | `:api-endpoint` | `nil` | Host root used to derive `/api/v1/...` URLs (currently the hooks endpoint). Falls back to the host of `:generation-endpoint` |
 | `:hooks-config` | `nil` (hooks off) | Synchronous hook evaluation config. Opt in with `(make-hooks-config :enabled t :phases '(:preflight) :timeout-sec 15.0 :fail-open t)`; `make-hooks-config` itself defaults to `:enabled nil` |
 | `:traces-endpoint` | `nil` | Full URL for OTLP trace export |
-| `:traces-enabled` | `nil` | Enable trace/span export |
+| `:traces-enabled` | `nil` | Enable companion and diagnostic spans; OTel generation transport works independently |
+| `:traces-headers`, `:metrics-headers` | `nil` | Separate HTTP header alists for each OTLP signal |
+| `:traces-forward-auth`, `:metrics-forward-auth` | Same-origin only | Explicit `t` permits forwarding API authentication and extra headers to another origin |
 | `:metrics-endpoint` | `nil` | Full URL for OTLP metrics export (e.g. `https://{host}/v1/metrics`) |
 | `:metrics-enabled` | `nil` | Enable built-in GenAI histogram metrics export |
-| `:metrics-forward-auth` | `t` | Forward the same auth headers to the metrics endpoint |
 | `:auth-mode` | `:none` | `:none`, `:basic`, `:bearer`, or `:tenant` |
 | `:auth-user` | `nil` | Basic auth username (falls back to tenant-id) |
 | `:auth-password` | `nil` | Auth password/token |
@@ -356,9 +375,13 @@ Behaviour:
 | `:batch-size` | `20` | Generations per export batch |
 | `:flush-interval-sec` | `5` | Background flush interval |
 | `:queue-max` | `500` | Generation queue capacity |
+| `:generation-enqueue-timeout-sec` | `1.0` | Maximum wait for OTel generation queue capacity |
+| `:export-timeout-sec` | `10` | Maximum native export duration per attempt, subject to the deadline limitations above |
 | `:trace-queue-max` | `nil` | Trace queue capacity (defaults to queue-max) |
 | `:service-name` | `"unknown"` | Service name (OTLP resource attribute `service.name`) |
 | `:service-version` | `nil` | Service version (OTLP resource attribute `service.version`) |
+| `:service-instance-id` | Random ID per client | Distinguishes independent cumulative metric producers; explicit config/environment values are preserved |
+| `:resource-attributes` | `nil` | Alist of additional OTLP resource attributes |
 | `:agent-name` | `nil` | Agent name for `gen_ai.agent.name` span attribute and generation `agent_name` field; falls back to `service-name` |
 | `:agent-version` | `nil` | Agent version for `gen_ai.agent.version` span attribute and generation `agent_version` field; falls back to `service-version` |
 | `:user-id` | `nil` | User identifier (OTel `user.id` span attribute) |
@@ -371,7 +394,7 @@ Behaviour:
 
 `make-client` automatically layers `AGENTO11Y_*` environment variables on top of
 the supplied config: explicit caller config wins over env, env wins over
-schema defaults. This matches the canonical agento11y SDKs schema (Go, Python, JS).
+schema defaults. Explicit `nil`, false, and default-valued options also win over the environment.
 
 Every variable also has a legacy `SIGIL_<SUFFIX>` spelling. The `AGENTO11Y_`
 name wins when both are set, and the choice is made before parsing, so a stale
@@ -399,32 +422,70 @@ spellings are never merged: the selected value is used whole, including for
 | `AGENTO11Y_DEBUG` | `:debug` | `1` / `true` / `yes` / `on` → t, otherwise nil |
 | `AGENTO11Y_ENABLE_EXPERIMENTAL_FEATURES` | `:experimental-features` | Same truthy values as `AGENTO11Y_DEBUG` |
 
-`AGENTO11Y_PROTOCOL` is not supported (agento11y-cl is HTTP-only); a warning is
-logged when set to anything other than `http`/`https`. `AGENTO11Y_INSECURE` is a
-no-op because TLS is controlled by the URL scheme.
+`AGENTO11Y_PROTOCOL=http` or `https` selects native HTTP export; `otel` selects experimental generation spans.
+`AGENTO11Y_USE_EXPERIMENTAL_OTEL=true` independently enables experiment diagnostics.
+`AGENTO11Y_INSECURE` remains a no-op because the URL scheme controls TLS.
+`noop-client` ignores environment configuration.
 
-> **Caveat: env can override caller defaults for a few slots.** The resolver
-> cannot distinguish "caller passed the schema default" from "caller never set
-> the slot". Practically this affects two security-sensitive options:
->
-> - `:auth-mode :none` — `AGENTO11Y_AUTH_MODE` will replace it. A caller asking
->   for "no auth" can have credentials added by env.
-> - `:content-capture-mode :no-tool-content` — `AGENTO11Y_CONTENT_CAPTURE_MODE`
->   will replace it. A caller who set `:no-tool-content` to keep tool I/O off
->   spans can be silently widened to `full` by the environment. Only the schema
->   default `:no-tool-content` is treated as unset, so an explicit
->   `:metadata-only` is never replaced.
->
-> If a deployment relies on these defaults for privacy or auth posture,
-> either set the matching variable to the desired value or unset it
-> before constructing the client. `make-client` accepts `:env-fn` for callers
-> that want to ignore the host environment entirely (e.g. tests).
->
-> `:eval-path-prefix` and `:ingest-actor` are not affected: their slots hold
-> NIL until a caller sets them, so an explicit value equal to the default
-> still wins over env.
+The exporter supports `http/json` only. An explicit OTLP `grpc` or `http/protobuf` protocol is rejected.
+Supported standard variables include:
+
+| Variable | Behavior |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base URL; append `/v1/traces` and `/v1/metrics` |
+| `AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT` | Branded base URL; takes precedence over standard endpoint variables |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Exact signal URLs; do not append a path |
+| `AGENTO11Y_TRACES_ENDPOINT`, `AGENTO11Y_METRICS_ENDPOINT` | Exact URLs; take precedence over base URLs |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Shared OTLP headers |
+| `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | Replace shared headers for that signal |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | Resource identity and additional attributes |
+
+A base endpoint does not enable a new signal by itself. A metrics-specific endpoint enables metrics unless explicitly disabled.
+API credentials are not automatically sent to another origin. Configure signal headers, or explicitly opt into forwarding.
+The exporter refuses HTTP redirects to prevent credentials and captured content from following a redirect.
+Explicit `nil` clears environment header/tag maps; nonempty caller maps override matching environment keys.
+
+### Experimental OTel generation export
+
+```lisp
+(agento11y-cl:make-client
+ (agento11y-cl:make-config
+  :generation-protocol :otel
+  :experimental-features t
+  :traces-endpoint "https://{your-collector}/v1/traces"
+  :traces-headers '(("Authorization" . "Basic {your-otlp-credentials}"))
+  :content-capture-mode :metadata-only
+  :service-name "my-app"))
+```
+
+The span is the generation record; no native generation POST is made. The destination must route spans marked `agento11y.record=true` to Agent Observability.
+A trace-only destination is insufficient. Retain tool spans in the trace backend if you need tool execution views.
+Hooks, ratings, scores, experiment APIs, and workflow-step records still use their HTTP endpoints.
+
+Lisp keeps two stricter privacy rules than Go/Python: `:full-with-metadata-spans` becomes metadata-only, and `:no-tool-content` also removes tool arguments/results inside generation messages.
+Use `:full` only when the destination may receive that content. OTel metadata-only export omits complete message and tool-definition documents, rather than preserving their reduced HTTP structure.
+
+When input tokens already include cached tokens, declare that contract explicitly:
+
+```lisp
+(agento11y-cl:make-token-usage :input 100 :output 20 :cache-read 60
+                             :input-semantics :inclusive)
+```
+
+The count of fresh input tokens is then 40 for pricing. The default `:unspecified` preserves existing provider-raw accounting.
+Do not add cache counts again to an inclusive input total.
+
+### Trace context
+
+`extract-trace-context` reads a header alist into a context plist. Bind the result to `*trace-context*` after authenticating an inbound caller.
+`trace-context-headers` returns `traceparent` and optional `tracestate` headers for an outbound request.
+The SDK does not install HTTP middleware or a sampler. Applications choose where to inject and extract headers.
+Use `capture-telemetry-context` / `with-telemetry-context` for thread propagation.
 
 ### Service vs agent identity
+
+Each client owns a separate cumulative metric registry and receives a new default `service.instance.id`, even when clients share a config.
+If you explicitly set an instance ID, use a distinct value for each independent producer with the same metric attributes.
 
 `:service-name` / `:service-version` populate the OTLP resource attributes
 `service.name` and `service.version` (i.e. who runs the SDK). `:agent-name` /
@@ -458,9 +519,8 @@ endpoint.
 | Embedding input texts | span | when `:embedding-capture-input` | when `:embedding-capture-input` | omitted | omitted |
 | Tool span args/results | span | full | `<redacted>` | `<redacted>` | `<redacted>` |
 
-Message and part structure survives every mode: a redacted part is exported with
-empty content rather than dropped, so part counts and roles stay comparable
-across modes.
+With native HTTP generation export, message and part structure survives every mode: redacted parts retain empty content.
+OTel metadata-only generation export omits message and tool-definition documents.
 
 `:no-tool-content` matches the Go SDK's `ContentCaptureModeNoToolContent`
 semantics: keep generation content for evaluation, but redact tool execution
@@ -631,6 +691,17 @@ OTLP serialization are hand-rolled here; the reference SDK gets these for free
 from the OTel `Meter`.
 
 ## Experiments
+
+Optional diagnostic tracing is independent of generation transport and cloud evaluation.
+Set `:use-experimental-otel t` on the client, `AGENTO11Y_USE_EXPERIMENTAL_OTEL=true`, or a per-run `:use-experimental-otel t` override. Explicit `nil` disables it.
+Normal trace export must also be enabled.
+
+A scoped experiment emits a `test_suite_run` span. Each `with-trial` activates an `eval.trial` child span and attaches its IDs to HTTP trial/score records.
+Locally recorded scores add `gen_ai.evaluation.result` events to that trial span. Events describe buffered scores, not successful HTTP ingestion.
+HTTP remains the storage path for experiments and scores. Proposed OTel names use the schema marker `experiments-otel-2026-06`.
+Explanations and detailed errors follow span capture policy and secret scanning; arbitrary score metadata remains caller-owned.
+Trial close measures duration and accepts explicit usage without inventing token counts or cost.
+With diagnostics enabled, `trial-bind-conversation` keeps the diagnostic trace/span IDs stable. Explicit conversation trace/span IDs are stored separately and exported as a span link.
 
 An offline evaluation publishes an **experiment run**, one **trial** per test
 case attempt, and **scores** attached to those trials.
