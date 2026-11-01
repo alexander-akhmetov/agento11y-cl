@@ -160,7 +160,7 @@ Returns NIL for system messages (handle via extract-system-prompt)."
                                        :content content)))))
         ;; Regular message (user/assistant)
         (t
-         (let ((parts (normalize-content-to-parts (jget msg "content") tool-name-map)))
+         (let ((parts (nreverse (normalize-content-to-parts (jget msg "content") tool-name-map))))
            ;; OpenAI assistant messages may also have tool_calls
            (when (equal role "assistant")
              (let ((tool-calls (jget msg "tool_calls")))

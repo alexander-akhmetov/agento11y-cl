@@ -4,7 +4,7 @@
   '(labels ((check-case (name value) (agento11y-cl/t::check name value))
              (config (&rest options)
                (apply #'make-config
-                      (append options (list :http-fn nil :max-retries 1
+                      (append options (list :http-fn nil :max-retries 3
                                             :export-timeout-sec 3
                                             :log-fn (lambda (&rest args)
                                                       (declare (ignore args)))))))
@@ -117,6 +117,26 @@
                                                     (t 1)))))
                  (when (eq mode :ok)
                    (check-case "receiver completed without errors" (null server-error))))))
+      (let ((original (symbol-function 'dexador:request))
+            (dexador:*dexador-backend* :usocket))
+        (unwind-protect
+             (dolist (budget '(nil 2))
+               (let ((*export-deadline* (monotonic-deadline budget)) (calls 0))
+                 (setf (symbol-function 'dexador:request)
+                       (lambda (&rest args)
+                         (declare (ignore args))
+                         (incf calls)
+                         (when (= calls 1) (error 'usocket:timeout-error))
+                         (values "{}" 200)))
+                 (multiple-value-bind (ok body diagnostic)
+                     (post-with-retry (config) "http://127.0.0.1:1/" "{}" nil
+                                      "generations" 1)
+                   (declare (ignore body))
+                   (check-case (format nil "native socket timeout is terminal with budget ~s" budget)
+                               (and (not ok) (= calls 1)
+                                    (eq :timeout (getf diagnostic :kind))
+                                    (eql 1 (getf diagnostic :attempts)))))))
+          (setf (symbol-function 'dexador:request) original)))
       (receiver-case "warm pooled blocked read" :blocked)
       (receiver-case "warm pooled slow drip" :drip)
       (receiver-case "outer earlier deadline" :blocked :outer 0.06d0 :budget 1d0)
