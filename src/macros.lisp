@@ -87,6 +87,17 @@ thread constructor."
       (with-telemetry-context (context)
         (funcall thunk)))))
 
+(defun %merge-span-attributes (caller defaults)
+  (let ((seen (make-hash-table :test 'equal))
+        (result nil))
+    (dolist (attributes (list caller defaults))
+      (dolist (attribute attributes)
+        (let ((key (jget attribute "key")))
+          (unless (gethash key seen)
+            (setf (gethash key seen) t)
+            (push attribute result)))))
+    (nreverse result)))
+
 (defmacro with-span ((client name &key (kind 1) attributes-var links content-capture) &body body)
   "Execute BODY wrapped in an OTel span.
 When CLIENT exports no spans, bind only the resolved capture mode and keep
@@ -195,8 +206,6 @@ the caller was told it had been adopted."
                          (push (otel-string-attr "gen_ai.agent.version" agent-ver) base-attrs)))
                      (dolist (kv (prefixed-tag-pairs (config-tags cfg)))
                        (push (otel-string-attr (car kv) (cdr kv)) base-attrs))
-                     (dolist (a ,attrs-var)
-                       (push a base-attrs))
                      (queue-enqueue
                       (client-trace-queue ,client-var)
                       (build-span :trace-id trace-id
@@ -208,7 +217,9 @@ the caller was told it had been adopted."
                                   :kind ,kind
                                   :start-time-unix-nano ,start-nano
                                   :end-time-unix-nano end-nano
-                                  :attributes (coerce (nreverse base-attrs) 'vector)
+                                  :attributes (coerce (%merge-span-attributes
+                                                       ,attrs-var (nreverse base-attrs))
+                                                      'vector)
                                   :status-code (if ,ok :unset 2)
                                   :status-message (or ,err-message "")
                                   :links ,links-var))

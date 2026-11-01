@@ -4020,6 +4020,88 @@ experiment-runs branch, whose prefix they share."
         (check "trace-context has span-id" (getf *trace-context* :span-id)))
       (check "trace-context nil after" (null *trace-context*)))
 
+    (dolist (protocol '(:http :otel))
+      (let* ((cfg (make-config :generation-protocol protocol :experimental-features t
+                               :traces-enabled t :traces-endpoint "http://fake.invalid/v1/traces"
+                               :agent-name "default" :agent-version "1"
+                               :tags '(("env" . "default"))))
+             (client (make-client cfg :env-fn (constantly nil)))
+             (active-config (agento11y-cl::client-config client))
+             (before-name (agento11y-cl::config-agent-name active-config))
+             (before-version (agento11y-cl::config-agent-version active-config))
+             (before-tags (copy-tree (agento11y-cl::config-tags active-config))))
+        (dolist (escape '(nil t))
+          (let* ((caller (list (otel-string-attr "gen_ai.agent.name" "caller")
+                               (otel-string-attr "gen_ai.agent.name" "older")
+                               (otel-string-attr "gen_ai.agent.version" "2")
+                               (otel-string-attr "agento11y.sdk.name" "custom-sdk")
+                               (otel-string-attr "agento11y.tag.env" "caller-env")
+                               (otel-string-attr "Case" "upper")
+                               (otel-string-attr "case" "lower")))
+                 (before (jzon:stringify (coerce caller 'vector)))
+                 (condition (make-condition 'simple-error :format-control "application")))
+            (check "generic attributes preserve return values and application errors"
+                   (if escape
+                       (eq condition (handler-case
+                                         (with-span (client "caller-error" :attributes-var attrs)
+                                           (setf attrs caller)
+                                           (error condition))
+                                       (error (e) e)))
+                       (equal '(1 2) (multiple-value-list
+                                      (with-span (client "caller" :attributes-var attrs)
+                                        (setf attrs caller)
+                                        (values 1 2))))))
+            (let* ((span (first (agento11y-cl::queue-drain-all
+                                (agento11y-cl::client-trace-queue client))))
+                   (attrs (jget span "attributes")))
+              (dolist (pair '(("gen_ai.agent.name" . "caller")
+                              ("gen_ai.agent.version" . "2")
+                              ("agento11y.sdk.name" . "custom-sdk")
+                              ("agento11y.tag.env" . "caller-env")
+                              ("Case" . "upper") ("case" . "lower")))
+                (let ((matches (remove-if-not (lambda (attr) (equal (jget attr "key") (car pair)))
+                                              (coerce attrs 'list))))
+                  (check (format nil "~a generic ~a is unique with caller precedence" protocol (car pair))
+                         (and (= 1 (length matches))
+                              (equal (jget* (first matches) "value" "stringValue") (cdr pair))))))
+              (check "generic attributes preserve error status"
+                     (eql (jget* span "status" "code") (if escape 2 nil))))
+            (check "generic merging does not mutate caller objects or list"
+                   (equal before (jzon:stringify (coerce caller 'vector))))))
+        (let* ((entered (bt2:make-semaphore))
+               (release (bt2:make-semaphore))
+               (thread nil))
+          (unwind-protect
+               (with-span (client "first" :attributes-var attrs)
+                 (push (otel-string-attr "gen_ai.agent.name" "first") attrs)
+                 (setf thread
+                       (bt2:make-thread
+                        (lambda ()
+                          (with-span (client "second" :attributes-var attrs)
+                            (push (otel-string-attr "gen_ai.agent.name" "second") attrs)
+                            (bt2:signal-semaphore entered)
+                            (bt2:wait-on-semaphore release :timeout 5)))))
+                 (check "generic spans overlap on a shared client"
+                        (bt2:wait-on-semaphore entered :timeout 5)))
+            (bt2:signal-semaphore release)
+            (when thread (bt2:join-thread thread)))
+          (with-span (client "default") nil)
+          (let ((spans (agento11y-cl::queue-drain-all (agento11y-cl::client-trace-queue client))))
+            (check "shared client queues all three generic spans" (= 3 (length spans)))
+            (dolist (span spans)
+              (let ((identities (remove-if-not
+                                 (lambda (attr) (equal (jget attr "key") "gen_ai.agent.name"))
+                                 (coerce (jget span "attributes") 'list))))
+                (check "overlapping spans keep independent unique identities and default"
+                       (and (= 1 (length identities))
+                            (equal (jget span "name")
+                                   (jget* (first identities) "value" "stringValue")))))))
+          (let ((active-config (agento11y-cl::client-config client)))
+            (check "generic spans leave shared configuration unchanged"
+                   (and (equal (agento11y-cl::config-agent-name active-config) before-name)
+                        (equal (agento11y-cl::config-agent-version active-config) before-version)
+                        (equal (agento11y-cl::config-tags active-config) before-tags)))))))
+
     ;; with-span: gen_ai.agent.name uses agent-name when set, falling back to service-name
     (flet ((span-attr (span key)
              (let ((found nil))
@@ -4476,6 +4558,53 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-normalize-tests ()
   (with-test-suite ("Normalize")
+    (dolist (role '("user" "assistant"))
+      (dolist (content (list nil "" #()
+                             (vector (jobj "type" "text" "text" "first")
+                                     (jobj "type" "thinking" "thinking" "reason")
+                                     (jobj "type" "image" "source"
+                                           (jobj "media_type" "image/png" "data" "AQID"))
+                                     nil 42 (jobj "type" "unknown")
+                                     (jobj "type" "image" "source" 42)
+                                     (jobj "type" "text" "text" "second")
+                                     (jobj "type" "image_url" "image_url"
+                                           (jobj "url" "https://example.test/second.png"))
+                                     (jobj "type" "tool_use" "id" "anthropic" "name" "search"
+                                           "input" (jobj)))))
+        (let* ((msg (jobj "role" role "content" content
+                          "tool_calls" (vector
+                                        (jobj "id" "one" "function"
+                                              (jobj "name" "first" "arguments" "{}"))
+                                        nil (jobj "id" "two" "function"
+                                                  (jobj "name" "second" "arguments" "{}")))))
+               (before (jzon:stringify msg))
+               (expected (append
+                          (when (and (vectorp content) (plusp (length content)))
+                            '("text" "thinking" "media" "text" "media" "anthropic"))
+                          (when (equal role "assistant") '("one" "two")))))
+          (dotimes (iteration 2)
+            (declare (ignorable iteration))
+            (let ((parts (message-parts (normalize-message msg))))
+              (check "normalization retains content order then OpenAI call order"
+                     (equal (mapcar (lambda (part)
+                                      (typecase part
+                                        (text-part "text") (thinking-part "thinking")
+                                        (media-part "media")
+                                        (tool-call-part (tool-call-part-id part))))
+                                    parts)
+                            expected))
+              (when (= (length parts) (+ 6 (if (equal role "assistant") 2 0)))
+                (check "normalization preserves text and image relationships"
+                       (and (typep (first parts) 'text-part)
+                            (typep (third parts) 'media-part)
+                            (typep (fourth parts) 'text-part)
+                            (typep (fifth parts) 'media-part)
+                            (equal (text-part-text (first parts)) "first")
+                            (equal (media-part-url (third parts)) "data:image/png;base64,AQID")
+                            (equal (text-part-text (fourth parts)) "second")
+                            (equal (media-part-url (fifth parts)) "https://example.test/second.png")))))
+            (check "repeated normalization leaves provider input unchanged"
+                   (equal before (jzon:stringify msg)))))))
     ;; Anthropic text content
     (let ((parts (normalize-content-to-parts "Hello world")))
       (check "string content -> text part" (= (length parts) 1))
@@ -8694,6 +8823,76 @@ experiment-runs branch, whose prefix they share."
 
 (defun run-otel-genai-tests ()
   (with-test-suite ("OTel GenAI export")
+    (let* ((raw (list (jobj "role" "user" "content"
+                            (vector (jobj "type" "text" "text" "Compare")
+                                    (jobj "type" "text" "text" "first image")
+                                    (jobj "type" "image" "source"
+                                          (jobj "media_type" "image/png" "data" "AQID"))
+                                    (jobj "type" "text" "text" "second image")
+                                    (jobj "type" "image_url" "image_url"
+                                          (jobj "url" "https://example.test/second.png"))))
+                      (jobj "role" "assistant" "content"
+                            (vector (jobj "type" "text" "text" "answer")
+                                    (jobj "type" "thinking" "thinking" "reason"))
+                            "tool_calls" (vector
+                                          (jobj "id" "one" "function"
+                                                (jobj "name" "first" "arguments" "{\"secret\":1}"))
+                                          (jobj "id" "two" "function"
+                                                (jobj "name" "second" "arguments" "{\"secret\":2}"))))))
+           (before (jzon:stringify (coerce raw 'vector))))
+      (dolist (protocol '(:http :otel))
+        (dolist (mode '(:full :no-tool-content :metadata-only :full-with-metadata-spans))
+          (dotimes (iteration 2)
+            (declare (ignorable iteration))
+            (let* ((client (make-test-client :capture mode :generation-protocol protocol
+                                             :experimental-features t))
+                   (rec (start-generation client :model-name "vision")))
+              (set-result rec :input-messages (normalize-input-messages raw))
+              (recorder-end rec)
+              (if (eq protocol :http)
+                  (let* ((gen (first (agento11y-cl::queue-drain-all
+                                     (agento11y-cl::client-generation-queue client))))
+                         (messages (jget gen "input"))
+                         (parts (jget (aref messages 0) "parts"))
+                         (assistant (jget (aref messages 1) "parts"))
+                         (keep (not (eq mode :metadata-only))))
+                    (check "native raw vision prompt retains ordered labels and images"
+                           (equal (loop for part across parts
+                                        collect (or (jget part "text") (jget* part "media" "url")))
+                                  (if keep
+                                      '("Compare" "first image" "data:image/png;base64,AQID"
+                                        "second image" "https://example.test/second.png")
+                                      '("" "" "" "" ""))))
+                    (check "native raw assistant content precedes ordered tool calls"
+                           (and (equal (jget (aref assistant 0) "text") (if keep "answer" ""))
+                                (equal (jget (aref assistant 1) "thinking") (if keep "reason" ""))
+                                (equal (jget* (aref assistant 2) "tool_call" "id") "one")
+                                (equal (jget* (aref assistant 3) "tool_call" "id") "two")
+                                (equal (jget* (aref assistant 2) "tool_call" "input_json")
+                                       (if keep (agento11y-cl::utf8-base64-encode "{\"secret\":1}") "")))))
+                  (let* ((span (genai-only-span client))
+                         (encoded (genai-attr-string span "gen_ai.input.messages")))
+                    (if (member mode '(:metadata-only :full-with-metadata-spans))
+                        (check "restricted OTel raw messages remain absent" (null encoded))
+                        (let* ((messages (jzon:parse encoded))
+                               (parts (jget (aref messages 0) "parts"))
+                               (assistant (jget (aref messages 1) "parts")))
+                          (check "OTel raw vision prompt retains ordered labels and images"
+                                 (equal (loop for part across parts
+                                              collect (or (jget part "uri") (jget part "content")))
+                                        '("Compare" "first image" "AQID" "second image"
+                                          "https://example.test/second.png")))
+                          (check "OTel raw assistant content precedes ordered tool calls"
+                                 (and (equal (jget (aref assistant 0) "content") "answer")
+                                      (equal (jget (aref assistant 1) "content") "reason")
+                                      (equal (jget (aref assistant 2) "id") "one")
+                                      (equal (jget (aref assistant 3) "id") "two")))
+                          (check "OTel raw tool arguments retain capture restrictions"
+                                 (if (eq mode :full)
+                                     (equal (jget* (aref assistant 2) "arguments" "secret") 1)
+                                     (equal (jget (aref assistant 2) "arguments") (jzon:parse "null"))))))))
+              (check "raw provider inputs survive repeated protocol serialization"
+                     (equal before (jzon:stringify (coerce raw 'vector)))))))))
     (dolist (protocol '(:http :otel))
       (let* ((client (make-client
                       (make-config :generation-protocol protocol :generation-enabled t

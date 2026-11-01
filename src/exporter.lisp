@@ -99,7 +99,10 @@ Diagnostics contain no endpoint, credentials, response text, or condition text."
                      #+sbcl
                      (sb-ext:timeout () (return (failure :timeout attempt)))
                      #+(and sbcl (not windows) (not win32))
-                     (usocket:timeout-error () (return (failure :timeout attempt)))
+                     (usocket:timeout-error ()
+                       (if (config-http-fn config)
+                           (values nil nil nil :timeout)
+                           (return (failure :timeout attempt))))
                      (agento11y-export-error (e)
                        (if (eq :unsupported-deadline
                                (getf (agento11y-export-error-diagnostics e) :kind))
@@ -116,7 +119,9 @@ Diagnostics contain no endpoint, credentials, response text, or condition text."
                      (return (values (not diagnostic) resp-body
                                      (when diagnostic
                                        (append diagnostic (list :status-code status :attempts attempt)))))))
-                 (let ((kind (if transport-error :transport :http)))
+                 (let ((kind (cond ((eq transport-error :timeout) :timeout)
+                                   (transport-error :transport)
+                                   (t :http))))
                    (unless (or transport-error
                                (and (integerp status)
                                     (retryable-export-status-p status label)))

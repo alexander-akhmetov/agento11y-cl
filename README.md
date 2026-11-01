@@ -337,6 +337,12 @@ Queue limits count records, not bytes. These queues do not survive a process cra
 Native export deadlines require SBCL and Dexador's USOCKET backend. They cover pooled reads, repeated reads, TLS waits, and locks; they cannot preempt foreign DNS calls or CPU work.
 Other Lisp implementations/backends must supply `:http-fn`, which must implement its own timeout. Shutdown does not kill a thread inside a request.
 
+On non-Windows SBCL, a custom `:http-fn` socket timeout uses the existing export retry loop.
+Retries require remaining attempts and enough export budget for backoff.
+`:max-retries` counts total attempts, with at least one attempt even when set to zero.
+Native socket timeouts and SBCL timeouts remain terminal. OTLP partial-success responses never retry the accepted batch.
+A retry can resend a request whose acknowledgement was lost and can increase export latency.
+
 Recorder macros record escaping errors and preserve the original application condition if export also fails.
 
 ## Configuration
@@ -495,6 +501,11 @@ fields (i.e. which logical agent produced the call). When a recorder is
 created without explicit agent fields, the SDK falls back to config-level
 agent fields and finally to the service fields, so applications that only set
 `:service-name` keep their previous behaviour.
+
+Generic spans merge caller attributes over SDK defaults, including agent identity and prefixed client tags.
+Each key appears once. The first entry in the final caller attribute list wins; keys are case-sensitive.
+The merge does not modify caller attribute objects or shared client configuration.
+These rules apply only to generic `with-span`, not recorder spans or low-level `build-span`.
 
 ### Content capture modes
 
